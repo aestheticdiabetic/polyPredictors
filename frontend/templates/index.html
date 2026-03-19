@@ -187,12 +187,14 @@
     </div>
 
     <!-- Filter tabs -->
-    <div class="filter-tabs">
+    <div class="filter-tabs" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
       <button class="filter-tab active" data-status="all">All</button>
       <button class="filter-tab" data-status="open">Open</button>
       <button class="filter-tab" data-status="wins">Wins</button>
       <button class="filter-tab" data-status="losses">Losses</button>
       <button class="filter-tab" data-status="skipped">Skipped</button>
+      <button id="ledger-sort-btn" class="btn btn-sm" style="display:none;margin-left:auto"
+              onclick="toggleLedgerSort()">⏱ Soonest First</button>
     </div>
 
     <div class="table-wrapper">
@@ -206,13 +208,14 @@
             <th>Entry Price</th>
             <th>Bet Size</th>
             <th>P&amp;L</th>
+            <th>Closes In</th>
             <th>Status</th>
             <th>Notes</th>
           </tr>
         </thead>
         <tbody id="ledger-table-body">
           <tr>
-            <td colspan="9">
+            <td colspan="10">
               <div class="empty-state">
                 <div class="empty-icon">📋</div>
                 <p>No bets yet. Start a session to begin tracking.</p>
@@ -238,16 +241,47 @@
       </span>
     </div>
 
+    <!-- "Should I Follow?" widget -->
+    <div id="signals-verdict-widget" style="display:none;margin-bottom:16px;border-radius:8px;overflow:hidden;border:1px solid var(--border)">
+      <div id="signals-verdict-header" style="padding:10px 16px;font-weight:600;font-size:0.85rem;display:flex;align-items:center;gap:8px"></div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:0;border-top:1px solid var(--border)">
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Signals</div>
+          <div class="signal-stat-value" id="sig-stat-total">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Resolved</div>
+          <div class="signal-stat-value" id="sig-stat-resolved">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Win Rate</div>
+          <div class="signal-stat-value" id="sig-stat-winrate">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Net Extra P&amp;L</div>
+          <div class="signal-stat-value" id="sig-stat-pnl">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Avg per Signal</div>
+          <div class="signal-stat-value" id="sig-stat-avg">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Still Open</div>
+          <div class="signal-stat-value" id="sig-stat-open">—</div>
+        </div>
+      </div>
+    </div>
+
     <div class="table-wrapper">
       <table>
         <thead>
           <tr>
             <th>Time</th>
-            <th>Our Bet #</th>
+            <th>Market</th>
             <th>Whale Added</th>
-            <th>Price</th>
-            <th>Hypo. Extra P&amp;L</th>
-            <th>Note</th>
+            <th>Signal Price</th>
+            <th>Outcome</th>
+            <th>Extra P&amp;L if Followed</th>
           </tr>
         </thead>
         <tbody id="signals-table-body">

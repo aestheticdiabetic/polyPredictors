@@ -160,6 +160,7 @@ class CopiedBet(Base):
     # Timestamps
     opened_at = Column(DateTime, nullable=True)
     closed_at = Column(DateTime, nullable=True)
+    market_close_at = Column(DateTime, nullable=True)  # market end date from Polymarket
 
     # Relationships
     whale_bet = relationship("WhaleBet", back_populates="copied_bet")
@@ -190,6 +191,7 @@ class CopiedBet(Base):
             "resolution_price": round(self.resolution_price, 4) if self.resolution_price is not None else None,
             "opened_at": self.opened_at.isoformat() if self.opened_at else None,
             "closed_at": self.closed_at.isoformat() if self.closed_at else None,
+            "market_close_at": self.market_close_at.isoformat() if self.market_close_at else None,
         }
 
 
@@ -293,9 +295,29 @@ def get_db():
 
 
 def init_db():
-    """Create all tables and seed default whales if needed."""
+    """Create all tables, run lightweight migrations, and seed defaults."""
     Base.metadata.create_all(bind=engine)
+    _migrate()
     _seed_defaults()
+
+
+def _migrate():
+    """Apply additive schema migrations (add missing columns)."""
+    migrations = [
+        ("copied_bets", "market_close_at", "DATETIME"),
+    ]
+    with engine.connect() as conn:
+        for table, column, col_type in migrations:
+            try:
+                conn.execute(
+                    __import__("sqlalchemy").text(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"
+                    )
+                )
+                conn.commit()
+            except Exception:
+                # Column already exists — safe to ignore
+                pass
 
 
 def _seed_defaults():

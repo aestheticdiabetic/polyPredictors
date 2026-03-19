@@ -111,40 +111,48 @@ class RiskCalculator:
         if not market_info:
             return False, "Market info unavailable"
 
-        # Check active flag if present
-        active = market_info.get("active", True)
-        if not active:
+        # Explicit closed / resolved / inactive flags
+        if not market_info.get("active", True):
             return False, "Market is inactive"
 
-        closed_flag = market_info.get("closed", False)
-        if closed_flag:
+        if market_info.get("closed", False):
             return False, "Market is already closed"
 
-        # Check endDate
+        if market_info.get("resolved", False):
+            return False, "Market is already resolved"
+
+        # Some APIs use a string status field
+        status = str(market_info.get("status", "")).lower()
+        if status in ("closed", "resolved", "finalized", "settled"):
+            return False, f"Market status is '{status}'"
+
+        # Check endDate — deny if missing (conservative: unknown close time = unsafe)
         end_date_str = (
             market_info.get("endDate")
+            or market_info.get("endDateIso")
             or market_info.get("end_date_iso")
             or market_info.get("end_date")
         )
         if not end_date_str:
-            # No end date info - allow the bet but flag uncertainty
-            logger.debug("Market has no endDate, allowing bet anyway: %s", market_info.get("id"))
-            return True, ""
+            logger.warning(
+                "Market has no endDate field — skipping to avoid betting on a "
+                "closed market (id=%s)", market_info.get("id", "unknown")
+            )
+            return False, "Market end date unknown — skipping"
 
         try:
-            # Handle various ISO formats
-            end_date_str = end_date_str.rstrip("Z")
-            if "." in end_date_str:
-                end_dt = datetime.fromisoformat(end_date_str)
-            else:
-                end_dt = datetime.fromisoformat(end_date_str)
-
-            # Make timezone-aware if naive
+            end_dt = datetime.fromisoformat(end_date_str.rstrip("Z"))
             if end_dt.tzinfo is None:
                 end_dt = end_dt.replace(tzinfo=timezone.utc)
 
             now = datetime.now(timezone.utc)
             hours_remaining = (end_dt - now).total_seconds() / 3600.0
+
+            if hours_remaining < 0:
+                return (
+                    False,
+                    f"Market closed {abs(hours_remaining):.1f}h ago",
+                )
 
             if hours_remaining < min_hours_to_close:
                 return (
@@ -153,10 +161,56 @@ class RiskCalculator:
                 )
         except (ValueError, TypeError) as exc:
             logger.warning("Could not parse endDate '%s': %s", end_date_str, exc)
-            # Allow the bet - don't block on parse error
-            return True, ""
+            return False, f"Could not parse market end date: {end_date_str!r}"
 
         return True, ""
+
+    def check_price_staleness(
+        self,
+        whale_price: float,
+        live_price: Optional[float],
+        max_drift: float,
+    ) -> tuple[bool, str]:
+        """
+        Guard against copying a bet whose odds have moved significantly since
+        the whale placed it.
+
+        Logic:
+            drift = |live_price - whale_price|
+            If drift > max_drift  →  skip
+
+        A drift in either direction is treated as a skip signal:
+          - Price went UP   (e.g. 0.20 → 0.30): we'd be paying too much per share,
+            reducing or eliminating the expected edge.
+          - Price went DOWN (e.g. 0.20 → 0.10): the market has moved against the
+            whale's thesis, which is a warning sign.
+
+        If live_price is None (fetch failed) the bet is allowed through — we
+        prefer not to block on network uncertainty.
+
+        Returns:
+            (True,  "")             if safe to proceed
+            (False, reason_string)  if the bet should be skipped
+        """
+        if live_price is None:
+            logger.debug("Live price unavailable — skipping staleness check")
+            return True, ""
+
+        drift = abs(live_price - whale_price)
+
+        if drift <= max_drift:
+            logger.debug(
+                "Price OK: whale=%.4f live=%.4f drift=%.4f <= max %.4f",
+                whale_price, live_price, drift, max_drift,
+            )
+            return True, ""
+
+        direction = "risen" if live_price > whale_price else "fallen"
+        return (
+            False,
+            f"Odds have {direction} from {whale_price:.3f} to {live_price:.3f} "
+            f"(drift {drift:.3f} > max {max_drift:.3f})",
+        )
 
     # ------------------------------------------------------------------
     # Convenience helpers

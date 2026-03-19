@@ -9,17 +9,22 @@
 // State
 // ============================================================
 const State = {
-  session:       null,
-  mode:          'SIMULATION',
-  runtimeHours:  null,   // null = manual
-  ledgerPage:    1,
-  ledgerStatus:  'all',
-  ledgerMode:    'all',
-  signalsPage:   1,
-  timerInterval: null,
-  pollInterval:  null,
-  ledgerInterval: null,
+  session:           null,
+  mode:              'SIMULATION',
+  runtimeHours:      null,   // null = manual
+  ledgerPage:        1,
+  ledgerStatus:      'all',
+  ledgerMode:        'all',
+  ledgerSort:        'default',  // 'default' = newest first; 'close_asc' = soonest close first
+  signalsPage:       1,
+  timerInterval:     null,
+  pollInterval:      null,
+  ledgerInterval:    null,
+  lastActivityMaxId: 0,    // Fix #6: dirty-check — skip re-render when unchanged
 };
+
+// Fix #7: in-flight guard — prevents overlapping concurrent fetches per endpoint
+const _inFlight = new Set();
 
 // ============================================================
 // DOM refs (populated after DOMContentLoaded)
@@ -141,8 +146,11 @@ function bindEvents() {
     tab.addEventListener('click', () => {
       State.ledgerStatus = tab.dataset.status;
       State.ledgerPage = 1;
+      // Default sort to close_asc when switching to Open tab
+      State.ledgerSort = tab.dataset.status === 'open' ? 'close_asc' : 'default';
       document.querySelectorAll('.filter-tab[data-status]').forEach(t => t.classList.remove('active'));
       tab.classList.add('active');
+      updateSortButton();
       fetchLedger();
     });
   });
@@ -184,6 +192,7 @@ async function startSession() {
     });
 
     State.session = resp.session;
+    State.lastActivityMaxId = 0; // force activity re-render for new session
     updateSessionUI();
     startTimer();
     fetchLedger();
@@ -218,6 +227,8 @@ async function stopSession() {
 // Status polling
 // ============================================================
 async function fetchStatus() {
+  if (_inFlight.has('status')) return;
+  _inFlight.add('status');
   try {
     const data = await api('GET', '/api/status');
     State.session = data.session;
@@ -228,6 +239,8 @@ async function fetchStatus() {
     updateStats(stats);
   } catch (err) {
     // Silently fail on status polls
+  } finally {
+    _inFlight.delete('status');
   }
 }
 
@@ -473,11 +486,18 @@ function closeModal() {
 // Activity Feed
 // ============================================================
 async function fetchActivity() {
+  if (_inFlight.has('activity')) return;
+  _inFlight.add('activity');
   try {
     const data = await api('GET', '/api/activity');
+    // Fix #6: skip full DOM re-render when feed hasn't changed
+    if (data.max_id === State.lastActivityMaxId) return;
+    State.lastActivityMaxId = data.max_id;
     renderActivity(data.activity);
   } catch (err) {
     console.error('fetchActivity error:', err);
+  } finally {
+    _inFlight.delete('activity');
   }
 }
 
@@ -520,17 +540,22 @@ function renderActivity(items) {
 // Ledger
 // ============================================================
 async function fetchLedger() {
+  if (_inFlight.has('ledger')) return;
+  _inFlight.add('ledger');
   try {
     const params = new URLSearchParams({
       page: State.ledgerPage,
       limit: 50,
       status: State.ledgerStatus,
       mode: State.ledgerMode,
+      sort: State.ledgerSort,
     });
     const data = await api('GET', `/api/ledger?${params}`);
     renderLedger(data.bets, data.pagination);
   } catch (err) {
     console.error('fetchLedger error:', err);
+  } finally {
+    _inFlight.delete('ledger');
   }
 }
 
@@ -538,7 +563,7 @@ function renderLedger(bets, pagination) {
   if (!bets || bets.length === 0) {
     DOM.ledgerTableBody.innerHTML = `
       <tr>
-        <td colspan="9">
+        <td colspan="10">
           <div class="empty-state">
             <div class="empty-icon">📋</div>
             <p>No bets yet. Start a session and add whales to track.</p>
@@ -586,15 +611,20 @@ function renderLedger(bets, pagination) {
 
     const actionDir = bet.side === 'SELL' ? 'EXIT' : 'BUY ' + (bet.outcome || '');
 
+    const whaleLabel = escHtml(bet.whale_alias || formatAddress(bet.whale_address));
+
+    const closesHtml = formatClosesIn(bet.market_close_at, bet.status);
+
     return `
       <tr class="${rowClass}">
         <td class="mono text-muted" style="font-size:0.75rem">${time}</td>
-        <td class="whale-addr mono">${formatAddress(bet.whale_address)}</td>
+        <td title="${escHtml(bet.whale_address)}">${whaleLabel}</td>
         <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(bet.question)}">${escHtml(truncate(bet.question || bet.market_id, 40))}</td>
         <td><span class="badge ${bet.mode === 'SIMULATION' ? 'badge-sim' : 'badge-real'}">${actionDir}</span></td>
         <td class="mono">${bet.price_at_entry ? bet.price_at_entry.toFixed(3) : '—'}</td>
         <td class="mono">${bet.size_usdc > 0 ? '$' + bet.size_usdc.toFixed(2) : '—'}</td>
         <td>${pnlHtml}</td>
+        <td class="mono" style="font-size:0.8rem">${closesHtml}</td>
         <td><span class="badge ${badgeClass}">${statusLabel}</span></td>
         <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-muted);font-size:0.75rem"
             title="${escHtml(bet.skip_reason || '')}">${escHtml(bet.skip_reason ? truncate(bet.skip_reason, 30) : '')}</td>
@@ -638,12 +668,65 @@ function changeLedgerPage(page) {
 // Signals
 // ============================================================
 async function fetchSignals() {
+  if (_inFlight.has('signals')) return;
+  _inFlight.add('signals');
   try {
-    const data = await api('GET', `/api/signals?page=${State.signalsPage}&limit=20`);
+    const [data, stats] = await Promise.all([
+      api('GET', `/api/signals?page=${State.signalsPage}&limit=20`),
+      api('GET', '/api/signals/stats'),
+    ]);
+    renderSignalsWidget(stats);
     renderSignals(data.signals);
   } catch (err) {
     console.error('fetchSignals error:', err);
+  } finally {
+    _inFlight.delete('signals');
   }
+}
+
+function renderSignalsWidget(stats) {
+  const widget = $('signals-verdict-widget');
+  if (!widget) return;
+
+  if (!stats || stats.total_signals === 0) {
+    widget.style.display = 'none';
+    return;
+  }
+
+  widget.style.display = '';
+
+  // Header: verdict banner
+  const header = $('signals-verdict-header');
+  const verdictCfg = {
+    follow:             { bg: 'rgba(0,200,100,0.12)', color: 'var(--success)', icon: '✅', text: 'Worth Following — these double-downs have been profitable' },
+    avoid:              { bg: 'rgba(220,50,50,0.10)',  color: 'var(--danger)',  icon: '⚠️', text: 'Caution — following these has historically lost money' },
+    neutral:            { bg: 'rgba(255,200,0,0.10)',  color: 'var(--warning)', icon: '⚖️', text: 'Mixed Results — no strong edge either way' },
+    insufficient_data:  { bg: 'rgba(255,255,255,0.04)', color: 'var(--text-muted)', icon: 'ℹ️', text: 'Awaiting more resolved signals to make a recommendation' },
+  };
+  const cfg = verdictCfg[stats.verdict] || verdictCfg.insufficient_data;
+  header.style.background = cfg.bg;
+  header.style.color = cfg.color;
+  header.innerHTML = `<span>${cfg.icon}</span> Should I follow these signals? &nbsp;<span style="font-weight:400">${cfg.text}</span>`;
+
+  // Stat cells
+  $('sig-stat-total').textContent    = stats.total_signals;
+  $('sig-stat-resolved').textContent = stats.resolved_signals > 0
+    ? `${stats.resolved_signals} (${stats.profitable}W / ${stats.losing}L)`
+    : stats.resolved_signals;
+
+  const wr = $('sig-stat-winrate');
+  wr.textContent = stats.win_rate_pct != null ? stats.win_rate_pct.toFixed(1) + '%' : '—';
+  wr.style.color = stats.win_rate_pct > 55 ? 'var(--success)' : stats.win_rate_pct < 45 ? 'var(--danger)' : '';
+
+  const pnlEl = $('sig-stat-pnl');
+  pnlEl.textContent = stats.total_pnl_usdc != null ? formatPnl(stats.total_pnl_usdc) : '—';
+  pnlEl.style.color = stats.total_pnl_usdc > 0 ? 'var(--success)' : stats.total_pnl_usdc < 0 ? 'var(--danger)' : '';
+
+  const avgEl = $('sig-stat-avg');
+  avgEl.textContent = stats.avg_pnl_per_signal != null ? formatPnl(stats.avg_pnl_per_signal) : '—';
+  avgEl.style.color = stats.avg_pnl_per_signal > 0 ? 'var(--success)' : stats.avg_pnl_per_signal < 0 ? 'var(--danger)' : '';
+
+  $('sig-stat-open').textContent = stats.open_signals;
 }
 
 function renderSignals(signals) {
@@ -664,17 +747,37 @@ function renderSignals(signals) {
 
   tbody.innerHTML = signals.map(s => {
     const time = new Date(s.timestamp + (s.timestamp.endsWith('Z') ? '' : 'Z')).toLocaleString();
-    const hypo = s.hypothetical_pnl_usdc != null
-      ? formatPnl(s.hypothetical_pnl_usdc)
-      : '—';
+
+    // Outcome column: show status badge for the underlying bet
+    const statusBadge = {
+      CLOSED_WIN:     '<span class="badge badge-win">WIN</span>',
+      CLOSED_LOSS:    '<span class="badge badge-loss">LOSS</span>',
+      CLOSED_NEUTRAL: '<span class="badge badge-neutral">NEUTRAL</span>',
+      OPEN:           '<span class="badge badge-open">OPEN</span>',
+      PENDING:        '<span class="badge badge-neutral">PENDING</span>',
+    }[s.bet_status] || `<span class="badge badge-neutral">${escHtml(s.bet_status || '?')}</span>`;
+
+    // Extra P&L column
+    let pnlHtml;
+    if (s.hypothetical_pnl_usdc != null) {
+      const cls = s.hypothetical_pnl_usdc > 0 ? 'pnl-positive' : s.hypothetical_pnl_usdc < 0 ? 'pnl-negative' : 'pnl-zero';
+      pnlHtml = `<span class="${cls}">${formatPnl(s.hypothetical_pnl_usdc)}</span>`;
+    } else if (s.bet_status === 'OPEN' || s.bet_status === 'PENDING') {
+      pnlHtml = '<span class="text-muted">pending…</span>';
+    } else {
+      pnlHtml = '<span class="text-muted">—</span>';
+    }
+
+    const market = escHtml(truncate(s.bet_question || `Bet #${s.copied_bet_id}`, 45));
+
     return `
       <tr>
         <td class="mono text-muted" style="font-size:0.75rem">${time}</td>
-        <td class="mono text-muted">#${s.copied_bet_id}</td>
+        <td title="${escHtml(s.bet_question || '')}">${market}</td>
         <td class="mono">$${s.whale_additional_usdc.toFixed(2)}</td>
         <td class="mono">${s.price.toFixed(4)}</td>
-        <td>${hypo}</td>
-        <td style="color:var(--text-muted);font-size:0.75rem">${escHtml(s.note || '')}</td>
+        <td>${statusBadge}</td>
+        <td>${pnlHtml}</td>
       </tr>`;
   }).join('');
 }
@@ -699,6 +802,57 @@ async function api(method, url, body) {
     throw new Error(detail);
   }
   return resp.json();
+}
+
+function toggleLedgerSort() {
+  State.ledgerSort = State.ledgerSort === 'close_asc' ? 'default' : 'close_asc';
+  State.ledgerPage = 1;
+  updateSortButton();
+  fetchLedger();
+}
+
+function updateSortButton() {
+  const btn = $('ledger-sort-btn');
+  if (!btn) return;
+  const isOpen = State.ledgerStatus === 'open';
+  btn.style.display = isOpen ? '' : 'none';
+  if (State.ledgerSort === 'close_asc') {
+    btn.textContent = '⏱ Soonest First';
+    btn.classList.add('active-sim');
+  } else {
+    btn.textContent = '🕒 Newest First';
+    btn.classList.remove('active-sim');
+  }
+}
+
+function formatClosesIn(marketCloseAt, status) {
+  if (!marketCloseAt) return '<span class="text-muted">—</span>';
+
+  // Treat stored value as UTC (naive UTC from backend)
+  const closeStr = marketCloseAt.endsWith('Z') ? marketCloseAt : marketCloseAt + 'Z';
+  const closeMs = new Date(closeStr).getTime();
+  const nowMs = Date.now();
+  const diffMs = closeMs - nowMs;
+  const diffSec = Math.floor(diffMs / 1000);
+
+  if (diffSec < 0) {
+    // Market has ended
+    if (status === 'OPEN') return '<span style="color:var(--danger);font-weight:600">EXPIRED</span>';
+    return '<span class="text-muted">closed</span>';
+  }
+
+  const days  = Math.floor(diffSec / 86400);
+  const hours = Math.floor((diffSec % 86400) / 3600);
+  const mins  = Math.floor((diffSec % 3600) / 60);
+
+  let label;
+  if (days > 0)       label = `${days}d ${hours}h`;
+  else if (hours > 0) label = `${hours}h ${mins}m`;
+  else                label = `${mins}m`;
+
+  // Highlight near-expiry (< 1h)
+  const style = diffSec < 3600 ? 'color:var(--warning);font-weight:600' : '';
+  return style ? `<span style="${style}">${label}</span>` : label;
 }
 
 function formatAddress(addr) {

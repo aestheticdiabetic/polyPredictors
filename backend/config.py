@@ -27,6 +27,22 @@ class Settings:
     POLLING_INTERVAL_SECONDS: int = int(os.getenv("POLLING_INTERVAL_SECONDS", "30"))
     MIN_MARKET_HOURS_TO_CLOSE: float = float(os.getenv("MIN_MARKET_HOURS_TO_CLOSE", "1.0"))
 
+    # Ignore whale trades older than this many hours.  Prevents the initial backlog
+    # of historical trades (fetched when a whale is first added) from being evaluated
+    # against markets that have since closed.
+    MAX_TRADE_AGE_HOURS: float = float(os.getenv("MAX_TRADE_AGE_HOURS", "24.0"))
+
+    # Maximum allowable price drift (in probability points) between when the whale
+    # placed their bet and when we copy it.  E.g. 0.05 means: if the whale bet at
+    # 0.20 and the current price is now above 0.25 or below 0.15, skip the bet.
+    MAX_PRICE_DRIFT_PCT: float = float(os.getenv("MAX_PRICE_DRIFT_PCT", "0.05"))
+
+    # Minimum USDC trading volume a leaderboard trader must have to appear in the
+    # Discover Whales modal.  The Polymarket API does not expose a prediction count,
+    # so volume is used as the practical proxy for high-activity traders.
+    # A trader averaging $5 per prediction needs $100,000 vol for ~20,000 predictions.
+    MIN_WHALE_VOLUME_USDC: float = float(os.getenv("MIN_WHALE_VOLUME_USDC", "1000000"))
+
     # API endpoints
     DATA_API_BASE: str = "https://data-api.polymarket.com"
     GAMMA_API_BASE: str = "https://gamma-api.polymarket.com"
@@ -35,11 +51,8 @@ class Settings:
     # Database
     DATABASE_URL: str = f"sqlite:///{_root}/data/polymarket_copier.db"
 
-    # Pre-loaded placeholder whale addresses (real ones come from leaderboard)
-    DEFAULT_WHALES: list = [
-        {"address": "0x8fB9E03Aef7b4dCA123F05BDbFB3e82aA39CF5", "alias": "TopWhale_1"},
-        {"address": "0x1D5B3D9f3B6c7E2d4F8A9C0B7e6d5A3c2B1f0E", "alias": "TopWhale_2"},
-    ]
+    # No default whales — add real ones via the UI Discover button or POST /api/whales
+    DEFAULT_WHALES: list = []
 
     def credentials_valid(self) -> bool:
         """Check if all REAL mode credentials are present."""

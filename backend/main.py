@@ -3,7 +3,9 @@ FastAPI application entry point.
 All API routes are defined here.
 """
 
+import json
 import logging
+import logging.handlers
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -36,11 +38,38 @@ from backend.whale_monitor import WhaleMonitor
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+_root = Path(__file__).parent.parent
+_LOGS_DIR = _root / "logs"
+_LOGS_DIR.mkdir(exist_ok=True)
+
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+# Console handler — INFO and above
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.INFO)
+_console_handler.setFormatter(_fmt)
+
+# Rotating file handler — DEBUG and above (verbose), 5 MB per file, keep 10
+_file_handler = logging.handlers.RotatingFileHandler(
+    _LOGS_DIR / "app.log",
+    maxBytes=5 * 1024 * 1024,
+    backupCount=10,
+    encoding="utf-8",
 )
+_file_handler.setLevel(logging.DEBUG)
+_file_handler.setFormatter(_fmt)
+
+logging.root.setLevel(logging.DEBUG)
+logging.root.addHandler(_console_handler)
+logging.root.addHandler(_file_handler)
+
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Database — initialised here so tables exist before any singleton queries them
+# ---------------------------------------------------------------------------
+init_db()
+logger.info("Database initialised")
 
 # ---------------------------------------------------------------------------
 # Application-level singletons
@@ -55,12 +84,10 @@ whale_monitor = WhaleMonitor(bet_engine=bet_engine, polymarket_client=poly_clien
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialise the database on startup, clean up on shutdown."""
-    init_db()
-    logger.info("Database initialised")
+    """Clean up on shutdown."""
     yield
     # Graceful shutdown
-    whale_monitor.stop_monitoring()
+    whale_monitor.shutdown()
     await poly_client.close()
     logger.info("Application shutdown complete")
 
@@ -68,7 +95,6 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
-_root = Path(__file__).parent.parent
 app = FastAPI(title="Polymarket Whale Copier", version="1.0.0", lifespan=lifespan)
 
 # Static files
@@ -305,6 +331,7 @@ async def get_ledger(
     limit: int = Query(50, ge=1, le=200),
     mode: str = Query("all"),
     status: str = Query("all"),
+    sort: str = Query("default"),  # "default" = newest first; "close_asc" = soonest close first
     db: DBSession = Depends(get_db),
 ):
     """Paginated bet ledger with optional filters."""
@@ -325,15 +352,36 @@ async def get_ledger(
         query = query.filter(CopiedBet.status == db_status)
 
     total = query.count()
+
+    # Sort: soonest market close first (nulls last), otherwise newest bet first
+    from sqlalchemy import nulls_last
+    if sort == "close_asc":
+        order = nulls_last(CopiedBet.market_close_at.asc())
+    else:
+        order = CopiedBet.id.desc()
+
     bets = (
-        query.order_by(CopiedBet.id.desc())
+        query.order_by(order)
         .offset((page - 1) * limit)
         .limit(limit)
         .all()
     )
 
+    # Build alias lookup for the addresses on this page
+    addresses = {b.whale_address for b in bets}
+    alias_map = {
+        w.address: w.alias
+        for w in db.query(Whale).filter(Whale.address.in_(addresses)).all()
+    }
+
+    result = []
+    for b in bets:
+        d = b.to_dict()
+        d["whale_alias"] = alias_map.get(b.whale_address, b.whale_address[:10])
+        result.append(d)
+
     return {
-        "bets": [b.to_dict() for b in bets],
+        "bets": result,
         "pagination": {
             "page": page,
             "limit": limit,
@@ -386,8 +434,8 @@ async def ledger_stats(
 @app.get("/api/activity")
 async def get_activity(db: DBSession = Depends(get_db)):
     """
-    Returns the last 20 CopiedBets combined for the live feed,
-    sorted by ID descending (most recent first).
+    Returns the last 20 CopiedBets for the live feed, sorted by ID descending.
+    Includes max_id so the frontend can skip re-renders when nothing changed.
     """
     bets = (
         db.query(CopiedBet)
@@ -395,14 +443,22 @@ async def get_activity(db: DBSession = Depends(get_db)):
         .limit(20)
         .all()
     )
+
+    # Build a whale alias lookup from the addresses present in this page only
+    addresses = {bet.whale_address for bet in bets}
+    alias_map = {
+        w.address: w.alias
+        for w in db.query(Whale).filter(Whale.address.in_(addresses)).all()
+    }
+
     items = []
     for bet in bets:
         d = bet.to_dict()
-        # Attach whale alias by looking up whale address
-        whale = db.query(Whale).filter_by(address=bet.whale_address).first()
-        d["whale_alias"] = whale.alias if whale else bet.whale_address[:10]
+        d["whale_alias"] = alias_map.get(bet.whale_address, bet.whale_address[:10])
         items.append(d)
-    return {"activity": items}
+
+    max_id = bets[0].id if bets else 0
+    return {"activity": items, "max_id": max_id}
 
 
 # ---------------------------------------------------------------------------
@@ -428,38 +484,192 @@ async def get_leaderboard(
     }
 
     results = []
+    skipped_low_volume = 0
     for entry in entries:
+        # v1 API uses "proxyWallet"; keep fallbacks for any future field renames
         address = (
-            entry.get("proxyWalletAddress")
-            or entry.get("proxy_wallet_address")
+            entry.get("proxyWallet")
+            or entry.get("proxyWalletAddress")
             or entry.get("address")
             or ""
         ).lower()
 
-        pnl = entry.get("pnl") or entry.get("profit") or 0
-        volume = entry.get("volume") or entry.get("usdcVolume") or 0
+        pnl = entry.get("pnl") or 0
+        # v1 API uses "vol" for volume
+        volume = float(entry.get("vol") or entry.get("volume") or 0)
+
+        # Filter: Polymarket does not expose a prediction count in any public API.
+        # Volume is the best available proxy — skip traders below the threshold.
+        if volume < settings.MIN_WHALE_VOLUME_USDC:
+            skipped_low_volume += 1
+            continue
+
+        alias = (
+            entry.get("userName")
+            or entry.get("name")
+            or entry.get("pseudonym")
+            or f"Whale_{address[:6]}"
+        )
 
         results.append({
             "address": address,
-            "alias": entry.get("name") or entry.get("pseudonym") or f"Whale_{address[:6]}",
+            "alias": alias,
             "pnl_usdc": round(float(pnl), 2) if pnl else 0.0,
-            "volume_usdc": round(float(volume), 2) if volume else 0.0,
+            "volume_usdc": round(volume, 2),
             "already_tracked": address in tracked_addresses,
         })
 
+    if skipped_low_volume:
+        logger.debug(
+            "Leaderboard: filtered out %d traders below $%.0f volume threshold",
+            skipped_low_volume, settings.MIN_WHALE_VOLUME_USDC,
+        )
+
+    # Write a timestamped discover log so every leaderboard call is reviewable
+    _write_discover_log(
+        time_period=time_period,
+        limit=limit,
+        raw_entries=entries,
+        results=results,
+        tracked_addresses=list(tracked_addresses),
+    )
+
     return {"leaderboard": results}
+
+
+def _write_discover_log(
+    time_period: str,
+    limit: int,
+    raw_entries: list,
+    results: list,
+    tracked_addresses: list,
+) -> None:
+    """Write a timestamped JSON snapshot of a leaderboard fetch to logs/."""
+    try:
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        log_path = _LOGS_DIR / f"discover_{ts}.json"
+        payload = {
+            "timestamp_utc": datetime.utcnow().isoformat(),
+            "params": {"time_period": time_period, "limit": limit},
+            "tracked_addresses": tracked_addresses,
+            "results": results,
+            "raw_api_response": raw_entries,
+        }
+        log_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        logger.debug("Discover log written: %s", log_path.name)
+    except Exception as exc:
+        logger.warning("Failed to write discover log: %s", exc)
 
 
 # ---------------------------------------------------------------------------
 # Add-to-position signals
 # ---------------------------------------------------------------------------
+
+def _signal_to_dict(sig: AddToPositionSignal) -> dict:
+    """
+    Enrich a signal dict with its linked CopiedBet's outcome so the frontend
+    can show hypothetical P&L and market context without extra round-trips.
+
+    Hypothetical P&L logic:
+        additional_shares  = whale_additional_usdc / signal.price
+        hypothetical_pnl   = additional_shares * bet.resolution_price - whale_additional_usdc
+    This answers: "what would I have made if I had also added to the position?"
+    """
+    d = sig.to_dict()
+    bet: CopiedBet = sig.copied_bet
+
+    if bet:
+        d["bet_status"]     = bet.status
+        d["bet_question"]   = bet.question or bet.market_id
+        d["entry_price"]    = round(bet.price_at_entry, 4)
+
+        # Compute hypothetical P&L for resolved bets
+        if bet.resolution_price is not None and bet.status not in ("OPEN", "PENDING", "SKIPPED"):
+            additional_shares = sig.whale_additional_usdc / max(sig.price, 0.001)
+            proceeds          = additional_shares * bet.resolution_price
+            hypo_pnl          = round(proceeds - sig.whale_additional_usdc, 2)
+            d["hypothetical_pnl_usdc"] = hypo_pnl
+        else:
+            d["hypothetical_pnl_usdc"] = None  # still open — unknown outcome
+    else:
+        d["bet_status"]   = "UNKNOWN"
+        d["bet_question"] = ""
+        d["entry_price"]  = None
+
+    return d
+
+
+@app.get("/api/signals/stats")
+async def get_signals_stats(db: DBSession = Depends(get_db)):
+    """
+    Aggregate statistics for all add-to-position signals.
+    Used to power the "Should I Follow?" dashboard widget.
+    """
+    signals = db.query(AddToPositionSignal).all()
+
+    total           = len(signals)
+    open_count      = 0
+    resolved_count  = 0
+    profitable      = 0
+    losing          = 0
+    total_invested  = 0.0
+    total_pnl       = 0.0
+
+    for sig in signals:
+        total_invested += sig.whale_additional_usdc
+        bet: CopiedBet = sig.copied_bet
+
+        if not bet or bet.status in ("OPEN", "PENDING"):
+            open_count += 1
+            continue
+
+        if bet.status == "SKIPPED":
+            continue  # original bet never placed, skip from analysis
+
+        resolved_count += 1
+        if bet.resolution_price is not None:
+            additional_shares = sig.whale_additional_usdc / max(sig.price, 0.001)
+            hypo_pnl = additional_shares * bet.resolution_price - sig.whale_additional_usdc
+            total_pnl += hypo_pnl
+            if hypo_pnl > 0.01:
+                profitable += 1
+            elif hypo_pnl < -0.01:
+                losing += 1
+
+    win_rate = round(profitable / resolved_count * 100, 1) if resolved_count > 0 else None
+    avg_pnl  = round(total_pnl / resolved_count, 2) if resolved_count > 0 else None
+
+    # Recommendation signal: positive if win_rate > 55% and avg_pnl > 0
+    if resolved_count == 0:
+        verdict = "insufficient_data"
+    elif win_rate >= 60 and avg_pnl > 0:
+        verdict = "follow"
+    elif win_rate <= 40 or avg_pnl < 0:
+        verdict = "avoid"
+    else:
+        verdict = "neutral"
+
+    return {
+        "total_signals":     total,
+        "open_signals":      open_count,
+        "resolved_signals":  resolved_count,
+        "profitable":        profitable,
+        "losing":            losing,
+        "win_rate_pct":      win_rate,
+        "total_invested":    round(total_invested, 2),
+        "total_pnl_usdc":    round(total_pnl, 2),
+        "avg_pnl_per_signal": avg_pnl,
+        "verdict":           verdict,
+    }
+
+
 @app.get("/api/signals")
 async def get_signals(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
     db: DBSession = Depends(get_db),
 ):
-    """Return add-to-position signals."""
+    """Return add-to-position signals with computed hypothetical P&L."""
     total = db.query(AddToPositionSignal).count()
     signals = (
         db.query(AddToPositionSignal)
@@ -469,7 +679,7 @@ async def get_signals(
         .all()
     )
     return {
-        "signals": [s.to_dict() for s in signals],
+        "signals": [_signal_to_dict(s) for s in signals],
         "pagination": {
             "page": page,
             "limit": limit,

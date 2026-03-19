@@ -15,6 +15,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from backend.config import settings
 from backend.database import (
+    CopiedBet,
     MonitoringSession,
     SessionLocal,
     Whale,
@@ -38,6 +39,28 @@ class WhaleMonitor:
             job_defaults={"max_instances": 1, "coalesce": True}
         )
         self._lock = threading.Lock()
+
+        # Permanent resolution scheduler — runs regardless of session state so
+        # open positions are always monitored for early-close opportunities.
+        self._resolution_scheduler = BackgroundScheduler(
+            job_defaults={"max_instances": 1, "coalesce": True}
+        )
+        self._resolution_scheduler.add_job(
+            func=self._check_resolution_wrapper,
+            trigger=IntervalTrigger(minutes=5),
+            id="check_resolution_always",
+        )
+        self._resolution_scheduler.add_job(
+            func=self.poll_exits_only,
+            trigger=IntervalTrigger(seconds=settings.POLLING_INTERVAL_SECONDS),
+            id="poll_exits_always",
+        )
+        self._resolution_scheduler.start()
+        logger.info(
+            "Permanent background scheduler started "
+            "(resolution every 5 min, exit polling every %ds)",
+            settings.POLLING_INTERVAL_SECONDS,
+        )
 
         # { whale_address: datetime } - last seen trade timestamp per whale
         self._last_seen: dict[str, datetime] = {}
@@ -122,14 +145,6 @@ class WhaleMonitor:
             replace_existing=True,
         )
 
-        # Resolution checker every 5 minutes
-        self._scheduler.add_job(
-            func=self._check_resolution_wrapper,
-            trigger=IntervalTrigger(minutes=5),
-            id="check_resolution",
-            replace_existing=True,
-        )
-
         if not self._scheduler.running:
             self._scheduler.start()
 
@@ -144,7 +159,7 @@ class WhaleMonitor:
 
         logger.info("Stopping whale monitor")
 
-        for job_id in ("poll_whales", "refresh_risk_profiles", "check_resolution"):
+        for job_id in ("poll_whales", "refresh_risk_profiles"):
             try:
                 self._scheduler.remove_job(job_id)
             except Exception:
@@ -164,7 +179,14 @@ class WhaleMonitor:
                 db.close()
 
         self._session_id = None
-        logger.info("Whale monitor stopped")
+        logger.info("Whale monitor stopped (resolution checker still running)")
+
+    def shutdown(self):
+        """Full shutdown including the permanent resolution scheduler."""
+        self.stop_monitoring()
+        if self._resolution_scheduler.running:
+            self._resolution_scheduler.shutdown(wait=False)
+            logger.info("Permanent resolution checker stopped")
 
     def is_running(self) -> bool:
         return self._running
@@ -176,58 +198,90 @@ class WhaleMonitor:
     def poll_whales(self):
         """
         Called on each scheduler tick.
-        Checks activity for every active whale.
+        Fetches all whale activity in parallel (single event loop + asyncio.gather),
+        then processes each sequentially to avoid session-balance race conditions.
         """
         if not self._running:
             return
 
+        # Fix #3a: query only the address column — no need for full ORM objects
         db = SessionLocal()
         try:
-            whales = db.query(Whale).filter_by(is_active=True).all()
-            whale_list = [{"id": w.id, "address": w.address} for w in whales]
+            addresses = [
+                row[0]
+                for row in db.query(Whale.address).filter_by(is_active=True).all()
+            ]
         except Exception as exc:
             logger.error("poll_whales: failed to load whales: %s", exc)
             return
         finally:
             db.close()
 
-        logger.debug("Polling %d active whales", len(whale_list))
+        if not addresses:
+            return
 
-        for w in whale_list:
-            try:
-                self._check_whale_activity_sync(w["address"])
-            except Exception as exc:
-                logger.error("Error checking whale %s: %s", w["address"][:10], exc)
+        logger.debug("Polling %d active whales", len(addresses))
 
-    def _check_whale_activity_sync(self, address: str):
-        """
-        Run async whale check in a new event loop (we're in a background thread).
-        """
+        # Fix #1: one event loop for the entire poll cycle
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self.check_whale_activity(address))
+            loop.run_until_complete(self._poll_all_async(addresses))
         finally:
             loop.close()
 
-    async def check_whale_activity(self, address: str):
+    async def _poll_all_async(self, addresses: list):
         """
-        Fetch the last 100 trades for a whale and process any new ones.
+        Phase 1 — parallel HTTP: fetch all whale activity at once.
+        Phase 2 — sequential processing: process each result one at a time
+                   so session balance updates never race each other.
+        """
+        fetch_results = await asyncio.gather(
+            *[self._client.get_user_activity(addr, limit=100) for addr in addresses],
+            return_exceptions=True,
+        )
+
+        for address, trades in zip(addresses, fetch_results):
+            if isinstance(trades, Exception):
+                logger.error(
+                    "Error fetching activity for whale %s: %s", address[:10], trades
+                )
+                continue
+            try:
+                await self.check_whale_activity(address, trades or [])
+            except Exception as exc:
+                logger.error("Error processing whale %s: %s", address[:10], exc)
+
+    async def check_whale_activity(self, address: str, trades: list = None):
+        """
+        Process new trades for a whale.  When called from _poll_all_async the
+        trades list is already fetched (parallel); passing None triggers a
+        standalone fetch (e.g. for manual / test invocations).
         """
         if not self._running or not self._session_id:
             return
 
-        trades = await self._client.get_user_activity(address, limit=100)
+        if trades is None:
+            trades = await self._client.get_user_activity(address, limit=100)
         if not trades:
             return
 
         last_seen = self._last_seen.get(address)
+        now_utc = datetime.now(timezone.utc)
+        max_age_seconds = settings.MAX_TRADE_AGE_HOURS * 3600
         new_trades = []
 
         for trade in trades:
             ts = self._parse_trade_timestamp(trade)
             if ts is None:
                 continue
+
+            # Reject trades older than MAX_TRADE_AGE_HOURS — these are historical
+            # entries that likely reference already-closed markets.
+            age_seconds = (now_utc - ts).total_seconds()
+            if age_seconds > max_age_seconds:
+                continue
+
             if last_seen is None or ts > last_seen:
                 new_trades.append((ts, trade))
 
@@ -262,18 +316,25 @@ class WhaleMonitor:
                 try:
                     whale_bet = await self._save_whale_bet(trade, whale, ts, db)
                     if whale_bet:
-                        # Fetch market info for guard checks
-                        market_info = {}
-                        try:
-                            market_info = await self._client.get_market(whale_bet.market_id) or {}
-                        except Exception:
-                            pass
+                        # Fetch market metadata and live price in parallel.
+                        # get_market receives token_id as a fallback for markets
+                        # whose condition_id returns 404/422 on the direct endpoint.
+                        market_result, price_result = await asyncio.gather(
+                            self._client.get_market(
+                                whale_bet.market_id, token_id=whale_bet.token_id
+                            ),
+                            self._client.get_best_price(whale_bet.token_id),
+                            return_exceptions=True,
+                        )
+                        market_info = market_result if isinstance(market_result, dict) else {}
+                        live_price = price_result if isinstance(price_result, float) else None
 
                         self._bet_engine.process_new_whale_bet(
                             whale_bet=whale_bet,
                             session=session,
                             db=db,
                             market_info=market_info,
+                            live_price=live_price,
                         )
 
                     if new_last_seen is None or ts > new_last_seen:
@@ -295,6 +356,204 @@ class WhaleMonitor:
 
         except Exception as exc:
             logger.error("check_whale_activity error for %s: %s", address[:10], exc)
+            db.rollback()
+        finally:
+            db.close()
+
+    # ------------------------------------------------------------------
+    # Permanent exit polling (runs even when main scan is stopped)
+    # ------------------------------------------------------------------
+
+    def poll_exits_only(self):
+        """
+        Always-on background job: poll tracked whales for EXIT (SELL) trades
+        and close our matching open positions immediately.
+
+        Skipped when the main scanner is active — it already handles exits
+        as part of full trade processing.
+        """
+        if self._running:
+            return  # main scanner covers this
+
+        db = SessionLocal()
+        try:
+            addresses = [
+                row[0]
+                for row in db.query(Whale.address).filter_by(is_active=True).all()
+            ]
+        except Exception as exc:
+            logger.error("poll_exits_only: failed to load whales: %s", exc)
+            return
+        finally:
+            db.close()
+
+        if not addresses:
+            return
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._poll_exits_async(addresses))
+        finally:
+            loop.close()
+
+    async def _poll_exits_async(self, addresses: list):
+        """Fetch recent activity for all whales in parallel, then handle exits."""
+        fetch_results = await asyncio.gather(
+            *[self._client.get_user_activity(addr, limit=20) for addr in addresses],
+            return_exceptions=True,
+        )
+        for address, trades in zip(addresses, fetch_results):
+            if isinstance(trades, Exception):
+                logger.debug("poll_exits_only fetch error for %s: %s", address[:10], trades)
+                continue
+            try:
+                await self._handle_exit_trades(address, trades or [])
+            except Exception as exc:
+                logger.error("poll_exits_only error for %s: %s", address[:10], exc)
+
+    async def _handle_exit_trades(self, address: str, trades: list):
+        """
+        Filter trades to new EXIT signals and close any matching open positions.
+        Only acts if we actually hold a position in the exited market.
+        """
+        last_seen = self._last_seen.get(address)
+        now_utc = datetime.now(timezone.utc)
+        max_age_seconds = settings.MAX_TRADE_AGE_HOURS * 3600
+
+        new_exits = []
+        for trade in trades:
+            ts = self._parse_trade_timestamp(trade)
+            if ts is None:
+                continue
+            if (now_utc - ts).total_seconds() > max_age_seconds:
+                continue
+            if last_seen is not None and ts <= last_seen:
+                continue
+            side = (trade.get("side") or trade.get("type") or "").upper()
+            if side != "SELL":
+                continue
+            new_exits.append((ts, trade))
+
+        if not new_exits:
+            return
+
+        new_exits.sort(key=lambda x: x[0])
+        logger.info(
+            "Background exit poll: %d new EXIT trade(s) from whale %s",
+            len(new_exits), address[:10],
+        )
+
+        db = SessionLocal()
+        try:
+            whale = db.query(Whale).filter_by(address=address).first()
+            if not whale:
+                return
+
+            new_last_seen = last_seen
+
+            for ts, trade in new_exits:
+                try:
+                    token_id = (
+                        trade.get("asset")
+                        or trade.get("tokenId")
+                        or trade.get("outcome_token_id")
+                        or ""
+                    )
+                    market_id = (
+                        trade.get("conditionId")
+                        or trade.get("market")
+                        or trade.get("marketId")
+                        or ""
+                    )
+
+                    # Only act if we hold an open position in this market
+                    open_pos = None
+                    if token_id:
+                        open_pos = (
+                            db.query(CopiedBet)
+                            .filter_by(status="OPEN", token_id=token_id)
+                            .first()
+                        )
+                    if not open_pos and market_id:
+                        open_pos = (
+                            db.query(CopiedBet)
+                            .filter_by(status="OPEN", market_id=market_id)
+                            .first()
+                        )
+
+                    if not open_pos:
+                        # No position — still update last_seen so we don't re-check
+                        if new_last_seen is None or ts > new_last_seen:
+                            new_last_seen = ts
+                        continue
+
+                    # Persist the whale's exit bet for record keeping
+                    whale_bet = await self._save_whale_bet(trade, whale, ts, db)
+                    if not whale_bet:
+                        # Duplicate tx_hash — already processed
+                        if new_last_seen is None or ts > new_last_seen:
+                            new_last_seen = ts
+                        continue
+
+                    # Find the most recent session matching this position's mode
+                    session = (
+                        db.query(MonitoringSession)
+                        .filter_by(mode=open_pos.mode)
+                        .order_by(MonitoringSession.id.desc())
+                        .first()
+                    )
+                    if not session:
+                        if new_last_seen is None or ts > new_last_seen:
+                            new_last_seen = ts
+                        continue
+
+                    # Parse the exit price from the trade
+                    price_raw = trade.get("price") or trade.get("avgPrice") or open_pos.price_at_entry
+                    try:
+                        exit_price = float(price_raw)
+                    except (TypeError, ValueError):
+                        exit_price = open_pos.price_at_entry
+
+                    logger.info(
+                        "Background exit: whale %s exited %s @ %.4f — closing bet %d",
+                        address[:10], (market_id or token_id)[:16], exit_price, open_pos.id,
+                    )
+
+                    if open_pos.mode == "SIMULATION":
+                        self._bet_engine.simulate_sell(
+                            copied_bet=open_pos,
+                            current_price=exit_price,
+                            session=session,
+                            db=db,
+                        )
+                    else:
+                        try:
+                            self._bet_engine.place_real_sell(open_pos.token_id, open_pos.size_shares)
+                            open_pos.status = "CLOSED_NEUTRAL"
+                            open_pos.resolution_price = exit_price
+                            open_pos.closed_at = datetime.utcnow()
+                            db.add(open_pos)
+                        except Exception as exc:
+                            logger.error(
+                                "Background real sell failed for bet %d: %s", open_pos.id, exc
+                            )
+
+                    db.commit()
+
+                except Exception as exc:
+                    logger.error("_handle_exit_trades error for %s: %s", address[:10], exc)
+                    db.rollback()
+
+                if new_last_seen is None or ts > new_last_seen:
+                    new_last_seen = ts
+
+            with self._lock:
+                if new_last_seen:
+                    self._last_seen[address] = new_last_seen
+
+        except Exception as exc:
+            logger.error("_handle_exit_trades outer error for %s: %s", address[:10], exc)
             db.rollback()
         finally:
             db.close()
@@ -441,11 +700,10 @@ class WhaleMonitor:
     # ------------------------------------------------------------------
 
     def _check_resolution_wrapper(self):
-        if self._session_id:
-            try:
-                self._bet_engine.check_resolution(self._session_id)
-            except Exception as exc:
-                logger.error("check_resolution error: %s", exc)
+        try:
+            self._bet_engine.check_resolution()
+        except Exception as exc:
+            logger.error("check_resolution error: %s", exc)
 
     # ------------------------------------------------------------------
     # Utilities

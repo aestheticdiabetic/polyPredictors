@@ -4,6 +4,7 @@ All methods are async using httpx.
 """
 
 import logging
+import time
 from typing import Any, Optional
 
 import httpx
@@ -13,6 +14,7 @@ from backend.config import settings
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(15.0, connect=5.0)
+_MARKET_CACHE_TTL = 3600  # seconds
 
 
 class PolymarketClient:
@@ -20,6 +22,8 @@ class PolymarketClient:
 
     def __init__(self):
         self._http = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True)
+        # {condition_id: (data, expires_at)} — 1-hour TTL market metadata cache
+        self._market_cache: dict = {}
 
     async def close(self):
         await self._http.aclose()
@@ -82,13 +86,13 @@ class PolymarketClient:
         limit: int = 50,
     ) -> list[dict]:
         """
-        Fetch leaderboard from Data API.
-        Returns list of trader dicts with proxyWalletAddress, pnl, volume, etc.
+        Fetch leaderboard from Data API v1.
+        Returns list of trader dicts with proxyWallet, pnl, vol, userName, etc.
         """
-        url = f"{settings.DATA_API_BASE}/leaderboard"
+        url = f"{settings.DATA_API_BASE}/v1/leaderboard"
         params = {
-            "window": time_period,
-            "order_by": order_by,
+            "timePeriod": time_period,
+            "orderBy": order_by,
             "limit": limit,
         }
         try:
@@ -106,24 +110,82 @@ class PolymarketClient:
     # Gamma API  (https://gamma-api.polymarket.com)
     # ------------------------------------------------------------------
 
-    async def get_market(self, condition_id: str) -> Optional[dict]:
+    async def get_market(
+        self, condition_id: str, token_id: str = None
+    ) -> Optional[dict]:
         """
         Fetch market details from Gamma API.
-        Returns dict with endDate, clobTokenIds, question, etc.
+
+        Strategy:
+          1. Try GET /markets/{condition_id}  (fast, cached)
+          2. If that returns 404 or 422 (common for certain condition_id formats),
+             fall back to GET /markets?clob_token_ids={token_id} when token_id
+             is supplied.  This endpoint is known-good for all active markets.
+
+        Both successful and failed lookups are cached to avoid hammering the API:
+          - Success  → cached for _MARKET_CACHE_TTL  (1 hour)
+          - Failure  → cached for 1800 s             (30 minutes)
         """
-        url = f"{settings.GAMMA_API_BASE}/markets/{condition_id}"
-        try:
-            resp = await self._http.get(url)
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 404:
-                logger.debug("Market not found: %s", condition_id)
-            else:
-                logger.warning("get_market HTTP error for %s: %s", condition_id, exc)
+        _NEGATIVE_TTL = 1800  # 30 min negative cache
+        now = time.monotonic()
+
+        # Check cache (stores None for known-bad condition_ids too)
+        cached = self._market_cache.get(condition_id)
+        if cached and cached[1] > now:
+            result = cached[0]
+            if result is not None:
+                return result
+            # Negative cache hit — skip straight to token fallback if available
+        else:
+            # Attempt condition_id lookup
+            url = f"{settings.GAMMA_API_BASE}/markets/{condition_id}"
+            try:
+                resp = await self._http.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+                self._market_cache[condition_id] = (data, now + _MARKET_CACHE_TTL)
+                return data
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status in (404, 422):
+                    logger.debug(
+                        "get_market %d for condition_id %s — will try token fallback",
+                        status, condition_id,
+                    )
+                else:
+                    logger.warning("get_market HTTP error for %s: %s", condition_id, exc)
+                # Cache the failure so we don't retry for 30 minutes
+                self._market_cache[condition_id] = (None, now + _NEGATIVE_TTL)
+            except Exception as exc:
+                logger.error("get_market error for %s: %s", condition_id, exc)
+                return None
+
+        # Fallback: look up by CLOB token_id
+        if not token_id:
             return None
+
+        cache_key = f"token:{token_id}"
+        cached = self._market_cache.get(cache_key)
+        if cached and cached[1] > now:
+            return cached[0]
+
+        url = f"{settings.GAMMA_API_BASE}/markets"
+        try:
+            resp = await self._http.get(url, params={"clob_token_ids": token_id})
+            resp.raise_for_status()
+            data = resp.json()
+            markets = data if isinstance(data, list) else data.get("markets", [])
+            market = markets[0] if markets else None
+            self._market_cache[cache_key] = (market, now + _MARKET_CACHE_TTL)
+            if market:
+                logger.debug(
+                    "get_market resolved via token fallback for condition_id %s",
+                    condition_id,
+                )
+            return market
         except Exception as exc:
-            logger.error("get_market error for %s: %s", condition_id, exc)
+            logger.debug("get_market token fallback error for %s: %s", token_id, exc)
+            self._market_cache[cache_key] = (None, now + _NEGATIVE_TTL)
             return None
 
     async def get_last_trade_price(self, token_id: str) -> Optional[float]:

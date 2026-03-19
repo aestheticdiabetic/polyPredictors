@@ -4,9 +4,12 @@ Handles both SIMULATION and REAL mode bet placement,
 position closing, and resolution checking.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
+
+import httpx
 
 from sqlalchemy.orm import Session as DBSession
 
@@ -41,7 +44,8 @@ class BetEngine:
         session: MonitoringSession,
         db: DBSession,
         market_info: Optional[dict] = None,
-    ) -> CopiedBet:
+        live_price: Optional[float] = None,
+    ) -> Optional[CopiedBet]:
         """
         Decide what to do with a newly detected whale bet and create
         the corresponding CopiedBet record.
@@ -64,7 +68,7 @@ class BetEngine:
         existing_open = self._find_open_position(
             market_id=whale_bet.market_id,
             token_id=whale_bet.token_id,
-            session_id=session.id,
+            session_mode=session.mode,
             db=db,
         )
 
@@ -89,6 +93,14 @@ class BetEngine:
             min_hours_to_close=settings.MIN_MARKET_HOURS_TO_CLOSE,
         )
         if not ok:
+            # If the market is already closed/resolved, drop silently — no ledger entry.
+            # Policy skips (balance, price drift, etc.) still get a SKIPPED record.
+            if self._is_closed_market_skip(market_info or {}, skip_reason):
+                logger.debug(
+                    "Dropping whale_bet %d silently — market already closed: %s",
+                    whale_bet.id, skip_reason,
+                )
+                return None
             return self._create_skipped_bet(
                 whale_bet=whale_bet,
                 session=session,
@@ -122,6 +134,23 @@ class BetEngine:
                 db=db,
             )
 
+        # Price staleness guard — skip if odds have moved too far since the whale bet
+        price_ok, price_reason = risk_calc.check_price_staleness(
+            whale_price=whale_bet.price,
+            live_price=live_price,
+            max_drift=settings.MAX_PRICE_DRIFT_PCT,
+        )
+        if not price_ok:
+            return self._create_skipped_bet(
+                whale_bet=whale_bet,
+                session=session,
+                bet_size_usdc=bet_size_usdc,
+                risk_factor=risk_factor,
+                whale_avg=whale_avg,
+                skip_reason=price_reason,
+                db=db,
+            )
+
         # Place or simulate
         entry_price = whale_bet.price
         try:
@@ -146,9 +175,17 @@ class BetEngine:
                     size_usdc=bet_size_usdc,
                     price=whale_bet.price,
                 )
-                # Try to extract fill info from response
+                # Extract actual fill size from order response
                 shares_filled = order_resp.get("size_matched", bet_size_usdc / max(whale_bet.price, 0.01))
                 size_shares = float(shares_filled)
+                # Use actual fill price if the exchange reports it (avoids slippage mismatch)
+                fill_price = (
+                    order_resp.get("price")
+                    or order_resp.get("avgPrice")
+                    or order_resp.get("average_price")
+                )
+                if fill_price:
+                    entry_price = float(fill_price)
                 bet_status = "OPEN"
                 skip_reason_val = None
         except Exception as exc:
@@ -162,6 +199,24 @@ class BetEngine:
                 skip_reason=f"Order failed: {exc}",
                 db=db,
             )
+
+        # Parse market close date from market_info for ledger display
+        market_close_at = None
+        if market_info:
+            end_str = (
+                market_info.get("endDate")
+                or market_info.get("endDateIso")
+                or market_info.get("end_date_iso")
+                or market_info.get("end_date")
+            )
+            if end_str:
+                try:
+                    dt = datetime.fromisoformat(end_str.rstrip("Z"))
+                    if dt.tzinfo is not None:
+                        dt = dt.replace(tzinfo=None)  # store as naive UTC for consistency
+                    market_close_at = dt
+                except (ValueError, TypeError):
+                    pass
 
         # Persist CopiedBet
         copied_bet = CopiedBet(
@@ -182,6 +237,7 @@ class BetEngine:
             status=bet_status,
             skip_reason=skip_reason_val,
             opened_at=datetime.utcnow(),
+            market_close_at=market_close_at,
         )
         db.add(copied_bet)
 
@@ -292,60 +348,99 @@ class BetEngine:
     # Resolution checker
     # ------------------------------------------------------------------
 
-    def check_resolution(self, session_id: int):
+    def check_resolution(self):
         """
-        Check all OPEN CopiedBets for the given session.
-        For each OPEN bet, look up the current market price.
-        If the price is at or near 0 or 1, treat the market as resolved.
-        Called periodically (every 5 minutes).
+        Check ALL open CopiedBets across every session, regardless of whether
+        the whale monitor is currently running.  This runs on a permanent
+        background scheduler so positions are never left unattended.
+
+        Resolution rules:
+        - Market already ended (hours_remaining < 0):
+            Force-close at current price — the market has settled.
+        - Near-expiry (0 < hours_remaining < MIN_MARKET_HOURS_TO_CLOSE):
+            Close early if price crosses 0.80 / 0.20 — mirrors the whale
+            cashing out before expiry.
+        - Standard open market:
+            Close only when price is very decisive (>= 0.95 or <= 0.05).
         """
         db = SessionLocal()
         try:
-            session = db.query(MonitoringSession).filter_by(id=session_id).first()
-            if not session:
-                return
-
-            open_bets = (
-                db.query(CopiedBet)
-                .filter(
-                    CopiedBet.status == "OPEN",
-                    CopiedBet.mode == session.mode,
-                )
-                .all()
-            )
-
+            open_bets = db.query(CopiedBet).filter(CopiedBet.status == "OPEN").all()
             if not open_bets:
                 return
 
-            # We need the async client but we're in a sync context here.
-            # Use a synchronous fallback: check market data via httpx.get (sync)
-            import httpx
+            logger.debug("check_resolution: checking %d open bet(s)", len(open_bets))
 
-            http = httpx.Client(timeout=10.0, follow_redirects=True)
+            # Fetch price + endDate for all open bets in parallel
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             try:
-                for bet in open_bets:
-                    resolution_price = self._get_resolution_price_sync(
-                        bet.token_id, http
-                    )
-                    if resolution_price is None:
-                        continue
-
-                    # Consider resolved if price is very near 0 or 1
-                    if resolution_price >= 0.95 or resolution_price <= 0.05:
-                        self.simulate_sell(
-                            copied_bet=bet,
-                            current_price=resolution_price,
-                            session=session,
-                            db=db,
-                        )
-                        logger.info(
-                            "Resolved bet %d at price %.4f status=%s",
-                            bet.id, resolution_price, bet.status,
-                        )
-
-                db.commit()
+                resolution_data = loop.run_until_complete(
+                    self._fetch_resolution_data([b.token_id for b in open_bets])
+                )
             finally:
-                http.close()
+                loop.close()
+
+            # Cache sessions by mode so we only query once per mode
+            session_cache: dict[str, Optional[MonitoringSession]] = {}
+
+            now = datetime.now(timezone.utc)
+            min_hours = settings.MIN_MARKET_HOURS_TO_CLOSE
+
+            for bet, (price, end_dt) in zip(open_bets, resolution_data):
+                if price is None:
+                    continue
+
+                # Resolve the session for this bet's mode (cached)
+                if bet.mode not in session_cache:
+                    session_cache[bet.mode] = (
+                        db.query(MonitoringSession)
+                        .filter_by(mode=bet.mode)
+                        .order_by(MonitoringSession.id.desc())
+                        .first()
+                    )
+                session = session_cache.get(bet.mode)
+                if not session:
+                    continue
+
+                # Time remaining to market close
+                hours_remaining: Optional[float] = None
+                if end_dt is not None:
+                    hours_remaining = (end_dt - now).total_seconds() / 3600.0
+
+                # --- Case 1: Market has already ended ---
+                if hours_remaining is not None and hours_remaining < 0:
+                    logger.info(
+                        "Force-close: bet %d market ended %.1fh ago, price=%.4f",
+                        bet.id, abs(hours_remaining), price,
+                    )
+                    self.simulate_sell(copied_bet=bet, current_price=price, session=session, db=db)
+                    continue
+
+                # --- Case 2: Near-expiry window ---
+                if hours_remaining is not None and 0 <= hours_remaining < min_hours:
+                    logger.debug(
+                        "Near-expiry monitoring: bet %d closes in %.2fh, price=%.4f",
+                        bet.id, hours_remaining, price,
+                    )
+                    if price >= 0.80 or price <= 0.20:
+                        logger.info(
+                            "Near-expiry close: bet %d price=%.4f crosses 0.80/0.20 "
+                            "with %.2fh remaining",
+                            bet.id, price, hours_remaining,
+                        )
+                        self.simulate_sell(copied_bet=bet, current_price=price, session=session, db=db)
+                    continue
+
+                # --- Case 3: Standard resolution threshold ---
+                if price >= 0.95 or price <= 0.05:
+                    self.simulate_sell(copied_bet=bet, current_price=price, session=session, db=db)
+                    logger.info(
+                        "Resolved bet %d at price %.4f status=%s",
+                        bet.id, price, bet.status,
+                    )
+
+            db.commit()
 
         except Exception as exc:
             logger.error("check_resolution error: %s", exc)
@@ -353,24 +448,64 @@ class BetEngine:
         finally:
             db.close()
 
-    def _get_resolution_price_sync(self, token_id: str, http: "httpx.Client") -> Optional[float]:
-        """Synchronous fetch of last trade price from Gamma API."""
+    async def _fetch_resolution_data(
+        self, token_ids: list
+    ) -> list[tuple[Optional[float], Optional[datetime]]]:
+        """Fetch price and endDate for multiple tokens in parallel."""
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http:
+            return await asyncio.gather(
+                *[self._get_resolution_data_async(tid, http) for tid in token_ids]
+            )
+
+    async def _get_resolution_data_async(
+        self, token_id: str, http: httpx.AsyncClient
+    ) -> tuple[Optional[float], Optional[datetime]]:
+        """
+        Async fetch of (price, end_dt) from Gamma API for a single token.
+        Returns (None, None) on error.
+        """
         try:
             url = f"{settings.GAMMA_API_BASE}/markets"
-            resp = http.get(url, params={"clob_token_ids": token_id})
+            resp = await http.get(url, params={"clob_token_ids": token_id})
             resp.raise_for_status()
             data = resp.json()
             markets = data if isinstance(data, list) else data.get("markets", [])
             for market in markets:
                 tokens = market.get("clobTokenIds", [])
                 outcomes = market.get("outcomePrices", [])
-                if token_id in tokens and outcomes:
-                    idx = tokens.index(token_id)
-                    if idx < len(outcomes):
-                        return float(outcomes[idx])
+                if token_id not in tokens:
+                    continue
+
+                # Parse price
+                price: Optional[float] = None
+                idx = tokens.index(token_id)
+                if outcomes and idx < len(outcomes):
+                    try:
+                        price = float(outcomes[idx])
+                    except (TypeError, ValueError):
+                        pass
+
+                # Parse endDate
+                end_dt: Optional[datetime] = None
+                end_str = (
+                    market.get("endDate")
+                    or market.get("endDateIso")
+                    or market.get("end_date_iso")
+                    or market.get("end_date")
+                )
+                if end_str:
+                    try:
+                        dt = datetime.fromisoformat(end_str.rstrip("Z"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        end_dt = dt
+                    except (ValueError, TypeError):
+                        pass
+
+                return price, end_dt
         except Exception as exc:
-            logger.debug("_get_resolution_price_sync error: %s", exc)
-        return None
+            logger.debug("_get_resolution_data_async error for %s: %s", token_id, exc)
+        return None, None
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -386,7 +521,7 @@ class BetEngine:
         open_pos = self._find_open_position(
             market_id=whale_bet.market_id,
             token_id=whale_bet.token_id,
-            session_id=session.id,
+            session_mode=session.mode,
             db=db,
         )
 
@@ -442,7 +577,7 @@ class BetEngine:
         existing_open: CopiedBet,
         db: DBSession,
     ) -> CopiedBet:
-        """Whale is adding to a market we already hold - record signal, skip copy."""
+        """Whale is adding to a market we already hold - record signal only, no new ledger entry."""
         signal = AddToPositionSignal(
             whale_bet_id=whale_bet.id,
             copied_bet_id=existing_open.id,
@@ -453,29 +588,9 @@ class BetEngine:
             note="Whale added to position while we hold",
         )
         db.add(signal)
-
-        # Mark the whale_bet as leading to a SKIPPED copy
-        copied_bet = CopiedBet(
-            whale_bet_id=whale_bet.id,
-            whale_address=whale_bet.whale.address,
-            mode=existing_open.mode,
-            market_id=whale_bet.market_id,
-            token_id=whale_bet.token_id,
-            question=whale_bet.question,
-            side=whale_bet.side,
-            outcome=whale_bet.outcome,
-            price_at_entry=whale_bet.price,
-            size_usdc=0.0,
-            size_shares=0.0,
-            risk_factor=1.0,
-            whale_bet_usdc=whale_bet.size_usdc,
-            whale_avg_bet_usdc=whale_bet.whale.avg_bet_size_usdc if whale_bet.whale else 0.0,
-            status="SKIPPED",
-            skip_reason="Already have open position in this market",
-        )
-        db.add(copied_bet)
         db.commit()
-        return copied_bet
+        # Return the existing open position — no new ledger entry created
+        return existing_open
 
     def _create_skipped_bet(
         self,
@@ -511,26 +626,50 @@ class BetEngine:
         logger.info("Skipped bet for whale_bet %d: %s", whale_bet.id, skip_reason)
         return copied_bet
 
+    @staticmethod
+    def _is_closed_market_skip(market_info: dict, skip_reason: str) -> bool:
+        """
+        Return True if the skip is because the market is already closed/expired.
+        These should be dropped silently rather than cluttering the ledger.
+        Policy skips (balance, min bet, price drift, closing soon) return False.
+        """
+        # Explicit closed/resolved flags from market metadata
+        if market_info.get("closed") or market_info.get("resolved"):
+            return True
+        if not market_info.get("active", True):
+            return True
+        status = str(market_info.get("status", "")).lower()
+        if status in ("closed", "resolved", "finalized", "settled"):
+            return True
+
+        # Reason-string patterns produced by should_place_bet for past-end-date markets
+        closed_phrases = (
+            "market is already closed",
+            "market is already resolved",
+            "market is inactive",
+            "closed ",       # "Market closed 3.2h ago"
+            "market status is",
+            "market end date unknown",
+        )
+        reason_lower = skip_reason.lower()
+        return any(phrase in reason_lower for phrase in closed_phrases)
+
     def _find_open_position(
         self,
         market_id: str,
         token_id: str,
-        session_id: int,
+        session_mode: str,
         db: DBSession,
     ) -> Optional[CopiedBet]:
-        """Find an OPEN CopiedBet for this market/token in the given session."""
-        # Get session mode first
-        session = db.query(MonitoringSession).filter_by(id=session_id).first()
-        if not session:
-            return None
-
+        """Find an OPEN CopiedBet for this market/token in the given session.
+        Accepts session_mode directly to avoid a redundant DB round-trip."""
         return (
             db.query(CopiedBet)
             .filter(
                 CopiedBet.market_id == market_id,
                 CopiedBet.token_id == token_id,
                 CopiedBet.status == "OPEN",
-                CopiedBet.mode == session.mode,
+                CopiedBet.mode == session_mode,
             )
             .first()
         )
