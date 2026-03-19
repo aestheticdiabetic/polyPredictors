@@ -13,6 +13,7 @@ import httpx
 
 from sqlalchemy.orm import Session as DBSession
 
+from backend.categorizer import classify
 from backend.config import settings
 from backend.database import (
     AddToPositionSignal,
@@ -134,6 +135,27 @@ class BetEngine:
                 db=db,
             )
 
+        # Category filter — skip if this whale has disabled this sport or bet type
+        cat_sport, cat_bet_type = classify(whale_bet.question)
+        if whale and whale.category_filters:
+            import json as _json
+            try:
+                filters = _json.loads(whale.category_filters)
+                disabled_sports = filters.get("disabled_sports", [])
+                disabled_bet_types = filters.get("disabled_bet_types", [])
+                if cat_sport in disabled_sports or cat_bet_type in disabled_bet_types:
+                    return self._create_skipped_bet(
+                        whale_bet=whale_bet,
+                        session=session,
+                        bet_size_usdc=bet_size_usdc,
+                        risk_factor=risk_factor,
+                        whale_avg=whale_avg,
+                        skip_reason=f"Category filtered: {cat_sport} / {cat_bet_type}",
+                        db=db,
+                    )
+            except Exception:
+                pass
+
         # Price staleness guard — skip if odds have moved too far since the whale bet
         price_ok, price_reason = risk_calc.check_price_staleness(
             whale_price=whale_bet.price,
@@ -218,6 +240,9 @@ class BetEngine:
                 except (ValueError, TypeError):
                     pass
 
+        # Classify market category and bet type
+        market_category, bet_type_cat = classify(whale_bet.question)
+
         # Persist CopiedBet
         copied_bet = CopiedBet(
             whale_bet_id=whale_bet.id,
@@ -236,6 +261,8 @@ class BetEngine:
             whale_avg_bet_usdc=whale_avg,
             status=bet_status,
             skip_reason=skip_reason_val,
+            market_category=market_category,
+            bet_type=bet_type_cat,
             opened_at=datetime.utcnow(),
             market_close_at=market_close_at,
         )
@@ -426,15 +453,27 @@ class BetEngine:
                     continue
 
                 # --- Case 1: Market has already ended ---
+                # Only settle once the price has reached a decisive resolution value.
+                # Polymarket markets take hours-to-days after the scheduled end time
+                # for the UMA/oracle resolution to propagate on-chain; until then the
+                # Gamma API returns the last trading price, not the final 1.0/0.0.
+                # Force-closing at a mid-market price produces incorrect win/loss results.
                 if market_ended:
-                    logger.info(
-                        "Force-close: bet %d market ended %.1fh ago, price=%.4f",
-                        bet.id, abs(hours_remaining), price,
-                    )
-                    self.simulate_sell(
-                        copied_bet=bet, current_price=price, session=session, db=db,
-                        close_reason="Market ended",
-                    )
+                    if price >= 0.95 or price <= 0.05:
+                        logger.info(
+                            "Force-close: bet %d market ended %.1fh ago, price=%.4f (resolved)",
+                            bet.id, abs(hours_remaining), price,
+                        )
+                        self.simulate_sell(
+                            copied_bet=bet, current_price=price, session=session, db=db,
+                            close_reason="Market ended",
+                        )
+                    else:
+                        logger.debug(
+                            "Market ended %.1fh ago but price=%.4f not yet settled — "
+                            "waiting for on-chain resolution (bet %d)",
+                            abs(hours_remaining), price, bet.id,
+                        )
                     continue
 
                 # --- Case 2: Near-expiry window ---

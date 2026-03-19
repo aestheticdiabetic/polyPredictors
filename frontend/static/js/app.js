@@ -101,7 +101,6 @@ document.addEventListener('DOMContentLoaded', () => {
   fetchActivity();
   fetchLedger();
   fetchSignals();
-  fetchWhaleAnalysis();
 
   // Polling
   State.pollInterval = setInterval(() => {
@@ -115,7 +114,6 @@ document.addEventListener('DOMContentLoaded', () => {
     if (State.session && State.session.is_active) {
       fetchLedger();
       fetchSignals();
-      fetchWhaleAnalysis();
     }
   }, 10000);
 });
@@ -867,58 +865,7 @@ function renderSignalsGrouped(signals, tab, page) {
   }).join('');
 }
 
-// ============================================================
-// Whale Analysis
-// ============================================================
-async function fetchWhaleAnalysis() {
-  if (_inFlight.has('whale-analysis')) return;
-  _inFlight.add('whale-analysis');
-  try {
-    const data = await api('GET', '/api/stats/by-whale');
-    renderWhaleAnalysis(data.whales);
-  } catch (err) {
-    console.error('fetchWhaleAnalysis error:', err);
-  } finally {
-    _inFlight.delete('whale-analysis');
-  }
-}
-
-function renderWhaleAnalysis(whales) {
-  const tbody = $('whale-analysis-body');
-  if (!tbody) return;
-
-  if (!whales || whales.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="9"><div class="empty-state"><p>No closed bets yet.</p></div></td></tr>`;
-    return;
-  }
-
-  tbody.innerHTML = whales.map(w => {
-    const alias    = escHtml(w.whale_alias || w.whale_address);
-    const winRate  = w.win_rate_pct != null ? `${w.win_rate_pct}%` : '—';
-    const wlnLabel = `${w.wins} / ${w.losses} / ${w.neutral}`;
-
-    const pnlCls  = w.total_pnl_usdc > 0 ? 'pnl-positive' : w.total_pnl_usdc < 0 ? 'pnl-negative' : 'pnl-zero';
-    const avgCls  = w.avg_pnl_usdc  > 0 ? 'pnl-positive' : w.avg_pnl_usdc  < 0 ? 'pnl-negative' : 'pnl-zero';
-    const bestCls = (w.best_bet_usdc  ?? 0) > 0 ? 'pnl-positive' : 'pnl-zero';
-    const wrstCls = (w.worst_bet_usdc ?? 0) < 0 ? 'pnl-negative' : 'pnl-zero';
-
-    const winRateCls = w.win_rate_pct == null ? '' :
-      w.win_rate_pct >= 60 ? 'pnl-positive' : w.win_rate_pct <= 40 ? 'pnl-negative' : '';
-
-    return `
-      <tr>
-        <td title="${escHtml(w.whale_address)}" style="font-weight:500">${alias}</td>
-        <td class="mono">${w.followed}</td>
-        <td class="mono text-muted">${w.open}</td>
-        <td class="mono text-muted">${wlnLabel}</td>
-        <td class="mono ${winRateCls}">${winRate}</td>
-        <td class="mono ${pnlCls}">${formatPnl(w.total_pnl_usdc)}</td>
-        <td class="mono ${avgCls}">${w.closed > 0 ? formatPnl(w.avg_pnl_usdc) : '—'}</td>
-        <td class="mono ${bestCls}">${w.best_bet_usdc  != null ? formatPnl(w.best_bet_usdc)  : '—'}</td>
-        <td class="mono ${wrstCls}">${w.worst_bet_usdc != null ? formatPnl(w.worst_bet_usdc) : '—'}</td>
-      </tr>`;
-  }).join('');
-}
+// Whale analysis moved to /whales page
 
 // ============================================================
 // Helpers

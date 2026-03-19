@@ -499,6 +499,144 @@ async def stats_by_whale(db: DBSession = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
+# Per-whale category breakdown
+# ---------------------------------------------------------------------------
+@app.get("/api/stats/by-whale-category")
+async def stats_by_whale_category(db: DBSession = Depends(get_db)):
+    """
+    Aggregate closed CopiedBets broken down by whale × sport × bet_type.
+    Returns per-whale sport and bet-type breakdowns for the analysis page.
+    """
+    import json as _json
+    from collections import defaultdict
+
+    def _empty_bucket():
+        return {"wins": 0, "losses": 0, "neutral": 0, "closed": 0, "pnl_values": []}
+
+    closed_bets = (
+        db.query(CopiedBet)
+        .filter(CopiedBet.status.in_(["CLOSED_WIN", "CLOSED_LOSS", "CLOSED_NEUTRAL"]))
+        .all()
+    )
+
+    whales = db.query(Whale).all()
+    alias_map = {w.address: (w.alias or w.address) for w in whales}
+    filters_map = {w.address: w.category_filters for w in whales}
+
+    # {address: {"by_sport": {sport: bucket}, "by_bet_type": {bet_type: bucket}}}
+    data: dict = defaultdict(lambda: {
+        "by_sport": defaultdict(_empty_bucket),
+        "by_bet_type": defaultdict(_empty_bucket),
+    })
+
+    for b in closed_bets:
+        sport = b.market_category or "Other"
+        bt = b.bet_type or "Other"
+        for bucket_key, bucket_val in [("by_sport", sport), ("by_bet_type", bt)]:
+            g = data[b.whale_address][bucket_key][bucket_val]
+            g["closed"] += 1
+            if b.status == "CLOSED_WIN":
+                g["wins"] += 1
+            elif b.status == "CLOSED_LOSS":
+                g["losses"] += 1
+            else:
+                g["neutral"] += 1
+            if b.pnl_usdc is not None:
+                g["pnl_values"].append(b.pnl_usdc)
+
+    def _summarise(buckets: dict) -> list:
+        result = []
+        for label, g in sorted(buckets.items()):
+            total_pnl = round(sum(g["pnl_values"]), 2) if g["pnl_values"] else 0.0
+            win_rate = round(g["wins"] / g["closed"] * 100, 1) if g["closed"] > 0 else None
+            result.append({
+                "label": label,
+                "wins": g["wins"],
+                "losses": g["losses"],
+                "neutral": g["neutral"],
+                "closed": g["closed"],
+                "win_rate_pct": win_rate,
+                "total_pnl_usdc": total_pnl,
+            })
+        result.sort(key=lambda x: x["total_pnl_usdc"], reverse=True)
+        return result
+
+    output = []
+    for address, d in data.items():
+        raw_filters = filters_map.get(address)
+        try:
+            parsed_filters = _json.loads(raw_filters) if raw_filters else {}
+        except Exception:
+            parsed_filters = {}
+        output.append({
+            "whale_address": address,
+            "whale_alias": alias_map.get(address, address),
+            "category_filters": parsed_filters,
+            "by_sport": _summarise(d["by_sport"]),
+            "by_bet_type": _summarise(d["by_bet_type"]),
+        })
+
+    output.sort(key=lambda x: sum(s["total_pnl_usdc"] for s in x["by_sport"]), reverse=True)
+    return {"whales": output}
+
+
+# ---------------------------------------------------------------------------
+# Whale category filter management
+# ---------------------------------------------------------------------------
+
+class CategoryFiltersRequest(BaseModel):
+    disabled_sports: list[str] = []
+    disabled_bet_types: list[str] = []
+
+
+@app.get("/api/whales/{address}/categories")
+async def get_whale_categories(address: str, db: DBSession = Depends(get_db)):
+    """Return the current category filter config for a whale."""
+    import json as _json
+    whale = db.query(Whale).filter_by(address=address).first()
+    if not whale:
+        raise HTTPException(status_code=404, detail="Whale not found")
+    try:
+        filters = _json.loads(whale.category_filters) if whale.category_filters else {}
+    except Exception:
+        filters = {}
+    return {
+        "address": address,
+        "disabled_sports": filters.get("disabled_sports", []),
+        "disabled_bet_types": filters.get("disabled_bet_types", []),
+    }
+
+
+@app.patch("/api/whales/{address}/categories")
+async def update_whale_categories(
+    address: str,
+    body: CategoryFiltersRequest,
+    db: DBSession = Depends(get_db),
+):
+    """Update which sports / bet types to skip for a whale (opt-out model)."""
+    import json as _json
+    whale = db.query(Whale).filter_by(address=address).first()
+    if not whale:
+        raise HTTPException(status_code=404, detail="Whale not found")
+    payload = {
+        "disabled_sports": body.disabled_sports,
+        "disabled_bet_types": body.disabled_bet_types,
+    }
+    whale.category_filters = _json.dumps(payload)
+    db.add(whale)
+    db.commit()
+    return {"address": address, **payload}
+
+
+# ---------------------------------------------------------------------------
+# Whale analysis page
+# ---------------------------------------------------------------------------
+@app.get("/whales", response_class=HTMLResponse)
+async def whale_analysis_page(request: Request):
+    return templates.TemplateResponse("whales.html", {"request": request})
+
+
+# ---------------------------------------------------------------------------
 # Activity feed
 # ---------------------------------------------------------------------------
 @app.get("/api/activity")

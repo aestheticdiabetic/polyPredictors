@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Whale Analysis — Polymarket Whale Copier</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+  <style>
+    /* ── Page-specific styles ─────────────────────────────────────────── */
+
+    .nav-back {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-secondary);
+      font-size: 0.82rem;
+      padding: 6px 12px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+      transition: color var(--transition), border-color var(--transition);
+      cursor: pointer;
+      background: none;
+    }
+    .nav-back:hover { color: var(--text-primary); border-color: var(--accent); text-decoration: none; }
+
+    /* Summary row — clickable to expand */
+    tr.whale-summary-row { cursor: pointer; user-select: none; }
+    tr.whale-summary-row:hover td { background: var(--bg-card-hover); }
+    tr.whale-summary-row td:first-child::before {
+      content: '▶';
+      display: inline-block;
+      margin-right: 6px;
+      font-size: 0.65rem;
+      color: var(--text-muted);
+      transition: transform var(--transition);
+    }
+    tr.whale-summary-row.expanded td:first-child::before { transform: rotate(90deg); }
+
+    /* Expanded detail panel */
+    tr.whale-detail-row td { padding: 0 !important; border-top: none !important; }
+    .whale-detail-panel {
+      background: var(--bg-primary);
+      border-bottom: 2px solid var(--border);
+      padding: 20px 24px;
+      display: none;
+    }
+    tr.whale-detail-row.open .whale-detail-panel { display: block; }
+
+    .detail-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }
+    @media (max-width: 900px) { .detail-grid { grid-template-columns: 1fr; } }
+
+    .detail-section-title {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 10px;
+    }
+
+    .detail-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    .detail-table th {
+      text-align: left;
+      padding: 5px 10px;
+      color: var(--text-muted);
+      font-weight: 500;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.72rem;
+    }
+    .detail-table td { padding: 6px 10px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+    .detail-table tr:last-child td { border-bottom: none; }
+    .detail-table tr:hover td { background: var(--bg-card-hover); }
+
+    /* Filter panel */
+    .filter-panel {
+      margin-top: 20px;
+      padding-top: 18px;
+      border-top: 1px solid var(--border);
+    }
+    .filter-panel-title {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 12px;
+    }
+    .filter-groups {
+      display: flex;
+      gap: 32px;
+      flex-wrap: wrap;
+    }
+    .filter-group-label {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+    .filter-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .filter-chip {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 10px;
+      border-radius: 20px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      font-size: 0.78rem;
+      color: var(--text-primary);
+      cursor: pointer;
+      transition: border-color var(--transition), background var(--transition);
+      user-select: none;
+    }
+    .filter-chip input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
+    .filter-chip:hover { border-color: var(--accent); }
+    .filter-chip.disabled-chip {
+      opacity: 0.45;
+      text-decoration: line-through;
+    }
+    .filter-save-btn {
+      margin-top: 14px;
+    }
+
+    /* Category badge colours */
+    .cat-soccer     { color: #4ade80; }
+    .cat-basketball { color: #fb923c; }
+    .cat-tennis     { color: #a78bfa; }
+    .cat-esports    { color: #38bdf8; }
+    .cat-football   { color: #fbbf24; }
+    .cat-baseball   { color: #f87171; }
+    .cat-politics   { color: #e879f9; }
+    .cat-crypto     { color: #34d399; }
+    .cat-other      { color: var(--text-muted); }
+  </style>
+</head>
+<body>
+
+<div class="app-container">
+
+  <!-- Header -->
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-icon">🐋</div>
+      <h1>Whale Analysis</h1>
+    </div>
+    <div class="header-right">
+      <a href="/" class="nav-back">&#8592; Back to Dashboard</a>
+    </div>
+  </header>
+
+  <!-- ================================================================
+       OVERALL WHALE SUMMARY TABLE
+       ================================================================ -->
+  <section class="card" style="margin-bottom:24px">
+    <div class="card-title">
+      <span class="dot"></span>
+      Whale Performance Summary
+      <span class="text-muted" style="font-size:0.72rem;font-weight:400;margin-left:6px">
+        (click a row to expand category breakdown and filters)
+      </span>
+    </div>
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th>Whale</th>
+            <th>Followed</th>
+            <th>Open</th>
+            <th>W / L / N</th>
+            <th>Win Rate</th>
+            <th>Total P&amp;L</th>
+            <th>Avg P&amp;L / Bet</th>
+            <th>Best Bet</th>
+            <th>Worst Bet</th>
+          </tr>
+        </thead>
+        <tbody id="whale-analysis-body">
+          <tr>
+            <td colspan="9">
+              <div class="empty-state"><p>Loading whale data...</p></div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+</div><!-- /app-container -->
+
+<!-- Toast container -->
+<div id="toast-container" class="toast-container"></div>
+
+<script>
+/* ============================================================
+   Whale Analysis Page JS
+   ============================================================ */
+
+const ALL_SPORTS    = ["Soccer","Basketball","Tennis","eSports","American Football","Baseball","Politics","Crypto","Other"];
+const ALL_BET_TYPES = ["Over/Under","Spread","Exact Score","Moneyline","Match Winner","Other"];
+
+const SPORT_CLASS = {
+  Soccer: "cat-soccer", Basketball: "cat-basketball", Tennis: "cat-tennis",
+  eSports: "cat-esports", "American Football": "cat-football", Baseball: "cat-baseball",
+  Politics: "cat-politics", Crypto: "cat-crypto", Other: "cat-other",
+};
+
+// ── Utility ───────────────────────────────────────────────────────────────
+
+function fmt(v, prefix = "$") {
+  if (v == null) return "—";
+  const abs = Math.abs(v).toFixed(2);
+  return (v < 0 ? "-" : "+") + prefix + abs;
+}
+
+function pnlClass(v) {
+  if (v == null) return "";
+  return v > 0 ? "text-success" : v < 0 ? "text-danger" : "text-muted";
+}
+
+function winRateClass(r) {
+  if (r == null) return "";
+  return r >= 60 ? "text-success" : r <= 40 ? "text-danger" : "";
+}
+
+function showToast(msg, type = "info") {
+  const tc = document.getElementById("toast-container");
+  const t = document.createElement("div");
+  t.className = `toast toast-${type}`;
+  t.textContent = msg;
+  tc.appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+
+// ── Category breakdown sub-table ──────────────────────────────────────────
+
+function buildBreakdownTable(rows) {
+  if (!rows || rows.length === 0) return "<em style='color:var(--text-muted);font-size:0.8rem'>No closed bets</em>";
+  let html = `<table class="detail-table">
+    <thead><tr>
+      <th>Category</th><th>W / L / N</th><th>Win Rate</th><th>Total P&amp;L</th>
+    </tr></thead><tbody>`;
+  for (const r of rows) {
+    const cls = SPORT_CLASS[r.label] || "cat-other";
+    html += `<tr>
+      <td><span class="${cls}">${r.label}</span></td>
+      <td>${r.wins} / ${r.losses} / ${r.neutral}</td>
+      <td class="${winRateClass(r.win_rate_pct)}">${r.win_rate_pct != null ? r.win_rate_pct + "%" : "—"}</td>
+      <td class="${pnlClass(r.total_pnl_usdc)}">${fmt(r.total_pnl_usdc)}</td>
+    </tr>`;
+  }
+  html += "</tbody></table>";
+  return html;
+}
+
+// ── Filter chips ──────────────────────────────────────────────────────────
+
+function buildFilterChips(containerId, items, allItems, disabled) {
+  const wrap = document.getElementById(containerId);
+  wrap.innerHTML = "";
+  for (const item of allItems) {
+    const isDisabled = disabled.includes(item);
+    const chip = document.createElement("label");
+    chip.className = "filter-chip" + (isDisabled ? " disabled-chip" : "");
+    chip.dataset.value = item;
+
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = !isDisabled;
+    cb.addEventListener("change", () => {
+      chip.classList.toggle("disabled-chip", !cb.checked);
+    });
+
+    chip.appendChild(cb);
+    chip.appendChild(document.createTextNode(item));
+    wrap.appendChild(chip);
+  }
+}
+
+function readDisabled(containerId) {
+  return Array.from(document.querySelectorAll(`#${containerId} .filter-chip`))
+    .filter(c => !c.querySelector("input").checked)
+    .map(c => c.dataset.value);
+}
+
+// ── Detail panel HTML ─────────────────────────────────────────────────────
+
+function buildDetailPanel(whale) {
+  const addr = whale.whale_address;
+  const safeId = addr.replace(/[^a-z0-9]/gi, "_");
+  const filters = whale.category_filters || {};
+  const disabledSports   = filters.disabled_sports   || [];
+  const disabledBetTypes = filters.disabled_bet_types || [];
+
+  return `
+    <div class="whale-detail-panel" id="panel-${safeId}">
+      <div class="detail-grid">
+        <div>
+          <div class="detail-section-title">By Sport / Topic</div>
+          ${buildBreakdownTable(whale.by_sport)}
+        </div>
+        <div>
+          <div class="detail-section-title">By Bet Type</div>
+          ${buildBreakdownTable(whale.by_bet_type)}
+        </div>
+      </div>
+
+      <div class="filter-panel">
+        <div class="filter-panel-title">&#9881; Category Filters
+          <span style="font-size:0.7rem;font-weight:400;color:var(--text-muted);margin-left:6px;text-transform:none">
+            Unchecked = skip this whale's bets in that category
+          </span>
+        </div>
+        <div class="filter-groups">
+          <div>
+            <div class="filter-group-label">Sports / Topics</div>
+            <div class="filter-chips" id="sports-chips-${safeId}"></div>
+          </div>
+          <div>
+            <div class="filter-group-label">Bet Types</div>
+            <div class="filter-chips" id="bettypes-chips-${safeId}"></div>
+          </div>
+        </div>
+        <div class="filter-save-btn">
+          <button class="btn btn-primary btn-sm"
+                  onclick="saveFilters('${addr}', '${safeId}')">
+            Save Filters
+          </button>
+          <span id="save-status-${safeId}" style="margin-left:10px;font-size:0.78rem;color:var(--text-muted)"></span>
+        </div>
+      </div>
+    </div>`;
+}
+
+// ── Save filters ──────────────────────────────────────────────────────────
+
+async function saveFilters(address, safeId) {
+  const disabledSports   = readDisabled(`sports-chips-${safeId}`);
+  const disabledBetTypes = readDisabled(`bettypes-chips-${safeId}`);
+  const statusEl = document.getElementById(`save-status-${safeId}`);
+  try {
+    const resp = await fetch(`/api/whales/${address}/categories`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ disabled_sports: disabledSports, disabled_bet_types: disabledBetTypes }),
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+    statusEl.textContent = "✓ Saved";
+    statusEl.style.color = "var(--success)";
+    showToast("Filters saved", "success");
+    setTimeout(() => { statusEl.textContent = ""; }, 3000);
+  } catch (e) {
+    statusEl.textContent = "✗ Error";
+    statusEl.style.color = "var(--danger)";
+    showToast("Failed to save filters", "error");
+  }
+}
+
+// ── Main summary table ────────────────────────────────────────────────────
+
+let _analysisData = [];
+
+async function fetchWhaleAnalysis() {
+  // Fetch both endpoints in parallel
+  const [summaryResp, catResp] = await Promise.all([
+    fetch("/api/stats/by-whale"),
+    fetch("/api/stats/by-whale-category"),
+  ]);
+  const summaryData = await summaryResp.json();
+  const catData     = await catResp.json();
+
+  // Index category data by address
+  const catByAddr = {};
+  for (const w of catData.whales) catByAddr[w.whale_address] = w;
+
+  // Merge
+  _analysisData = summaryData.whales.map(w => ({
+    ...w,
+    ...(catByAddr[w.whale_address] || {}),
+  }));
+
+  renderWhaleAnalysis(_analysisData);
+}
+
+function renderWhaleAnalysis(whales) {
+  const tbody = document.getElementById("whale-analysis-body");
+  if (!whales || whales.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="9"><div class="empty-state"><p>No closed bets yet.</p></div></td></tr>`;
+    return;
+  }
+
+  let html = "";
+  for (const w of whales) {
+    const alias = w.whale_alias || w.whale_address;
+    const short = w.whale_address ? w.whale_address.slice(0, 8) + "…" : "";
+    const wrClass = winRateClass(w.win_rate_pct);
+    const pnlCls  = pnlClass(w.total_pnl_usdc);
+    const safeId  = w.whale_address.replace(/[^a-z0-9]/gi, "_");
+
+    // Summary row
+    html += `<tr class="whale-summary-row" onclick="toggleWhaleRow('${safeId}', this)" data-addr="${w.whale_address}">
+      <td>
+        <span style="font-weight:600">${alias}</span>
+        <span class="text-muted mono" style="font-size:0.72rem;margin-left:6px">${short}</span>
+      </td>
+      <td>${w.followed}</td>
+      <td>${w.open}</td>
+      <td>${w.wins} / ${w.losses} / ${w.neutral}</td>
+      <td class="${wrClass}">${w.win_rate_pct != null ? w.win_rate_pct + "%" : "—"}</td>
+      <td class="${pnlCls}">${fmt(w.total_pnl_usdc)}</td>
+      <td class="${pnlClass(w.avg_pnl_usdc)}">${fmt(w.avg_pnl_usdc)}</td>
+      <td class="text-success">${w.best_bet_usdc != null ? fmt(w.best_bet_usdc) : "—"}</td>
+      <td class="text-danger">${w.worst_bet_usdc != null ? fmt(w.worst_bet_usdc) : "—"}</td>
+    </tr>`;
+
+    // Detail row (hidden until expanded)
+    html += `<tr class="whale-detail-row" id="detail-row-${safeId}">
+      <td colspan="9">${buildDetailPanel(w)}</td>
+    </tr>`;
+  }
+  tbody.innerHTML = html;
+
+  // Initialise filter chips for each whale
+  for (const w of whales) {
+    const safeId = w.whale_address.replace(/[^a-z0-9]/gi, "_");
+    const filters = w.category_filters || {};
+    buildFilterChips(`sports-chips-${safeId}`,    ALL_SPORTS,    ALL_SPORTS,    filters.disabled_sports   || []);
+    buildFilterChips(`bettypes-chips-${safeId}`,  ALL_BET_TYPES, ALL_BET_TYPES, filters.disabled_bet_types || []);
+  }
+}
+
+function toggleWhaleRow(safeId, summaryRow) {
+  const detailRow = document.getElementById(`detail-row-${safeId}`);
+  const panel     = document.getElementById(`panel-${safeId}`);
+  const isOpen    = summaryRow.classList.contains("expanded");
+
+  summaryRow.classList.toggle("expanded", !isOpen);
+  detailRow.classList.toggle("open", !isOpen);
+  if (panel) panel.style.display = isOpen ? "none" : "block";
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────
+
+fetchWhaleAnalysis();
+</script>
+</body>
+</html>

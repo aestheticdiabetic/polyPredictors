@@ -59,6 +59,10 @@ class Whale(Base):
     total_bets_tracked = Column(Integer, default=0, nullable=False)
     win_count = Column(Integer, default=0, nullable=False)
 
+    # Category filters — JSON: {"disabled_sports": [...], "disabled_bet_types": [...]}
+    # null means follow all categories (opt-out model)
+    category_filters = Column(Text, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     # Relationships
@@ -76,6 +80,7 @@ class Whale(Base):
             "total_bets_tracked": self.total_bets_tracked,
             "win_count": self.win_count,
             "win_rate_pct": round(win_rate, 1),
+            "category_filters": self.category_filters,
             "created_at": self.created_at.isoformat(),
         }
 
@@ -158,6 +163,10 @@ class CopiedBet(Base):
     pnl_usdc = Column(Float, nullable=True)
     resolution_price = Column(Float, nullable=True)
 
+    # Categorisation
+    market_category = Column(String(50), nullable=True)   # Soccer | Basketball | Tennis | ...
+    bet_type = Column(String(50), nullable=True)          # Over/Under | Spread | Moneyline | ...
+
     # Timestamps
     opened_at = Column(DateTime, nullable=True)
     closed_at = Column(DateTime, nullable=True)
@@ -191,6 +200,8 @@ class CopiedBet(Base):
             "close_reason": self.close_reason,
             "pnl_usdc": round(self.pnl_usdc, 2) if self.pnl_usdc is not None else None,
             "resolution_price": round(self.resolution_price, 4) if self.resolution_price is not None else None,
+            "market_category": self.market_category,
+            "bet_type": self.bet_type,
             "opened_at": self.opened_at.isoformat() if self.opened_at else None,
             "closed_at": self.closed_at.isoformat() if self.closed_at else None,
             "market_close_at": self.market_close_at.isoformat() if self.market_close_at else None,
@@ -306,8 +317,11 @@ def init_db():
 def _migrate():
     """Apply additive schema migrations (add missing columns)."""
     migrations = [
-        ("copied_bets", "market_close_at", "DATETIME"),
-        ("copied_bets", "close_reason",    "TEXT"),
+        ("copied_bets", "market_close_at",  "DATETIME"),
+        ("copied_bets", "close_reason",     "TEXT"),
+        ("copied_bets", "market_category",  "VARCHAR(50)"),
+        ("copied_bets", "bet_type",         "VARCHAR(50)"),
+        ("whales",      "category_filters", "TEXT"),
     ]
     with engine.connect() as conn:
         for table, column, col_type in migrations:
