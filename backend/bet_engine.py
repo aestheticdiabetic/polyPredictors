@@ -417,7 +417,7 @@ class BetEngine:
             now = datetime.now(timezone.utc)
             min_hours = settings.MIN_MARKET_HOURS_TO_CLOSE
 
-            for bet, (price, end_dt) in zip(open_bets, resolution_data):
+            for bet, (price, end_dt, is_resolved) in zip(open_bets, resolution_data):
                 if price is None:
                     continue
 
@@ -453,15 +453,31 @@ class BetEngine:
                     continue
 
                 # --- Case 1: Market has already ended ---
-                # Only settle once the price has reached a decisive resolution value.
-                # Polymarket markets take hours-to-days after the scheduled end time
-                # for the UMA/oracle resolution to propagate on-chain; until then the
-                # Gamma API returns the last trading price, not the final 1.0/0.0.
-                # Force-closing at a mid-market price produces incorrect win/loss results.
+                # Polymarket sets endDate to game START time for many live sports
+                # markets, so hours_remaining < 0 fires immediately when play begins —
+                # well before the final outcome is known.  The oracle (UMA) then takes
+                # hours-to-days to settle on-chain.  Until it does, outcomePrices for
+                # unsettled binary markets often reads ["0","0"] or the last traded
+                # price, neither of which is a reliable resolution signal.
+                #
+                # Rules:
+                #  - price >= 0.95               → YES clearly won; close regardless of resolved flag
+                #  - price <= 0.05 AND is_resolved → oracle confirmed NO won; close
+                #  - price <= 0.05 AND NOT is_resolved → likely unresolved 0.0 default; wait
+                #  - 0.05 < price < 0.95         → mid-range; definitely not settled; wait
                 if market_ended:
-                    if price >= 0.95 or price <= 0.05:
+                    if price >= 0.95:
                         logger.info(
-                            "Force-close: bet %d market ended %.1fh ago, price=%.4f (resolved)",
+                            "Force-close: bet %d market ended %.1fh ago, price=%.4f (YES resolved)",
+                            bet.id, abs(hours_remaining), price,
+                        )
+                        self.simulate_sell(
+                            copied_bet=bet, current_price=price, session=session, db=db,
+                            close_reason="Market ended",
+                        )
+                    elif price <= 0.05 and is_resolved:
+                        logger.info(
+                            "Force-close: bet %d market ended %.1fh ago, price=%.4f (NO resolved, oracle confirmed)",
                             bet.id, abs(hours_remaining), price,
                         )
                         self.simulate_sell(
@@ -470,11 +486,25 @@ class BetEngine:
                         )
                     else:
                         logger.debug(
-                            "Market ended %.1fh ago but price=%.4f not yet settled — "
-                            "waiting for on-chain resolution (bet %d)",
-                            abs(hours_remaining), price, bet.id,
+                            "Market ended %.1fh ago but not yet oracle-resolved "
+                            "(price=%.4f, resolved=%s) — waiting for on-chain settlement (bet %d)",
+                            abs(hours_remaining), price, is_resolved, bet.id,
                         )
                     continue
+
+                # For live sports markets (Soccer, Basketball, Tennis, eSports,
+                # American Football, Baseball) price movement during an event is
+                # just live odds fluctuating — it does NOT indicate final outcome.
+                # Only the on-chain oracle settlement (Case 1, after market end)
+                # gives a reliable signal for these markets.
+                # For prediction markets (Politics, Crypto, Other) the price does
+                # gradually converge to 0/1 as the outcome becomes clear, so
+                # price-based early exit (Cases 2 & 3) remains valid there.
+                _LIVE_SPORTS = {
+                    "Soccer", "Basketball", "Tennis", "eSports",
+                    "American Football", "Baseball",
+                }
+                is_live_sport = bet.market_category in _LIVE_SPORTS
 
                 # --- Case 2: Near-expiry window ---
                 if hours_remaining is not None and 0 <= hours_remaining < min_hours:
@@ -482,7 +512,7 @@ class BetEngine:
                         "Near-expiry monitoring: bet %d closes in %.2fh, price=%.4f",
                         bet.id, hours_remaining, price,
                     )
-                    if price >= 0.80 or price <= 0.20:
+                    if not is_live_sport and (price >= 0.80 or price <= 0.20):
                         logger.info(
                             "Near-expiry close: bet %d price=%.4f crosses 0.80/0.20 "
                             "with %.2fh remaining",
@@ -492,10 +522,20 @@ class BetEngine:
                             copied_bet=bet, current_price=price, session=session, db=db,
                             close_reason=f"Near-expiry exit ({hours_remaining:.1f}h left, price {price:.3f})",
                         )
+                    elif is_live_sport:
+                        logger.debug(
+                            "Near-expiry: skipping price-based close for live sport bet %d "
+                            "(%s, %.2fh left, price=%.4f) — waiting for on-chain settlement",
+                            bet.id, bet.market_category, hours_remaining, price,
+                        )
                     continue
 
                 # --- Case 3: Standard resolution threshold ---
-                if price >= 0.95 or price <= 0.05:
+                # Only applies to prediction markets (non-sports) where price
+                # converging to an extreme genuinely signals outcome.
+                # Live sports prices fluctuate wildly during play and must not be
+                # used as resolution signals before the event ends.
+                if not is_live_sport and (price >= 0.95 or price <= 0.05):
                     self.simulate_sell(
                         copied_bet=bet, current_price=price, session=session, db=db,
                         close_reason=f"Price reached resolution threshold ({price:.3f})",
@@ -515,8 +555,8 @@ class BetEngine:
 
     async def _fetch_resolution_data(
         self, token_ids: list
-    ) -> list[tuple[Optional[float], Optional[datetime]]]:
-        """Fetch price and endDate for multiple tokens in parallel."""
+    ) -> list[tuple[Optional[float], Optional[datetime], bool]]:
+        """Fetch price, endDate and resolved flag for multiple tokens in parallel."""
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http:
             return await asyncio.gather(
                 *[self._get_resolution_data_async(tid, http) for tid in token_ids]
@@ -524,10 +564,11 @@ class BetEngine:
 
     async def _get_resolution_data_async(
         self, token_id: str, http: httpx.AsyncClient
-    ) -> tuple[Optional[float], Optional[datetime]]:
+    ) -> tuple[Optional[float], Optional[datetime], bool]:
         """
-        Async fetch of (price, end_dt) from Gamma API for a single token.
-        Returns (None, None) on error.
+        Async fetch of (price, end_dt, is_resolved) from Gamma API for a single token.
+        is_resolved is True only when the market's oracle has actually settled the outcome.
+        Returns (None, None, False) on error.
         """
         try:
             url = f"{settings.GAMMA_API_BASE}/markets"
@@ -567,10 +608,21 @@ class BetEngine:
                     except (ValueError, TypeError):
                         pass
 
-                return price, end_dt
+                # Parse oracle resolution status.
+                # The market is only truly settled when the UMA/oracle has resolved
+                # it on-chain. "active=False" alone is NOT enough — markets are set
+                # to inactive when trading stops (e.g. game starts) but the oracle
+                # resolution can still be pending hours later.
+                is_resolved = bool(
+                    market.get("resolved")
+                    or market.get("resolutionStatus") == "resolved"
+                    or str(market.get("status", "")).lower() in ("resolved", "finalized", "settled")
+                )
+
+                return price, end_dt, is_resolved
         except Exception as exc:
             logger.debug("_get_resolution_data_async error for %s: %s", token_id, exc)
-        return None, None
+        return None, None, False
 
     # ------------------------------------------------------------------
     # Private helpers
