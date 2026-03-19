@@ -17,6 +17,8 @@ const State = {
   ledgerMode:        'all',
   ledgerSort:        'default',  // 'default' = newest first; 'close_asc' = soonest close first
   signalsPage:       1,
+  signalsTab:        'all',   // 'all' | 'win' | 'loss' | 'open'
+  signalsGroupPage:  1,       // client-side page for grouped signal rows
   timerInterval:     null,
   pollInterval:      null,
   ledgerInterval:    null,
@@ -48,6 +50,8 @@ function cacheDom() {
 
     // Stats
     statBets:        $('stat-bets'),
+    statCapital:     $('stat-capital'),
+    statSimCapital:  $('stat-sim-capital'),
     statWinRate:     $('stat-winrate'),
     statPnl:         $('stat-pnl'),
     statDuration:    $('stat-duration'),
@@ -68,7 +72,9 @@ function cacheDom() {
     ledgerInfo:      $('ledger-info'),
 
     // Signals
-    signalsTableBody:$('signals-table-body'),
+    signalsTableBody:  $('signals-table-body'),
+    signalsPagination: $('signals-pagination'),
+    signalsInfo:       $('signals-info'),
 
     // Modal
     modalOverlay:    $('modal-overlay'),
@@ -95,6 +101,7 @@ document.addEventListener('DOMContentLoaded', () => {
   fetchActivity();
   fetchLedger();
   fetchSignals();
+  fetchWhaleAnalysis();
 
   // Polling
   State.pollInterval = setInterval(() => {
@@ -108,6 +115,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (State.session && State.session.is_active) {
       fetchLedger();
       fetchSignals();
+      fetchWhaleAnalysis();
     }
   }, 10000);
 });
@@ -273,6 +281,8 @@ function updateSessionUI() {
 
 function updateStats(stats) {
   DOM.statBets.textContent  = stats.placed || 0;
+  if (DOM.statCapital)    DOM.statCapital.textContent    = '$' + (stats.capital_at_risk     || 0).toFixed(2);
+  if (DOM.statSimCapital) DOM.statSimCapital.textContent = '$' + (stats.sim_capital_at_risk || 0).toFixed(2);
   DOM.statWinRate.textContent = (stats.win_rate_pct || 0).toFixed(1) + '%';
 
   const pnl = stats.total_pnl_usdc || 0;
@@ -667,22 +677,45 @@ function changeLedgerPage(page) {
 // ============================================================
 // Signals
 // ============================================================
+let _cachedSignals = [];
+
 async function fetchSignals() {
   if (_inFlight.has('signals')) return;
   _inFlight.add('signals');
   try {
     const [data, stats] = await Promise.all([
-      api('GET', `/api/signals?page=${State.signalsPage}&limit=20`),
+      api('GET', `/api/signals?page=${State.signalsPage}&limit=200`),
       api('GET', '/api/signals/stats'),
     ]);
+    _cachedSignals = data.signals || [];
     renderSignalsWidget(stats);
-    renderSignals(data.signals);
+    renderSignalsGrouped(_cachedSignals, State.signalsTab, State.signalsGroupPage);
   } catch (err) {
     console.error('fetchSignals error:', err);
   } finally {
     _inFlight.delete('signals');
   }
 }
+
+function setSignalsTab(tab) {
+  State.signalsTab = tab;
+  State.signalsGroupPage = 1;
+  const container = $('sig-filter-tabs');
+  if (container) {
+    container.querySelectorAll('.filter-tab').forEach(btn => btn.classList.remove('active'));
+    const idx = ['all','win','loss','open'].indexOf(tab);
+    if (idx >= 0) container.querySelectorAll('.filter-tab')[idx].classList.add('active');
+  }
+  renderSignalsGrouped(_cachedSignals, tab, 1);
+}
+
+function changeSignalsPage(page) {
+  if (page < 1) return;
+  State.signalsGroupPage = page;
+  renderSignalsGrouped(_cachedSignals, State.signalsTab, page);
+}
+
+const SIGNALS_PER_PAGE = 20;
 
 function renderSignalsWidget(stats) {
   const widget = $('signals-verdict-widget');
@@ -729,57 +762,160 @@ function renderSignalsWidget(stats) {
   $('sig-stat-open').textContent = stats.open_signals;
 }
 
-function renderSignals(signals) {
+function renderSignalsGrouped(signals, tab, page) {
+  page = page || 1;
   const tbody = DOM.signalsTableBody;
   if (!tbody) return;
 
-  if (!signals || signals.length === 0) {
-    tbody.innerHTML = `
-      <tr>
-        <td colspan="7">
-          <div class="empty-state">
-            <p>No add-to-position signals yet.</p>
-          </div>
-        </td>
-      </tr>`;
+  // Group by copied_bet_id first
+  const groups = {};
+  for (const s of (signals || [])) {
+    const key = s.copied_bet_id;
+    if (!groups[key]) {
+      groups[key] = {
+        copied_bet_id: key,
+        bet_question:  s.bet_question,
+        bet_status:    s.bet_status,
+        whale_alias:   s.whale_alias,
+        whale_address: s.whale_address,
+        signals:       [],
+      };
+    }
+    groups[key].signals.push(s);
+  }
+
+  // Filter groups by tab
+  let rows = Object.values(groups);
+  if (tab === 'win')  rows = rows.filter(g => g.bet_status === 'CLOSED_WIN');
+  if (tab === 'loss') rows = rows.filter(g => g.bet_status === 'CLOSED_LOSS');
+  if (tab === 'open') rows = rows.filter(g => g.bet_status === 'OPEN' || g.bet_status === 'PENDING');
+
+  const total = rows.length;
+  const pages = Math.max(1, Math.ceil(total / SIGNALS_PER_PAGE));
+  const safePage = Math.min(page, pages);
+  const start = (safePage - 1) * SIGNALS_PER_PAGE;
+  rows = rows.slice(start, start + SIGNALS_PER_PAGE);
+
+  // Render pagination
+  if (DOM.signalsInfo) {
+    const end = Math.min(start + SIGNALS_PER_PAGE, total);
+    DOM.signalsInfo.textContent = total > 0 ? `Showing ${start + 1}–${end} of ${total}` : '';
+  }
+  if (DOM.signalsPagination) {
+    if (pages <= 1) {
+      DOM.signalsPagination.innerHTML = '';
+    } else {
+      let ph = '';
+      ph += `<button onclick="changeSignalsPage(${safePage - 1})" ${safePage <= 1 ? 'disabled' : ''}>&lsaquo;</button>`;
+      for (let i = 1; i <= pages; i++) {
+        ph += `<button onclick="changeSignalsPage(${i})" class="${i === safePage ? 'active' : ''}">${i}</button>`;
+      }
+      ph += `<button onclick="changeSignalsPage(${safePage + 1})" ${safePage >= pages ? 'disabled' : ''}>&rsaquo;</button>`;
+      DOM.signalsPagination.innerHTML = ph;
+    }
+  }
+
+  if (rows.length === 0) {
+    const labels = { win: 'successful', loss: 'failed', open: 'open', all: '' };
+    tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state"><p>No ${labels[tab] || ''} double-down signals yet.</p></div></td></tr>`;
     return;
   }
 
-  tbody.innerHTML = signals.map(s => {
-    const time = new Date(s.timestamp + (s.timestamp.endsWith('Z') ? '' : 'Z')).toLocaleString();
+  const STATUS_BADGE = {
+    CLOSED_WIN:     '<span class="badge badge-win">WIN</span>',
+    CLOSED_LOSS:    '<span class="badge badge-loss">LOSS</span>',
+    CLOSED_NEUTRAL: '<span class="badge badge-neutral">NEUTRAL</span>',
+    OPEN:           '<span class="badge badge-open">OPEN</span>',
+    PENDING:        '<span class="badge badge-neutral">PENDING</span>',
+  };
 
-    // Outcome column: show status badge for the underlying bet
-    const statusBadge = {
-      CLOSED_WIN:     '<span class="badge badge-win">WIN</span>',
-      CLOSED_LOSS:    '<span class="badge badge-loss">LOSS</span>',
-      CLOSED_NEUTRAL: '<span class="badge badge-neutral">NEUTRAL</span>',
-      OPEN:           '<span class="badge badge-open">OPEN</span>',
-      PENDING:        '<span class="badge badge-neutral">PENDING</span>',
-    }[s.bet_status] || `<span class="badge badge-neutral">${escHtml(s.bet_status || '?')}</span>`;
+  tbody.innerHTML = rows.map(g => {
+    const count         = g.signals.length;
+    const totalAdded    = g.signals.reduce((acc, s) => acc + s.whale_additional_usdc, 0);
+    const avgPrice      = g.signals.reduce((acc, s) => acc + s.price, 0) / count;
+    const totalHypoPnl  = g.signals.reduce((acc, s) =>
+      acc + (s.hypothetical_pnl_usdc != null ? s.hypothetical_pnl_usdc : 0), 0);
+    const hasUnresolved = g.signals.some(s => s.hypothetical_pnl_usdc == null);
 
-    // Extra P&L column
+    const statusBadge = STATUS_BADGE[g.bet_status]
+      || `<span class="badge badge-neutral">${escHtml(g.bet_status || '?')}</span>`;
+
     let pnlHtml;
-    if (s.hypothetical_pnl_usdc != null) {
-      const cls = s.hypothetical_pnl_usdc > 0 ? 'pnl-positive' : s.hypothetical_pnl_usdc < 0 ? 'pnl-negative' : 'pnl-zero';
-      pnlHtml = `<span class="${cls}">${formatPnl(s.hypothetical_pnl_usdc)}</span>`;
-    } else if (s.bet_status === 'OPEN' || s.bet_status === 'PENDING') {
+    if (g.bet_status === 'OPEN' || g.bet_status === 'PENDING') {
       pnlHtml = '<span class="text-muted">pending…</span>';
+    } else if (hasUnresolved) {
+      pnlHtml = '<span class="text-muted">partial</span>';
     } else {
-      pnlHtml = '<span class="text-muted">—</span>';
+      const cls = totalHypoPnl > 0 ? 'pnl-positive' : totalHypoPnl < 0 ? 'pnl-negative' : 'pnl-zero';
+      pnlHtml = `<span class="${cls}">${formatPnl(totalHypoPnl)}</span>`;
     }
 
-    const market = escHtml(truncate(s.bet_question || `Bet #${s.copied_bet_id}`, 45));
+    const market     = escHtml(truncate(g.bet_question || `Bet #${g.copied_bet_id}`, 50));
+    const whaleLabel = escHtml(g.whale_alias || g.whale_address || '—');
+    const addLabel   = count === 1 ? '1 addition' : `${count} additions`;
 
-    const whaleLabel = escHtml(s.whale_alias || s.whale_address || '—');
     return `
       <tr>
-        <td class="mono text-muted" style="font-size:0.75rem">${time}</td>
-        <td style="font-size:0.8rem;color:var(--text-muted)" title="${escHtml(s.whale_address || '')}">${whaleLabel}</td>
-        <td title="${escHtml(s.bet_question || '')}">${market}</td>
-        <td class="mono">$${s.whale_additional_usdc.toFixed(2)}</td>
-        <td class="mono">${s.price.toFixed(4)}</td>
+        <td title="${escHtml(g.bet_question || '')}">${market}</td>
+        <td style="font-size:0.8rem;color:var(--text-muted)" title="${escHtml(g.whale_address || '')}">${whaleLabel}</td>
+        <td class="mono text-muted">${addLabel}</td>
+        <td class="mono">$${totalAdded.toFixed(2)}</td>
+        <td class="mono">${avgPrice.toFixed(4)}</td>
         <td>${statusBadge}</td>
         <td>${pnlHtml}</td>
+      </tr>`;
+  }).join('');
+}
+
+// ============================================================
+// Whale Analysis
+// ============================================================
+async function fetchWhaleAnalysis() {
+  if (_inFlight.has('whale-analysis')) return;
+  _inFlight.add('whale-analysis');
+  try {
+    const data = await api('GET', '/api/stats/by-whale');
+    renderWhaleAnalysis(data.whales);
+  } catch (err) {
+    console.error('fetchWhaleAnalysis error:', err);
+  } finally {
+    _inFlight.delete('whale-analysis');
+  }
+}
+
+function renderWhaleAnalysis(whales) {
+  const tbody = $('whale-analysis-body');
+  if (!tbody) return;
+
+  if (!whales || whales.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="9"><div class="empty-state"><p>No closed bets yet.</p></div></td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = whales.map(w => {
+    const alias    = escHtml(w.whale_alias || w.whale_address);
+    const winRate  = w.win_rate_pct != null ? `${w.win_rate_pct}%` : '—';
+    const wlnLabel = `${w.wins} / ${w.losses} / ${w.neutral}`;
+
+    const pnlCls  = w.total_pnl_usdc > 0 ? 'pnl-positive' : w.total_pnl_usdc < 0 ? 'pnl-negative' : 'pnl-zero';
+    const avgCls  = w.avg_pnl_usdc  > 0 ? 'pnl-positive' : w.avg_pnl_usdc  < 0 ? 'pnl-negative' : 'pnl-zero';
+    const bestCls = (w.best_bet_usdc  ?? 0) > 0 ? 'pnl-positive' : 'pnl-zero';
+    const wrstCls = (w.worst_bet_usdc ?? 0) < 0 ? 'pnl-negative' : 'pnl-zero';
+
+    const winRateCls = w.win_rate_pct == null ? '' :
+      w.win_rate_pct >= 60 ? 'pnl-positive' : w.win_rate_pct <= 40 ? 'pnl-negative' : '';
+
+    return `
+      <tr>
+        <td title="${escHtml(w.whale_address)}" style="font-weight:500">${alias}</td>
+        <td class="mono">${w.followed}</td>
+        <td class="mono text-muted">${w.open}</td>
+        <td class="mono text-muted">${wlnLabel}</td>
+        <td class="mono ${winRateCls}">${winRate}</td>
+        <td class="mono ${pnlCls}">${formatPnl(w.total_pnl_usdc)}</td>
+        <td class="mono ${avgCls}">${w.closed > 0 ? formatPnl(w.avg_pnl_usdc) : '—'}</td>
+        <td class="mono ${bestCls}">${w.best_bet_usdc  != null ? formatPnl(w.best_bet_usdc)  : '—'}</td>
+        <td class="mono ${wrstCls}">${w.worst_bet_usdc != null ? formatPnl(w.worst_bet_usdc) : '—'}</td>
       </tr>`;
   }).join('');
 }

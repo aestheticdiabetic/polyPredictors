@@ -407,10 +407,16 @@ async def ledger_stats(
     placed = [b for b in bets if b.status != "SKIPPED"]
     wins = [b for b in bets if b.status == "CLOSED_WIN"]
     losses = [b for b in bets if b.status == "CLOSED_LOSS"]
+    closed = [b for b in bets if b.status in ("CLOSED_WIN", "CLOSED_LOSS", "CLOSED_NEUTRAL")]
     closed_pnl = [b.pnl_usdc for b in bets if b.pnl_usdc is not None]
     total_pnl = round(sum(closed_pnl), 2)
     avg_pnl = round(total_pnl / len(closed_pnl), 2) if closed_pnl else 0.0
-    win_rate = round(len(wins) / len(placed) * 100, 1) if placed else 0.0
+    win_rate = round(len(wins) / len(closed) * 100, 1) if closed else 0.0
+
+    # Capital currently at risk (sum of size_usdc for all OPEN bets)
+    open_bets = [b for b in bets if b.status == "OPEN"]
+    capital_at_risk = round(sum(b.size_usdc for b in open_bets), 2)
+    sim_capital_at_risk = round(sum(b.size_usdc for b in open_bets if b.mode == "SIMULATION"), 2)
 
     # Current session balance
     active = db.query(MonitoringSession).filter_by(is_active=True).first()
@@ -425,7 +431,71 @@ async def ledger_stats(
         "total_pnl_usdc": total_pnl,
         "avg_pnl_per_bet": avg_pnl,
         "session_balance": round(balance, 2),
+        "capital_at_risk": capital_at_risk,
+        "sim_capital_at_risk": sim_capital_at_risk,
     }
+
+
+# ---------------------------------------------------------------------------
+# Per-whale analysis
+# ---------------------------------------------------------------------------
+@app.get("/api/stats/by-whale")
+async def stats_by_whale(db: DBSession = Depends(get_db)):
+    """Aggregate copied_bets performance broken down by whale."""
+    from collections import defaultdict
+
+    bets = db.query(CopiedBet).filter(CopiedBet.status != "SKIPPED").all()
+
+    # Build alias lookup from Whale table
+    whales = db.query(Whale).all()
+    alias_map = {w.address: (w.alias or w.address) for w in whales}
+
+    groups: dict = defaultdict(lambda: {
+        "followed": 0, "open": 0, "wins": 0, "losses": 0, "neutral": 0,
+        "closed": 0, "pnl_values": [],
+    })
+
+    for b in bets:
+        g = groups[b.whale_address]
+        g["followed"] += 1
+        if b.status == "OPEN":
+            g["open"] += 1
+        elif b.status == "CLOSED_WIN":
+            g["wins"] += 1; g["closed"] += 1
+            if b.pnl_usdc is not None: g["pnl_values"].append(b.pnl_usdc)
+        elif b.status == "CLOSED_LOSS":
+            g["losses"] += 1; g["closed"] += 1
+            if b.pnl_usdc is not None: g["pnl_values"].append(b.pnl_usdc)
+        elif b.status == "CLOSED_NEUTRAL":
+            g["neutral"] += 1; g["closed"] += 1
+            if b.pnl_usdc is not None: g["pnl_values"].append(b.pnl_usdc)
+
+    result = []
+    for address, g in groups.items():
+        total_pnl = round(sum(g["pnl_values"]), 2)
+        avg_pnl   = round(total_pnl / len(g["pnl_values"]), 2) if g["pnl_values"] else 0.0
+        win_rate  = round(g["wins"] / g["closed"] * 100, 1) if g["closed"] > 0 else None
+        best      = round(max(g["pnl_values"]), 2) if g["pnl_values"] else None
+        worst     = round(min(g["pnl_values"]), 2) if g["pnl_values"] else None
+        result.append({
+            "whale_address": address,
+            "whale_alias":   alias_map.get(address, address),
+            "followed":      g["followed"],
+            "open":          g["open"],
+            "wins":          g["wins"],
+            "losses":        g["losses"],
+            "neutral":       g["neutral"],
+            "closed":        g["closed"],
+            "win_rate_pct":  win_rate,
+            "total_pnl_usdc": total_pnl,
+            "avg_pnl_usdc":  avg_pnl,
+            "best_bet_usdc": best,
+            "worst_bet_usdc": worst,
+        })
+
+    # Sort by total P&L descending
+    result.sort(key=lambda x: x["total_pnl_usdc"], reverse=True)
+    return {"whales": result}
 
 
 # ---------------------------------------------------------------------------

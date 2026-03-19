@@ -78,6 +78,14 @@
       <div id="stat-bets" class="stat-value">0</div>
     </div>
     <div class="stat-card">
+      <div class="stat-label">Capital at Risk</div>
+      <div id="stat-capital" class="stat-value">$0.00</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Sim Capital at Risk</div>
+      <div id="stat-sim-capital" class="stat-value">$0.00</div>
+    </div>
+    <div class="stat-card">
       <div class="stat-label">Win Rate</div>
       <div id="stat-winrate" class="stat-value accent">0.0%</div>
     </div>
@@ -272,25 +280,73 @@
       </div>
     </div>
 
+    <!-- Filter tabs -->
+    <div class="filter-tabs" id="sig-filter-tabs">
+      <button class="filter-tab active" onclick="setSignalsTab('all')">All</button>
+      <button class="filter-tab" onclick="setSignalsTab('win')">Successful</button>
+      <button class="filter-tab" onclick="setSignalsTab('loss')">Failed</button>
+      <button class="filter-tab" onclick="setSignalsTab('open')">Open</button>
+    </div>
+
     <div class="table-wrapper">
       <table>
         <thead>
           <tr>
-            <th>Time</th>
-            <th>Whale</th>
             <th>Market</th>
-            <th>Whale Added</th>
-            <th>Signal Price</th>
+            <th>Whale</th>
+            <th>Additions</th>
+            <th>Total Added</th>
+            <th>Avg Price</th>
             <th>Outcome</th>
             <th>Extra P&amp;L if Followed</th>
           </tr>
         </thead>
         <tbody id="signals-table-body">
           <tr>
-            <td colspan="6">
-              <div class="empty-state">
-                <p>No add-to-position signals yet.</p>
-              </div>
+            <td colspan="7">
+              <div class="empty-state"><p>No add-to-position signals yet.</p></div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;flex-wrap:wrap;gap:8px">
+      <span id="signals-info" class="pagination-info"></span>
+      <div id="signals-pagination" class="pagination"></div>
+    </div>
+  </section>
+
+  <!-- ================================================================
+       WHALE ANALYSIS
+       ================================================================ -->
+  <section class="card" style="margin-bottom:24px">
+    <div class="card-title">
+      <span class="dot"></span>
+      Whale Analysis
+      <span class="text-muted" style="font-size:0.72rem;font-weight:400;margin-left:6px">
+        (performance per tracked whale)
+      </span>
+    </div>
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th>Whale</th>
+            <th>Followed</th>
+            <th>Open</th>
+            <th>W / L / N</th>
+            <th>Win Rate</th>
+            <th>Total P&amp;L</th>
+            <th>Avg P&amp;L / Bet</th>
+            <th>Best Bet</th>
+            <th>Worst Bet</th>
+          </tr>
+        </thead>
+        <tbody id="whale-analysis-body">
+          <tr>
+            <td colspan="9">
+              <div class="empty-state"><p>No closed bets yet.</p></div>
             </td>
           </tr>
         </tbody>

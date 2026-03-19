@@ -910,6 +910,7 @@ tr.row-skip  td:first-child { border-left: 3px solid var(--warning); }
   color: var(--text-primary);
 }
 
+
 /* ============================================================
    Notifications / Toast
    ============================================================ */
