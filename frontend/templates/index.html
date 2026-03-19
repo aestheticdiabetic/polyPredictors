@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polymarket Whale Copier</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+<div class="app-container">
+
+  <!-- ================================================================
+       HEADER
+       ================================================================ -->
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-icon">🐋</div>
+      <h1>Polymarket Whale Copier</h1>
+    </div>
+    <div class="header-right">
+      <span class="session-timer">
+        Session: <span id="timer-value">00:00:00</span>
+      </span>
+      <span id="mode-badge" class="mode-badge idle">IDLE</span>
+    </div>
+  </header>
+
+  <!-- ================================================================
+       CONTROL PANEL
+       ================================================================ -->
+  <section class="card" style="margin-bottom:24px">
+    <div class="control-panel">
+
+      <!-- Left: mode + runtime -->
+      <div style="display:flex;flex-direction:column;gap:16px">
+        <div class="control-group">
+          <div class="control-label">Mode</div>
+          <div class="mode-toggle">
+            <button id="mode-sim-btn">SIMULATION</button>
+            <button id="mode-real-btn">REAL</button>
+          </div>
+        </div>
+        <div class="control-group">
+          <div class="control-label">Runtime</div>
+          <div class="runtime-selector">
+            <button data-hours="2">2h</button>
+            <button data-hours="4">4h</button>
+            <button data-hours="8">8h</button>
+            <button data-hours="12">12h</button>
+            <button data-hours="24">24h</button>
+            <button data-hours="manual" class="active">Manual</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Middle: balance -->
+      <div class="balance-display">
+        <div class="balance-label">Balance</div>
+        <div id="balance-value" class="balance-value">$200.00</div>
+      </div>
+
+      <!-- Right: start / stop -->
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <button id="start-btn" class="btn btn-start">&#9654; START</button>
+        <button id="stop-btn" class="btn btn-stop" disabled>&#9632; STOP</button>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ================================================================
+       STATS BAR
+       ================================================================ -->
+  <div class="stats-bar">
+    <div class="stat-card">
+      <div class="stat-label">Total Bets Placed</div>
+      <div id="stat-bets" class="stat-value">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Win Rate</div>
+      <div id="stat-winrate" class="stat-value accent">0.0%</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Total P&amp;L</div>
+      <div id="stat-pnl" class="stat-value">$0.00</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Session Duration</div>
+      <div id="stat-duration" class="stat-value mono">00:00:00</div>
+    </div>
+  </div>
+
+  <!-- ================================================================
+       TWO COLUMN
+       ================================================================ -->
+  <div class="two-col">
+
+    <!-- Whale Watchlist -->
+    <div class="card">
+      <div class="card-title">
+        <span class="dot"></span>
+        Whale Watchlist
+      </div>
+
+      <div class="card-body-scroll">
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>Alias</th>
+                <th>Address</th>
+                <th>Avg Bet</th>
+                <th>Active</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="whale-table-body">
+              <tr>
+                <td colspan="5">
+                  <div class="empty-state">
+                    <div class="empty-icon">🐋</div>
+                    <p>Loading whales...</p>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Add whale form -->
+      <div style="margin-top:16px">
+        <div class="control-label" style="margin-bottom:8px">Add Whale</div>
+        <div class="form-row">
+          <input
+            id="add-whale-addr"
+            class="input-field"
+            placeholder="0x wallet address"
+            style="min-width:200px"
+          />
+          <input
+            id="add-whale-alias"
+            class="input-field"
+            placeholder="Alias (optional)"
+            style="min-width:120px;flex:0 1 140px"
+          />
+          <button id="add-whale-btn" class="btn btn-primary btn-sm">Add</button>
+        </div>
+      </div>
+
+      <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+        <button id="discover-btn" class="btn btn-secondary btn-sm">&#128270; Discover Whales</button>
+        <button id="refresh-profiles-btn" class="btn btn-secondary btn-sm">&#8635; Refresh Profiles</button>
+      </div>
+    </div>
+
+    <!-- Live Activity Feed -->
+    <div class="card">
+      <div class="card-title" style="justify-content:space-between">
+        <span style="display:flex;align-items:center;gap:8px">
+          <span class="dot"></span>
+          Live Activity Feed
+        </span>
+        <span>
+          <span id="feed-status-dot" class="status-dot"></span>
+        </span>
+      </div>
+
+      <div id="activity-feed" class="activity-feed">
+        <div class="activity-feed-empty">Waiting for whale activity...</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ================================================================
+       BET LEDGER
+       ================================================================ -->
+  <section class="card" style="margin-bottom:24px">
+    <div class="card-title" style="justify-content:space-between">
+      <span style="display:flex;align-items:center;gap:8px">
+        <span class="dot"></span>
+        Bet Ledger
+      </span>
+      <span id="ledger-info" class="text-muted" style="font-size:0.75rem;font-weight:400"></span>
+    </div>
+
+    <!-- Filter tabs -->
+    <div class="filter-tabs">
+      <button class="filter-tab active" data-status="all">All</button>
+      <button class="filter-tab" data-status="open">Open</button>
+      <button class="filter-tab" data-status="wins">Wins</button>
+      <button class="filter-tab" data-status="losses">Losses</button>
+      <button class="filter-tab" data-status="skipped">Skipped</button>
+    </div>
+
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Whale</th>
+            <th>Market</th>
+            <th>Action</th>
+            <th>Entry Price</th>
+            <th>Bet Size</th>
+            <th>P&amp;L</th>
+            <th>Status</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody id="ledger-table-body">
+          <tr>
+            <td colspan="9">
+              <div class="empty-state">
+                <div class="empty-icon">📋</div>
+                <p>No bets yet. Start a session to begin tracking.</p>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div id="ledger-pagination" class="pagination" style="margin-top:16px"></div>
+  </section>
+
+  <!-- ================================================================
+       ADD-TO-POSITION SIGNALS
+       ================================================================ -->
+  <section class="card signals-panel">
+    <div class="card-title">
+      <span class="dot"></span>
+      Add-to-Position Signals
+      <span class="text-muted" style="font-size:0.72rem;font-weight:400;margin-left:6px">
+        (whale doubled down while we held)
+      </span>
+    </div>
+
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Our Bet #</th>
+            <th>Whale Added</th>
+            <th>Price</th>
+            <th>Hypo. Extra P&amp;L</th>
+            <th>Note</th>
+          </tr>
+        </thead>
+        <tbody id="signals-table-body">
+          <tr>
+            <td colspan="6">
+              <div class="empty-state">
+                <p>No add-to-position signals yet.</p>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+</div><!-- /app-container -->
+
+<!-- ================================================================
+     DISCOVER MODAL
+     ================================================================ -->
+<div id="modal-overlay" class="modal-overlay">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title">🏆 Polymarket Leaderboard</span>
+      <button id="modal-close" class="modal-close">&times;</button>
+    </div>
+    <p style="font-size:0.8rem;color:var(--text-secondary)">
+      Top traders by all-time P&amp;L. Click Add to start tracking.
+    </p>
+    <div id="modal-body" class="modal-body">
+      <!-- Populated by JS -->
+    </div>
+  </div>
+</div>
+
+<!-- Toast container -->
+<div id="toast-container" class="toast-container"></div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
