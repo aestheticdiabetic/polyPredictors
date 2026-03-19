@@ -582,6 +582,12 @@ def _signal_to_dict(sig: AddToPositionSignal) -> dict:
         d["bet_status"]     = bet.status
         d["bet_question"]   = bet.question or bet.market_id
         d["entry_price"]    = round(bet.price_at_entry, 4)
+        d["whale_address"]  = bet.whale_address
+        d["whale_alias"]    = bet.whale_address  # overridden below if alias available
+        # Resolve alias from the whale_bet → whale relationship
+        if bet.whale_bet and bet.whale_bet.whale:
+            alias = bet.whale_bet.whale.alias
+            d["whale_alias"] = alias if alias else bet.whale_address
 
         # Compute hypothetical P&L for resolved bets
         if bet.resolution_price is not None and bet.status not in ("OPEN", "PENDING", "SKIPPED"):

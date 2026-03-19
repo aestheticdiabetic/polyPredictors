@@ -736,7 +736,7 @@ function renderSignals(signals) {
   if (!signals || signals.length === 0) {
     tbody.innerHTML = `
       <tr>
-        <td colspan="6">
+        <td colspan="7">
           <div class="empty-state">
             <p>No add-to-position signals yet.</p>
           </div>
@@ -770,9 +770,11 @@ function renderSignals(signals) {
 
     const market = escHtml(truncate(s.bet_question || `Bet #${s.copied_bet_id}`, 45));
 
+    const whaleLabel = escHtml(s.whale_alias || s.whale_address || '—');
     return `
       <tr>
         <td class="mono text-muted" style="font-size:0.75rem">${time}</td>
+        <td style="font-size:0.8rem;color:var(--text-muted)" title="${escHtml(s.whale_address || '')}">${whaleLabel}</td>
         <td title="${escHtml(s.bet_question || '')}">${market}</td>
         <td class="mono">$${s.whale_additional_usdc.toFixed(2)}</td>
         <td class="mono">${s.price.toFixed(4)}</td>
