@@ -27,6 +27,11 @@ class Settings:
     POLLING_INTERVAL_SECONDS: int = int(os.getenv("POLLING_INTERVAL_SECONDS", "30"))
     MIN_MARKET_HOURS_TO_CLOSE: float = float(os.getenv("MIN_MARKET_HOURS_TO_CLOSE", "1.0"))
 
+    # How often (in seconds) the permanent resolution checker runs.
+    # Lower = more likely to catch prices at 0.05 before they snap to 0.0.
+    # Default 60s is a reasonable balance; set lower (e.g. 30) for tighter stops.
+    RESOLUTION_CHECK_INTERVAL_SECONDS: int = int(os.getenv("RESOLUTION_CHECK_INTERVAL_SECONDS", "60"))
+
     # Ignore whale trades older than this many hours.  Prevents the initial backlog
     # of historical trades (fetched when a whale is first added) from being evaluated
     # against markets that have since closed.

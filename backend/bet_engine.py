@@ -292,6 +292,7 @@ class BetEngine:
         current_price: float,
         session: MonitoringSession,
         db: DBSession,
+        close_reason: str = "",
     ) -> float:
         """
         Simulate selling all shares at `current_price`.
@@ -317,6 +318,8 @@ class BetEngine:
         copied_bet.pnl_usdc = round(pnl, 2)
         copied_bet.resolution_price = current_price
         copied_bet.closed_at = datetime.utcnow()
+        if close_reason:
+            copied_bet.close_reason = close_reason
 
         db.add(copied_bet)
         db.add(session)
@@ -408,13 +411,30 @@ class BetEngine:
                 if end_dt is not None:
                     hours_remaining = (end_dt - now).total_seconds() / 3600.0
 
+                # Guard: price of exactly 0.0 on an active market is API noise.
+                # Only a market that has already passed its end date can legitimately
+                # settle at 0.0. Skipping prevents a transient API glitch from
+                # wiping open positions with a 100% loss.
+                market_ended = hours_remaining is not None and hours_remaining < 0
+                if price == 0.0 and not market_ended:
+                    logger.warning(
+                        "Skipping price=0.0 for active bet %d (%.1fh to close) — "
+                        "likely API noise, not closing",
+                        bet.id,
+                        hours_remaining if hours_remaining is not None else 0,
+                    )
+                    continue
+
                 # --- Case 1: Market has already ended ---
-                if hours_remaining is not None and hours_remaining < 0:
+                if market_ended:
                     logger.info(
                         "Force-close: bet %d market ended %.1fh ago, price=%.4f",
                         bet.id, abs(hours_remaining), price,
                     )
-                    self.simulate_sell(copied_bet=bet, current_price=price, session=session, db=db)
+                    self.simulate_sell(
+                        copied_bet=bet, current_price=price, session=session, db=db,
+                        close_reason="Market ended",
+                    )
                     continue
 
                 # --- Case 2: Near-expiry window ---
@@ -429,12 +449,18 @@ class BetEngine:
                             "with %.2fh remaining",
                             bet.id, price, hours_remaining,
                         )
-                        self.simulate_sell(copied_bet=bet, current_price=price, session=session, db=db)
+                        self.simulate_sell(
+                            copied_bet=bet, current_price=price, session=session, db=db,
+                            close_reason=f"Near-expiry exit ({hours_remaining:.1f}h left, price {price:.3f})",
+                        )
                     continue
 
                 # --- Case 3: Standard resolution threshold ---
                 if price >= 0.95 or price <= 0.05:
-                    self.simulate_sell(copied_bet=bet, current_price=price, session=session, db=db)
+                    self.simulate_sell(
+                        copied_bet=bet, current_price=price, session=session, db=db,
+                        close_reason=f"Price reached resolution threshold ({price:.3f})",
+                    )
                     logger.info(
                         "Resolved bet %d at price %.4f status=%s",
                         bet.id, price, bet.status,
@@ -551,12 +577,16 @@ class BetEngine:
 
         # Close existing position
         exit_price = whale_bet.price
+        whale_alias = whale_bet.whale.alias if whale_bet.whale else whale_bet.whale_address[:10]
+        exit_reason = f"Whale exited ({whale_alias} sold @ {exit_price:.3f})"
+
         if session.mode == "SIMULATION":
             self.simulate_sell(
                 copied_bet=open_pos,
                 current_price=exit_price,
                 session=session,
                 db=db,
+                close_reason=exit_reason,
             )
         else:
             try:
@@ -565,6 +595,7 @@ class BetEngine:
                 open_pos.pnl_usdc = 0.0
                 open_pos.resolution_price = exit_price
                 open_pos.closed_at = datetime.utcnow()
+                open_pos.close_reason = exit_reason
             except Exception as exc:
                 logger.error("Real sell failed for copied_bet %d: %s", open_pos.id, exc)
 

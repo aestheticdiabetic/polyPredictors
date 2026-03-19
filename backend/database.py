@@ -152,6 +152,7 @@ class CopiedBet(Base):
     status = Column(String(20), nullable=False, default="PENDING")
     # PENDING / OPEN / CLOSED_WIN / CLOSED_LOSS / CLOSED_NEUTRAL / SKIPPED
     skip_reason = Column(Text, nullable=True)
+    close_reason = Column(Text, nullable=True)  # why a position was closed early
 
     # Resolution
     pnl_usdc = Column(Float, nullable=True)
@@ -187,6 +188,7 @@ class CopiedBet(Base):
             "whale_avg_bet_usdc": round(self.whale_avg_bet_usdc, 2),
             "status": self.status,
             "skip_reason": self.skip_reason,
+            "close_reason": self.close_reason,
             "pnl_usdc": round(self.pnl_usdc, 2) if self.pnl_usdc is not None else None,
             "resolution_price": round(self.resolution_price, 4) if self.resolution_price is not None else None,
             "opened_at": self.opened_at.isoformat() if self.opened_at else None,
@@ -305,6 +307,7 @@ def _migrate():
     """Apply additive schema migrations (add missing columns)."""
     migrations = [
         ("copied_bets", "market_close_at", "DATETIME"),
+        ("copied_bets", "close_reason",    "TEXT"),
     ]
     with engine.connect() as conn:
         for table, column, col_type in migrations:

@@ -627,7 +627,7 @@ function renderLedger(bets, pagination) {
         <td class="mono" style="font-size:0.8rem">${closesHtml}</td>
         <td><span class="badge ${badgeClass}">${statusLabel}</span></td>
         <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-muted);font-size:0.75rem"
-            title="${escHtml(bet.skip_reason || '')}">${escHtml(bet.skip_reason ? truncate(bet.skip_reason, 30) : '')}</td>
+            title="${escHtml(bet.close_reason || bet.skip_reason || '')}">${escHtml(truncate(bet.close_reason || bet.skip_reason || '', 30))}</td>
       </tr>`;
   }).join('');
 

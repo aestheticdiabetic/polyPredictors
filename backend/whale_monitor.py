@@ -47,7 +47,7 @@ class WhaleMonitor:
         )
         self._resolution_scheduler.add_job(
             func=self._check_resolution_wrapper,
-            trigger=IntervalTrigger(minutes=5),
+            trigger=IntervalTrigger(seconds=settings.RESOLUTION_CHECK_INTERVAL_SECONDS),
             id="check_resolution_always",
         )
         self._resolution_scheduler.add_job(
@@ -58,7 +58,8 @@ class WhaleMonitor:
         self._resolution_scheduler.start()
         logger.info(
             "Permanent background scheduler started "
-            "(resolution every 5 min, exit polling every %ds)",
+            "(resolution every %ds, exit polling every %ds)",
+            settings.RESOLUTION_CHECK_INTERVAL_SECONDS,
             settings.POLLING_INTERVAL_SECONDS,
         )
 
@@ -520,12 +521,16 @@ class WhaleMonitor:
                         address[:10], (market_id or token_id)[:16], exit_price, open_pos.id,
                     )
 
+                    whale_alias = whale.alias or address[:10]
+                    exit_reason = f"Whale exited ({whale_alias} sold @ {exit_price:.3f})"
+
                     if open_pos.mode == "SIMULATION":
                         self._bet_engine.simulate_sell(
                             copied_bet=open_pos,
                             current_price=exit_price,
                             session=session,
                             db=db,
+                            close_reason=exit_reason,
                         )
                     else:
                         try:
@@ -533,6 +538,7 @@ class WhaleMonitor:
                             open_pos.status = "CLOSED_NEUTRAL"
                             open_pos.resolution_price = exit_price
                             open_pos.closed_at = datetime.utcnow()
+                            open_pos.close_reason = exit_reason
                             db.add(open_pos)
                         except Exception as exc:
                             logger.error(
