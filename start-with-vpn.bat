@@ -1,14 +1,10 @@
 @echo off
-echo Starting VPN container...
-docker compose -f docker-compose.vpn.yml up -d
-
-echo Waiting for VPN to be healthy...
-:wait_loop
-for /f %%s in ('docker inspect --format={{.State.Health.Status}} polymarket-vpn 2^>nul') do set STATUS=%%s
-if not "%STATUS%"=="healthy" (
-    timeout /t 3 /nobreak >nul
-    goto wait_loop
-)
-
-echo VPN is healthy. Starting polymarket-copier...
-venv\Scripts\python.exe run.py %*
+echo Starting Polymarket stack...
+docker compose -f docker-compose.vpn.yml up -d --build
+echo.
+echo Done. You can close this window.
+echo App: http://localhost:8000
+echo.
+echo Useful commands:
+echo   View logs:  docker logs polymarket-app -f
+echo   Stop all:   docker compose -f docker-compose.vpn.yml down

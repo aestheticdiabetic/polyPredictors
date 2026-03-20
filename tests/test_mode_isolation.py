@@ -1140,9 +1140,11 @@ def test_background_exit_hedge_sim_uses_simulate_sell():
     monitor = WhaleMonitor(bet_engine=engine, polymarket_client=mock_client)
     monitor._resolution_scheduler.shutdown(wait=False)
 
-    with patch.object(engine, "place_real_sell", side_effect=AssertionError(
-        "place_real_sell called for HEDGE_SIM background exit — regression!"
-    )):
+    with patch("backend.whale_monitor.SessionLocal", _db_mod.SessionLocal), \
+         patch("backend.bet_engine.SessionLocal", _db_mod.SessionLocal), \
+         patch.object(engine, "place_real_sell", side_effect=AssertionError(
+             "place_real_sell called for HEDGE_SIM background exit — regression!"
+         )):
         loop = asyncio.new_event_loop()
         try:
             loop.run_until_complete(

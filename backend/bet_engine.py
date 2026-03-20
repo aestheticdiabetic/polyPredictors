@@ -132,6 +132,8 @@ class BetEngine:
         ok, skip_reason = risk_calc.should_place_bet(
             market_info or {},
             min_hours_to_close=settings.MIN_MARKET_HOURS_TO_CLOSE,
+            whale_price=whale_bet.price,
+            live_price=live_price,
         )
         if not ok:
             # If the market is already closed/resolved, drop silently — no ledger entry.

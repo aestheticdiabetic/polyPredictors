@@ -115,8 +115,11 @@ def _run_resolution_with_mock(price: float, end_dt: datetime, is_resolved: bool)
     async def _mock_fetch(token_ids):
         return [(price, end_dt, is_resolved)] * len(token_ids)
 
-    with patch.object(engine, "_fetch_resolution_data", side_effect=_mock_fetch):
-        engine.check_resolution()
+    # Patch SessionLocal where it's used (not just where it's defined) so that
+    # this test module's in-memory engine is used regardless of pytest collection order.
+    with patch("backend.bet_engine.SessionLocal", _db_mod.SessionLocal):
+        with patch.object(engine, "_fetch_resolution_data", side_effect=_mock_fetch):
+            engine.check_resolution()
 
 
 def _past(hours: float) -> datetime:
@@ -335,8 +338,9 @@ def test_no_crash_with_none_price():
     async def _mock_fetch(token_ids):
         return [(None, None, False)] * len(token_ids)
 
-    with patch.object(engine, "_fetch_resolution_data", side_effect=_mock_fetch):
-        engine.check_resolution()  # must not raise
+    with patch("backend.bet_engine.SessionLocal", _db_mod.SessionLocal):
+        with patch.object(engine, "_fetch_resolution_data", side_effect=_mock_fetch):
+            engine.check_resolution()  # must not raise
 
     db = _new_db()
     resolved = db.query(CopiedBet).filter_by(id=bet_id).first()
@@ -394,8 +398,9 @@ def test_multiple_bets_one_resolves():
                 results.append((0.02, _past(1), True))   # guard — stays open
         return results
 
-    with patch.object(engine, "_fetch_resolution_data", side_effect=_mock_fetch):
-        engine.check_resolution()
+    with patch("backend.bet_engine.SessionLocal", _db_mod.SessionLocal):
+        with patch.object(engine, "_fetch_resolution_data", side_effect=_mock_fetch):
+            engine.check_resolution()
 
     db = _new_db()
     b1 = db.query(CopiedBet).filter_by(id=bet1_id).first()

@@ -96,13 +96,19 @@ class RiskCalculator:
         self,
         market_info: dict,
         min_hours_to_close: float = 1.0,
+        whale_price: Optional[float] = None,
+        live_price: Optional[float] = None,
     ) -> tuple[bool, str]:
         """
         Decide whether to place a bet given market metadata.
 
         Checks:
-        - Market is still open (endDate in the future by at least min_hours_to_close)
-        - Market is active (not resolved / closed)
+        - Market is still open and active (not resolved / closed)
+        - Time-to-close rules:
+            * < 1 minute remaining → always skip (hard floor)
+            * 1 min – min_hours_to_close remaining → skip UNLESS live price is
+              within 2% of the whale's entry price (price still representative)
+            * >= min_hours_to_close remaining → allow through
 
         Returns:
             (True, "") if safe to proceed
@@ -154,11 +160,33 @@ class RiskCalculator:
                     f"Market closed {abs(hours_remaining):.1f}h ago",
                 )
 
-            if hours_remaining < min_hours_to_close:
+            HARD_MIN_HOURS = 1.0 / 60.0  # 1 minute — never bet this close to close
+            if hours_remaining < HARD_MIN_HOURS:
+                mins = hours_remaining * 60
                 return (
                     False,
-                    f"Market closes in {hours_remaining:.1f}h (min {min_hours_to_close}h required)",
+                    f"Market closes in {mins:.1f}min — too close to close",
                 )
+
+            if hours_remaining < min_hours_to_close:
+                # Allow through if live price is within 2% of the whale's entry price,
+                # meaning the market is still pricing correctly despite the short window.
+                if whale_price is not None and live_price is not None:
+                    drift = abs(live_price - whale_price)
+                    if drift <= 0.02:
+                        pass  # price looks good — allow the bet
+                    else:
+                        mins = hours_remaining * 60
+                        return (
+                            False,
+                            f"Market closes in {mins:.0f}min, price drift {drift:.3f} > 2% — skipping",
+                        )
+                else:
+                    # No price data to validate — apply the original stricter rule
+                    return (
+                        False,
+                        f"Market closes in {hours_remaining:.1f}h (min {min_hours_to_close}h required, no price data)",
+                    )
         except (ValueError, TypeError) as exc:
             logger.warning("Could not parse endDate '%s': %s", end_date_str, exc)
             return False, f"Could not parse market end date: {end_date_str!r}"

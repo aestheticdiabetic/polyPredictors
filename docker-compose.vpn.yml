@@ -9,6 +9,7 @@ services:
       - /dev/net/tun:/dev/net/tun
     ports:
       - "127.0.0.1:8888:8888"
+      - "127.0.0.1:8000:8081"
     volumes:
       - ./vpn:/gluetun/custom
     environment:
@@ -28,3 +29,17 @@ services:
       timeout: 5s
       retries: 6
       start_period: 30s
+
+  polymarket-app:
+    build: .
+    container_name: polymarket-app
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    restart: unless-stopped
+    command: ["python", "run.py", "--port", "8081"]
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
