@@ -415,7 +415,7 @@ async def ledger_stats(
 
     # Capital currently at risk (sum of size_usdc for all OPEN bets)
     open_bets = [b for b in bets if b.status == "OPEN"]
-    capital_at_risk = round(sum(b.size_usdc for b in open_bets), 2)
+    capital_at_risk = round(sum(b.size_usdc for b in open_bets if b.mode != "SIMULATION"), 2)
     sim_capital_at_risk = round(sum(b.size_usdc for b in open_bets if b.mode == "SIMULATION"), 2)
 
     # Current session balance
@@ -797,11 +797,14 @@ def _signal_to_dict(sig: AddToPositionSignal) -> dict:
             alias = bet.whale_bet.whale.alias
             d["whale_alias"] = alias if alias else bet.whale_address
 
-        # Compute hypothetical P&L for resolved bets
+        # Compute hypothetical P&L for resolved bets.
+        # Use suggested_add_usdc (our scaled bet size) if available, otherwise
+        # fall back to the whale's raw addition for legacy records.
         if bet.resolution_price is not None and bet.status not in ("OPEN", "PENDING", "SKIPPED"):
-            additional_shares = sig.whale_additional_usdc / max(sig.price, 0.001)
+            investment        = sig.suggested_add_usdc if sig.suggested_add_usdc is not None else sig.whale_additional_usdc
+            additional_shares = investment / max(sig.price, 0.001)
             proceeds          = additional_shares * bet.resolution_price
-            hypo_pnl          = round(proceeds - sig.whale_additional_usdc, 2)
+            hypo_pnl          = round(proceeds - investment, 2)
             d["hypothetical_pnl_usdc"] = hypo_pnl
         else:
             d["hypothetical_pnl_usdc"] = None  # still open — unknown outcome
@@ -830,7 +833,8 @@ async def get_signals_stats(db: DBSession = Depends(get_db)):
     total_pnl       = 0.0
 
     for sig in signals:
-        total_invested += sig.whale_additional_usdc
+        investment = sig.suggested_add_usdc if sig.suggested_add_usdc is not None else sig.whale_additional_usdc
+        total_invested += investment
         bet: CopiedBet = sig.copied_bet
 
         if not bet or bet.status in ("OPEN", "PENDING"):
@@ -842,8 +846,8 @@ async def get_signals_stats(db: DBSession = Depends(get_db)):
 
         resolved_count += 1
         if bet.resolution_price is not None:
-            additional_shares = sig.whale_additional_usdc / max(sig.price, 0.001)
-            hypo_pnl = additional_shares * bet.resolution_price - sig.whale_additional_usdc
+            additional_shares = investment / max(sig.price, 0.001)
+            hypo_pnl = additional_shares * bet.resolution_price - investment
             total_pnl += hypo_pnl
             if hypo_pnl > 0.01:
                 profitable += 1

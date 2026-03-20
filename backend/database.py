@@ -220,6 +220,10 @@ class AddToPositionSignal(Base):
     price = Column(Float, nullable=False)
     timestamp = Column(DateTime, nullable=False, default=datetime.utcnow)
 
+    # Scaled bet size we would add under our own sizing rules (risk-factor
+    # adjusted to our session balance), distinct from the whale's raw addition.
+    suggested_add_usdc = Column(Float, nullable=True)
+
     hypothetical_pnl_usdc = Column(Float, nullable=True)
     note = Column(Text, nullable=True)
 
@@ -236,6 +240,7 @@ class AddToPositionSignal(Base):
             "whale_additional_shares": round(self.whale_additional_shares, 4),
             "price": round(self.price, 4),
             "timestamp": self.timestamp.isoformat(),
+            "suggested_add_usdc": round(self.suggested_add_usdc, 2) if self.suggested_add_usdc is not None else None,
             "hypothetical_pnl_usdc": round(self.hypothetical_pnl_usdc, 2) if self.hypothetical_pnl_usdc is not None else None,
             "note": self.note,
         }
@@ -317,11 +322,12 @@ def init_db():
 def _migrate():
     """Apply additive schema migrations (add missing columns)."""
     migrations = [
-        ("copied_bets", "market_close_at",  "DATETIME"),
-        ("copied_bets", "close_reason",     "TEXT"),
-        ("copied_bets", "market_category",  "VARCHAR(50)"),
-        ("copied_bets", "bet_type",         "VARCHAR(50)"),
-        ("whales",      "category_filters", "TEXT"),
+        ("copied_bets",           "market_close_at",   "DATETIME"),
+        ("copied_bets",           "close_reason",      "TEXT"),
+        ("copied_bets",           "market_category",   "VARCHAR(50)"),
+        ("copied_bets",           "bet_type",          "VARCHAR(50)"),
+        ("whales",                "category_filters",  "TEXT"),
+        ("add_to_position_signals", "suggested_add_usdc", "FLOAT"),
     ]
     with engine.connect() as conn:
         for table, column, col_type in migrations:

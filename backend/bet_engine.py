@@ -66,16 +66,20 @@ class BetEngine:
             return self._handle_exit(whale_bet, session, db)
 
         # ---- CASE 2: Whale is opening / adding to a position ----------
+        # Scope to THIS whale's position so that a different whale entering the
+        # same market doesn't incorrectly trigger "add to position" logic.
+        whale_address = whale.address if whale else None
         existing_open = self._find_open_position(
             market_id=whale_bet.market_id,
             token_id=whale_bet.token_id,
             session_mode=session.mode,
             db=db,
+            whale_address=whale_address,
         )
 
         if existing_open is not None:
             # Whale is adding to a position we already hold -> signal only
-            return self._handle_add_to_position(whale_bet, existing_open, db)
+            return self._handle_add_to_position(whale_bet, existing_open, session, db)
 
         # ---- CASE 3: Fresh position ------------------------------------
 
@@ -502,7 +506,7 @@ class BetEngine:
                 # price-based early exit (Cases 2 & 3) remains valid there.
                 _LIVE_SPORTS = {
                     "Soccer", "Basketball", "Tennis", "eSports",
-                    "American Football", "Baseball",
+                    "American Football", "Baseball", "Hockey",
                 }
                 is_live_sport = bet.market_category in _LIVE_SPORTS
 
@@ -610,14 +614,34 @@ class BetEngine:
 
                 # Parse oracle resolution status.
                 # The market is only truly settled when the UMA/oracle has resolved
-                # it on-chain. "active=False" alone is NOT enough — markets are set
-                # to inactive when trading stops (e.g. game starts) but the oracle
-                # resolution can still be pending hours later.
-                is_resolved = bool(
-                    market.get("resolved")
-                    or market.get("resolutionStatus") == "resolved"
-                    or str(market.get("status", "")).lower() in ("resolved", "finalized", "settled")
-                )
+                # it on-chain. "active=False" and "resolved=True" alone are NOT
+                # enough — Polymarket sets these flags when trading stops (e.g. at
+                # game tipoff) but the oracle outcome can still be pending for hours.
+                #
+                # The reliable signal is price convergence: when the oracle finalises,
+                # outcomePrices becomes ["0","1"] or ["1","0"] (one side wins, one
+                # loses). Before settlement it reads ["0","0"] — both zero, sum = 0.
+                #
+                # IMPORTANT: Polymarket live-odds markets update outcomePrices during
+                # play (e.g. ["0.03","0.97"] for a low-scoring game in the 3rd period).
+                # These are NOT oracle-settled — they are live trading prices.
+                # Polymarket never allows trading at exactly 0 or 1; the oracle sets
+                # prices to the integer strings "0" and "1" only after final settlement.
+                #
+                # We distinguish oracle settlement from live pricing by requiring the
+                # opposing token to be ≥ 0.99 (only an exact "1" passes; a live "0.97"
+                # does not). This correctly handles all three states:
+                #   ["0","0"]      → other_price=0.0  → not settled (wait)
+                #   ["0.03","0.97"]→ other_price=0.97 → live trading  (wait)
+                #   ["0","1"]      → other_price=1.0  → oracle settled (close)
+                other_price_val: float = 0.0
+                if len(outcomes) >= 2:
+                    try:
+                        other_price_val = float(outcomes[1 - idx])
+                    except (TypeError, ValueError, IndexError):
+                        pass
+
+                is_resolved = other_price_val >= 0.99
 
                 return price, end_dt, is_resolved
         except Exception as exc:
@@ -635,11 +659,16 @@ class BetEngine:
         db: DBSession,
     ) -> CopiedBet:
         """Whale is selling out of a position - close ours if we have one."""
+        # Use the exiting whale's address to scope the search — prevents a
+        # different whale's EXIT signal from closing a position we opened by
+        # following a different whale in the same market.
+        exiting_whale_address = whale_bet.whale.address if whale_bet.whale else None
         open_pos = self._find_open_position(
             market_id=whale_bet.market_id,
             token_id=whale_bet.token_id,
             session_mode=session.mode,
             db=db,
+            whale_address=exiting_whale_address,
         )
 
         if open_pos is None:
@@ -697,9 +726,24 @@ class BetEngine:
         self,
         whale_bet: WhaleBet,
         existing_open: CopiedBet,
+        session: MonitoringSession,
         db: DBSession,
     ) -> CopiedBet:
-        """Whale is adding to a market we already hold - record signal only, no new ledger entry."""
+        """Whale is adding to a market we already hold - record signal only, no new ledger entry.
+
+        Calculates suggested_add_usdc using the same risk-factor sizing as the
+        main bet engine, based on the session balance *after* the original
+        position's cost (already deducted from session.current_balance_usdc).
+        """
+        whale = whale_bet.whale
+        whale_avg = whale.avg_bet_size_usdc if whale else 0.0
+        risk_factor = risk_calc.calculate_risk_factor(whale_bet.size_usdc, whale_avg)
+        suggested_add_usdc = risk_calc.calculate_bet_size(
+            session_balance=session.current_balance_usdc,
+            risk_factor=risk_factor,
+            max_bet_pct=settings.MAX_BET_PCT,
+        )
+
         signal = AddToPositionSignal(
             whale_bet_id=whale_bet.id,
             copied_bet_id=existing_open.id,
@@ -707,6 +751,7 @@ class BetEngine:
             whale_additional_shares=whale_bet.size_shares,
             price=whale_bet.price,
             timestamp=whale_bet.timestamp,
+            suggested_add_usdc=suggested_add_usdc,
             note="Whale added to position while we hold",
         )
         db.add(signal)
@@ -782,16 +827,21 @@ class BetEngine:
         token_id: str,
         session_mode: str,
         db: DBSession,
+        whale_address: Optional[str] = None,
     ) -> Optional[CopiedBet]:
         """Find an OPEN CopiedBet for this market/token in the given session.
-        Accepts session_mode directly to avoid a redundant DB round-trip."""
-        return (
-            db.query(CopiedBet)
-            .filter(
-                CopiedBet.market_id == market_id,
-                CopiedBet.token_id == token_id,
-                CopiedBet.status == "OPEN",
-                CopiedBet.mode == session_mode,
-            )
-            .first()
+
+        If whale_address is provided (recommended for exits and add-to-position
+        signals), the search is scoped to that whale's positions only.  This
+        prevents a different whale's EXIT signal from accidentally closing a
+        position that was opened by following a different whale.
+        """
+        q = db.query(CopiedBet).filter(
+            CopiedBet.market_id == market_id,
+            CopiedBet.token_id == token_id,
+            CopiedBet.status == "OPEN",
+            CopiedBet.mode == session_mode,
         )
+        if whale_address is not None:
+            q = q.filter(CopiedBet.whale_address == whale_address)
+        return q.first()

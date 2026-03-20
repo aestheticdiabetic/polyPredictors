@@ -3,7 +3,7 @@ Market categorization utilities.
 
 Classifies a bet's market question into:
   - sport    : Soccer | Basketball | Tennis | eSports | American Football |
-               Baseball | Politics | Crypto | Other
+               Baseball | Hockey | Politics | Crypto | Other
   - bet_type : Over/Under | Spread | Exact Score | Moneyline | Match Winner | Other
 """
 
@@ -88,12 +88,25 @@ _NFL_KEYWORDS = {"NFL", "SUPER BOWL", "AFC CHAMPIONSHIP", "NFC CHAMPIONSHIP"}
 _MLB_TEAMS = {
     "RED SOX", "YANKEES", "DODGERS", "CUBS", "ASTROS", "BRAVES", "METS",
     "WHITE SOX", "REDS", "PIRATES", "BREWERS", "ROCKIES", "ORIOLES",
-    "BLUE JAYS", "NATIONALS", "MARLINS", "RAYS", "ANGELS", "RANGERS",
+    "BLUE JAYS", "NATIONALS", "MARLINS", "RAYS", "ANGELS",
     "PADRES", "PHILLIES", "MARINERS", "TIGERS", "ROYALS", "TWINS",
     "ATHLETICS", "DIAMONDBACKS",
+    # Note: "RANGERS" omitted — ambiguous with NY Rangers (NHL); resolved by
+    # checking NHL first. Texas Rangers context caught via _MLB_KEYWORDS.
 }
 
-_MLB_KEYWORDS = {"MLB", "WORLD SERIES", " BASEBALL"}
+_MLB_KEYWORDS = {"MLB", "WORLD SERIES", " BASEBALL", "TEXAS RANGERS"}
+
+_NHL_TEAMS = {
+    "BLUE JACKETS", "MAPLE LEAFS", "CANADIENS", "SENATORS", "JETS",
+    "FLAMES", "OILERS", "CANUCKS", "GOLDEN KNIGHTS", "KRAKEN",
+    "BRUINS", "SABRES", "RED WINGS", "PANTHERS", "LIGHTNING",
+    "HURRICANES", "BLUE JACKETS", "CAPITALS", "PENGUINS", "FLYERS",
+    "DEVILS", "ISLANDERS", "NY RANGERS", "BLACKHAWKS", "PREDATORS",
+    "BLUES", "WILD", "AVALANCHE", "STARS", "COYOTES", "DUCKS", "SHARKS",
+}
+
+_NHL_KEYWORDS = {"NHL", " HOCKEY", "STANLEY CUP", "POWER PLAY"}
 
 _TENNIS_KEYWORDS = {
     "ATP ", "WTA ", "ROLAND GARROS", "WIMBLEDON", "US OPEN",
@@ -174,6 +187,14 @@ def classify_sport(question: str) -> str:
     # American Football
     if any(kw in q for kw in _NFL_KEYWORDS) or any(t in q for t in _NFL_TEAMS):
         return "American Football"
+
+    # Hockey (NHL) — checked before Baseball to resolve RANGERS ambiguity
+    # ("Rangers vs. Blue Jackets" → Blue Jackets is NHL-exclusive)
+    if any(kw in q for kw in _NHL_KEYWORDS) or any(t in q for t in _NHL_TEAMS):
+        return "Hockey"
+    # Rangers without an NHL co-team → assume NHL (NY Rangers more common on Polymarket)
+    if "RANGERS" in q and not any(kw in q for kw in _MLB_KEYWORDS):
+        return "Hockey"
 
     # Baseball
     if any(kw in q for kw in _MLB_KEYWORDS) or any(t in q for t in _MLB_TEAMS):

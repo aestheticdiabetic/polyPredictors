@@ -815,7 +815,7 @@ function renderSignalsGrouped(signals, tab, page) {
 
   if (rows.length === 0) {
     const labels = { win: 'successful', loss: 'failed', open: 'open', all: '' };
-    tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state"><p>No ${labels[tab] || ''} double-down signals yet.</p></div></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8"><div class="empty-state"><p>No ${labels[tab] || ''} double-down signals yet.</p></div></td></tr>`;
     return;
   }
 
@@ -828,12 +828,13 @@ function renderSignalsGrouped(signals, tab, page) {
   };
 
   tbody.innerHTML = rows.map(g => {
-    const count         = g.signals.length;
-    const totalAdded    = g.signals.reduce((acc, s) => acc + s.whale_additional_usdc, 0);
-    const avgPrice      = g.signals.reduce((acc, s) => acc + s.price, 0) / count;
-    const totalHypoPnl  = g.signals.reduce((acc, s) =>
+    const count            = g.signals.length;
+    const totalWhaleAdded  = g.signals.reduce((acc, s) => acc + s.whale_additional_usdc, 0);
+    const totalSuggested   = g.signals.reduce((acc, s) => acc + (s.suggested_add_usdc ?? s.whale_additional_usdc), 0);
+    const avgPrice         = g.signals.reduce((acc, s) => acc + s.price, 0) / count;
+    const totalHypoPnl     = g.signals.reduce((acc, s) =>
       acc + (s.hypothetical_pnl_usdc != null ? s.hypothetical_pnl_usdc : 0), 0);
-    const hasUnresolved = g.signals.some(s => s.hypothetical_pnl_usdc == null);
+    const hasUnresolved    = g.signals.some(s => s.hypothetical_pnl_usdc == null);
 
     const statusBadge = STATUS_BADGE[g.bet_status]
       || `<span class="badge badge-neutral">${escHtml(g.bet_status || '?')}</span>`;
@@ -857,7 +858,8 @@ function renderSignalsGrouped(signals, tab, page) {
         <td title="${escHtml(g.bet_question || '')}">${market}</td>
         <td style="font-size:0.8rem;color:var(--text-muted)" title="${escHtml(g.whale_address || '')}">${whaleLabel}</td>
         <td class="mono text-muted">${addLabel}</td>
-        <td class="mono">$${totalAdded.toFixed(2)}</td>
+        <td class="mono text-muted">$${totalWhaleAdded.toFixed(2)}</td>
+        <td class="mono">$${totalSuggested.toFixed(2)}</td>
         <td class="mono">${avgPrice.toFixed(4)}</td>
         <td>${statusBadge}</td>
         <td>${pnlHtml}</td>
