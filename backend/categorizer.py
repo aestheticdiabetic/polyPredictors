@@ -65,7 +65,7 @@ _NBA_TEAMS = {
     "PISTONS", "BUCKS", "RAPTORS", "NUGGETS", "SUNS", "CLIPPERS", "SPURS",
     "ROCKETS", "MAVERICKS", "THUNDER", "BLAZERS", "TIMBERWOLVES", "JAZZ",
     "PELICANS", "HAWKS", "HORNETS", "MAGIC", "PACERS", "76ERS",
-    "WIZARDS", "GRIZZLIES", "KINGS",
+    "WIZARDS", "GRIZZLIES", "KINGS", "CAVALIERS",
 }
 
 _COLLEGE_BB = {
@@ -73,6 +73,19 @@ _COLLEGE_BB = {
     "TAR HEELS", "COMMODORES", "BOILERMAKERS", "HOYAS", "FRIARS",
     "MOUNTAINEERS", "VOLUNTEERS", "CORNHUSKERS", "TERRAPINS",
     "RAZORBACKS", "GATORS", "HURRICANES", "SOONERS", "JAYHAWKS",
+    # Additional college basketball team nicknames commonly seen on Polymarket
+    "CRIMSON TIDE",   # Alabama
+    "CYCLONES",       # Iowa State
+    "WILDCATS",       # Kentucky, Arizona, K-State, many others
+    "LONGHORNS",      # Texas
+    "BLUE DEVILS",    # Duke
+    "HUSKIES",        # UConn, Washington
+    "WOLFPACK",       # NC State
+    "BEARCATS",       # Cincinnati
+    "AGGIES",         # Utah State, Texas A&M
+    "NITTANY LIONS",  # Penn State
+    "SEMINOLES",      # Florida State
+    "CAVALIERS",      # Virginia (UVA)
 }
 
 _NFL_TEAMS = {
@@ -114,6 +127,7 @@ _TENNIS_KEYWORDS = {
     "INDIAN WELLS", "CINCINNATI", "CHALLENGER", "ITF ", "DAVIS CUP",
     "ASUNCION", "MONTERREY", "BOGOTA", "BUDAPEST", "MARRAKECH",
     "HOUSTON", "ESTORIL", "MUNICH OPEN", "BARCELONA OPEN",
+    "SET HANDICAP",  # tennis-specific handicap bet format
 }
 
 _SOCCER_KEYWORDS = {
@@ -144,6 +158,15 @@ _SOCCER_TEAM_NAMES = {
     "1. FSV MAINZ", "SIGMA OLOMOUC", "AC SPARTA", "VFB STUTTGART",
     "DORTMUND", "LEVERKUSEN", "HOFFENHEIM",
     "KAYSERISPOR", "FATIH KARA",
+    # Additional clubs commonly seen on Polymarket
+    "HANNOVER",       # Hannover 96 (German 2. Bundesliga)
+    "HUESCA",         # SD Huesca (Spanish football)
+    "RACING CLUB",    # RC Lens, RC Strasbourg, Racing Club de Lens (French football)
+    "ANGERS",         # Angers SCO (French football)
+    "PUMAS",          # Pumas de la UNAM (Liga MX)
+    "TIGRES",         # Tigres de la UANL (Liga MX)
+    "CRUZEIRO",       # Cruzeiro EC (Brazilian football)
+    "SPORTING KANSAS", # Sporting Kansas City (MLS)
 }
 
 _SOCCER_FC_SUFFIXES = (" FC", "FC ", " CF", " SC ", " RFC", " AFC")

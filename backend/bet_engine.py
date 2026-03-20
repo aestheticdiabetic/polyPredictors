@@ -264,7 +264,10 @@ class BetEngine:
                 db=db,
             )
 
-        # Parse market close date from market_info for ledger display
+        # Parse market close date from market_info for ledger display.
+        # Prefer gameStartTime (actual tip-off / kick-off) over endDate (trading
+        # cutoff) when it is available and later, so the countdown reflects the
+        # real event time rather than Polymarket's arbitrary betting deadline.
         market_close_at = None
         if market_info:
             end_str = (
@@ -277,8 +280,20 @@ class BetEngine:
                 try:
                     dt = datetime.fromisoformat(end_str.rstrip("Z"))
                     if dt.tzinfo is not None:
-                        dt = dt.replace(tzinfo=None)  # store as naive UTC for consistency
+                        dt = dt.replace(tzinfo=None)  # store as naive UTC
                     market_close_at = dt
+                except (ValueError, TypeError):
+                    pass
+
+            # Override with gameStartTime when available and later than endDate
+            game_start_str = market_info.get("gameStartTime")
+            if game_start_str:
+                try:
+                    gst = datetime.fromisoformat(str(game_start_str).rstrip("Z"))
+                    if gst.tzinfo is not None:
+                        gst = gst.replace(tzinfo=None)
+                    if market_close_at is None or gst > market_close_at:
+                        market_close_at = gst
                 except (ValueError, TypeError):
                     pass
 
@@ -481,6 +496,15 @@ class BetEngine:
                 session = session_cache.get(bet.mode)
                 if not session:
                     continue
+
+                # Refresh market_close_at from the API if it has changed or was missing.
+                # Polymarket occasionally updates endDate; keeping the DB in sync
+                # ensures the frontend always shows the latest trading-close time.
+                if end_dt is not None:
+                    # Convert to naive UTC for comparison (DB stores naive UTC)
+                    end_dt_naive = end_dt.replace(tzinfo=None) if end_dt.tzinfo else end_dt
+                    if bet.market_close_at != end_dt_naive:
+                        bet.market_close_at = end_dt_naive
 
                 # Time remaining to market close
                 hours_remaining: Optional[float] = None
@@ -699,7 +723,12 @@ class BetEngine:
                     except (TypeError, ValueError):
                         pass
 
-                # Parse endDate
+                # Parse endDate (Polymarket trading cutoff) and gameStartTime.
+                # For sports markets, endDate is often the betting cutoff set to
+                # midnight before the game, while gameStartTime is the actual tip-off /
+                # kick-off. We prefer gameStartTime when it is later than endDate so
+                # that market_close_at (and thus the ledger countdown) reflects the
+                # real event time rather than an arbitrary trading cutoff.
                 end_dt: Optional[datetime] = None
                 end_str = (
                     market.get("endDate")
@@ -713,6 +742,18 @@ class BetEngine:
                         if dt.tzinfo is None:
                             dt = dt.replace(tzinfo=timezone.utc)
                         end_dt = dt
+                    except (ValueError, TypeError):
+                        pass
+
+                # Override with gameStartTime when available and later than endDate
+                game_start_str = market.get("gameStartTime")
+                if game_start_str:
+                    try:
+                        gst = datetime.fromisoformat(str(game_start_str).rstrip("Z"))
+                        if gst.tzinfo is None:
+                            gst = gst.replace(tzinfo=timezone.utc)
+                        if end_dt is None or gst > end_dt:
+                            end_dt = gst
                     except (ValueError, TypeError):
                         pass
 

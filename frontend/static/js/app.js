@@ -640,7 +640,7 @@ function renderLedger(bets, pagination) {
 
     const whaleLabel = escHtml(bet.whale_alias || formatAddress(bet.whale_address));
 
-    const closesHtml = formatClosesIn(bet.market_close_at, bet.status);
+    const closesHtml = formatClosesIn(bet.market_close_at, bet.status, bet.market_category);
 
     return `
       <tr class="${rowClass}">
@@ -970,7 +970,12 @@ function updateSortButton() {
   }
 }
 
-function formatClosesIn(marketCloseAt, status) {
+const LIVE_SPORT_CATEGORIES = new Set([
+  'Soccer', 'Basketball', 'Tennis', 'eSports',
+  'American Football', 'Baseball', 'Hockey',
+]);
+
+function formatClosesIn(marketCloseAt, status, marketCategory) {
   if (!marketCloseAt) return '<span class="text-muted">—</span>';
 
   // Treat stored value as UTC (naive UTC from backend)
@@ -981,8 +986,16 @@ function formatClosesIn(marketCloseAt, status) {
   const diffSec = Math.floor(diffMs / 1000);
 
   if (diffSec < 0) {
-    // Market has ended
-    if (status === 'OPEN') return '<span style="color:var(--danger);font-weight:600">EXPIRED</span>';
+    // Market trading window has closed. For live sports the endDate is the
+    // game START / trading-close time — the oracle may not settle for hours
+    // after play ends. Show "Pending" so the bet isn't mis-labelled EXPIRED
+    // while the game is still in progress.
+    if (status === 'OPEN') {
+      if (LIVE_SPORT_CATEGORIES.has(marketCategory)) {
+        return '<span style="color:var(--warning);font-weight:600">Pending</span>';
+      }
+      return '<span style="color:var(--danger);font-weight:600">EXPIRED</span>';
+    }
     return '<span class="text-muted">closed</span>';
   }
 
