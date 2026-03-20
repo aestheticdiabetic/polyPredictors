@@ -469,30 +469,53 @@ class BetEngine:
                 #  - price <= 0.05 AND is_resolved → oracle confirmed NO won; close
                 #  - price <= 0.05 AND NOT is_resolved → likely unresolved 0.0 default; wait
                 #  - 0.05 < price < 0.95         → mid-range; definitely not settled; wait
+                #
+                # Additional guard for live sports NO resolutions: Polymarket sometimes
+                # cancels/voids a duplicate or deprecated market line right at game start,
+                # resolving it to ["0","1"] (NO wins) within minutes of endDate. A real
+                # game outcome cannot be known this quickly. For live sports, require at
+                # least MIN_HOURS_AFTER_CLOSE hours past market end before accepting a
+                # NO oracle resolution, to avoid treating a market cancellation as a loss.
+                # Minimum hours after market_close_at before a NO oracle resolution
+                # is trusted for live sports bets.  Rationale:
+                #   Shortest game + minimum UMA liveness period ≈ 4h
+                #   (Soccer ~2h game + 2h oracle, Basketball ~2.5h + 2h, Hockey ~3h + 2h).
+                # All observed premature cancellations resolved within 2.5h; confirmed
+                # legitimate resolutions took 7h+.  5h provides a clear margin on both sides.
+                MIN_HOURS_AFTER_CLOSE = 5.0
                 if market_ended:
+                    hours_since_close = abs(hours_remaining)
                     if price >= 0.95:
                         logger.info(
                             "Force-close: bet %d market ended %.1fh ago, price=%.4f (YES resolved)",
-                            bet.id, abs(hours_remaining), price,
+                            bet.id, hours_since_close, price,
                         )
                         self.simulate_sell(
                             copied_bet=bet, current_price=price, session=session, db=db,
                             close_reason="Market ended",
                         )
                     elif price <= 0.05 and is_resolved:
-                        logger.info(
-                            "Force-close: bet %d market ended %.1fh ago, price=%.4f (NO resolved, oracle confirmed)",
-                            bet.id, abs(hours_remaining), price,
-                        )
-                        self.simulate_sell(
-                            copied_bet=bet, current_price=price, session=session, db=db,
-                            close_reason="Market ended",
-                        )
+                        if is_live_sport and hours_since_close < MIN_HOURS_AFTER_CLOSE:
+                            logger.warning(
+                                "Skipping premature NO resolution for live sport bet %d "
+                                "(%.1fh after market close < %.1fh minimum) — "
+                                "likely market cancellation, not game outcome",
+                                bet.id, hours_since_close, MIN_HOURS_AFTER_CLOSE,
+                            )
+                        else:
+                            logger.info(
+                                "Force-close: bet %d market ended %.1fh ago, price=%.4f (NO resolved, oracle confirmed)",
+                                bet.id, hours_since_close, price,
+                            )
+                            self.simulate_sell(
+                                copied_bet=bet, current_price=price, session=session, db=db,
+                                close_reason="Market ended",
+                            )
                     else:
                         logger.debug(
                             "Market ended %.1fh ago but not yet oracle-resolved "
                             "(price=%.4f, resolved=%s) — waiting for on-chain settlement (bet %d)",
-                            abs(hours_remaining), price, is_resolved, bet.id,
+                            hours_since_close, price, is_resolved, bet.id,
                         )
                     continue
 

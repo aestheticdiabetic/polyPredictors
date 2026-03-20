@@ -1,0 +1,30 @@
+version: "3.8"
+services:
+  gluetun:
+    image: qmcgaw/gluetun:v3.39.1
+    container_name: polymarket-vpn
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "127.0.0.1:8888:8888"
+    volumes:
+      - ./vpn:/gluetun/custom
+    environment:
+      - VPN_SERVICE_PROVIDER=custom
+      - VPN_TYPE=openvpn
+      - OPENVPN_CUSTOM_CONFIG=/gluetun/custom/ca-113.protonvpn.udp.ovpn
+      - OPENVPN_USER=${OPENVPN_USER}
+      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD}
+      - HTTPPROXY=on
+      - HTTPPROXY_LOG=off
+      - HTTPPROXY_STEALTH=on
+      - TZ=America/Toronto
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9999"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s

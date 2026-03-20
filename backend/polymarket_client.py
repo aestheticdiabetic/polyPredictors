@@ -21,7 +21,11 @@ class PolymarketClient:
     """Async client for all Polymarket public and private APIs."""
 
     def __init__(self):
-        self._http = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True)
+        self._http = httpx.AsyncClient(
+            timeout=_TIMEOUT,
+            follow_redirects=True,
+            proxy=settings.PROXY_URL or None,
+        )
         # {condition_id: (data, expires_at)} — 1-hour TTL market metadata cache
         self._market_cache: dict = {}
 

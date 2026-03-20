@@ -410,8 +410,10 @@ async def ledger_stats(
     closed = [b for b in bets if b.status in ("CLOSED_WIN", "CLOSED_LOSS", "CLOSED_NEUTRAL")]
     closed_pnl = [b.pnl_usdc for b in bets if b.pnl_usdc is not None]
     total_pnl = round(sum(closed_pnl), 2)
-    avg_pnl = round(total_pnl / len(closed_pnl), 2) if closed_pnl else 0.0
-    win_rate = round(len(wins) / len(closed) * 100, 1) if closed else 0.0
+    decided = [b for b in bets if b.status in ("CLOSED_WIN", "CLOSED_LOSS")]
+    decided_pnl = [b.pnl_usdc for b in decided if b.pnl_usdc is not None]
+    avg_pnl = round(sum(decided_pnl) / len(decided_pnl), 2) if decided_pnl else 0.0
+    win_rate = round(len(wins) / len(decided) * 100, 1) if decided else 0.0
 
     # Capital currently at risk (sum of size_usdc for all OPEN bets)
     open_bets = [b for b in bets if b.status == "OPEN"]
@@ -473,8 +475,9 @@ async def stats_by_whale(db: DBSession = Depends(get_db)):
     result = []
     for address, g in groups.items():
         total_pnl = round(sum(g["pnl_values"]), 2)
-        avg_pnl   = round(total_pnl / len(g["pnl_values"]), 2) if g["pnl_values"] else 0.0
-        win_rate  = round(g["wins"] / g["closed"] * 100, 1) if g["closed"] > 0 else None
+        decided   = g["wins"] + g["losses"]
+        avg_pnl   = round(total_pnl / decided, 2) if decided > 0 else 0.0
+        win_rate  = round(g["wins"] / decided * 100, 1) if decided > 0 else None
         best      = round(max(g["pnl_values"]), 2) if g["pnl_values"] else None
         worst     = round(min(g["pnl_values"]), 2) if g["pnl_values"] else None
         result.append({
@@ -548,7 +551,8 @@ async def stats_by_whale_category(db: DBSession = Depends(get_db)):
         result = []
         for label, g in sorted(buckets.items()):
             total_pnl = round(sum(g["pnl_values"]), 2) if g["pnl_values"] else 0.0
-            win_rate = round(g["wins"] / g["closed"] * 100, 1) if g["closed"] > 0 else None
+            decided  = g["wins"] + g["losses"]
+            win_rate = round(g["wins"] / decided * 100, 1) if decided > 0 else None
             result.append({
                 "label": label,
                 "wins": g["wins"],
@@ -841,8 +845,8 @@ async def get_signals_stats(db: DBSession = Depends(get_db)):
             open_count += 1
             continue
 
-        if bet.status == "SKIPPED":
-            continue  # original bet never placed, skip from analysis
+        if bet.status in ("SKIPPED", "CLOSED_NEUTRAL"):
+            continue  # voided/skipped bets have no outcome; exclude from stats
 
         resolved_count += 1
         if bet.resolution_price is not None:

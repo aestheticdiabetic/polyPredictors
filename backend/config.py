@@ -48,6 +48,9 @@ class Settings:
     # A trader averaging $5 per prediction needs $100,000 vol for ~20,000 predictions.
     MIN_WHALE_VOLUME_USDC: float = float(os.getenv("MIN_WHALE_VOLUME_USDC", "1000000"))
 
+    # Optional: HTTP proxy URL for routing traffic through VPN (e.g. gluetun)
+    PROXY_URL: str = os.getenv("PROXY_URL", "")
+
     # API endpoints
     DATA_API_BASE: str = "https://data-api.polymarket.com"
     GAMMA_API_BASE: str = "https://gamma-api.polymarket.com"
@@ -71,3 +74,10 @@ class Settings:
 
 
 settings = Settings()
+
+# Propagate proxy to environment so requests-based libs (py-clob-client) also use it
+if settings.PROXY_URL:
+    for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+        os.environ.setdefault(_k, settings.PROXY_URL)
+    os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
+    os.environ.setdefault("no_proxy", "localhost,127.0.0.1")

@@ -124,6 +124,9 @@ _SOCCER_KEYWORDS = {
 }
 
 _SOCCER_TEAM_NAMES = {
+    # MLS teams whose names contain substrings that match other sports' team lists.
+    # "RED BULLS" must be listed before "BULLS" is checked against _NBA_TEAMS.
+    "RED BULLS",
     "BALOMPI", "ARSENAL", "CHELSEA", "LIVERPOOL", "TOTTENHAM", "EVERTON",
     "MANCHESTER", "LEICESTER", "ASTON VILLA", "CRYSTAL PALACE", "NEWCASTLE",
     "WEST HAM", "WOLVERHAMPTON", "BRIGHTON", "BRENTFORD", "FULHAM",
@@ -134,7 +137,9 @@ _SOCCER_TEAM_NAMES = {
     "PANATHINAIKOS", "OLYMPIAKOS", "AEK", "PAOK",
     "AJAX", "PSV", "FEYENOORD", "TWENTE",
     "PORTO", "BENFICA", "SPORTING CP", "BRAGA",
-    "RANGERS", "CELTIC", "HEARTS", "HIBERNIAN",
+    # "RANGERS" intentionally omitted: ambiguous with NY Rangers (NHL).
+    # "Rangers FC" style is caught earlier by the _SOCCER_FC_SUFFIXES check.
+    "CELTIC", "HEARTS", "HIBERNIAN",
     "NOTTINGHAM FOREST", "MIDTJYLLAND", "SHAKHTAR", "LECH POZNA",
     "1. FSV MAINZ", "SIGMA OLOMOUC", "AC SPARTA", "VFB STUTTGART",
     "DORTMUND", "LEVERKUSEN", "HOFFENHEIM",
@@ -180,6 +185,14 @@ def classify_sport(question: str) -> str:
             if any(t in q for t in _NFL_TEAMS) or any(kw in q for kw in _NFL_KEYWORDS):
                 return "American Football"
 
+    # Soccer team names that could collide with NBA/NHL name checks must be
+    # resolved first (e.g. "RED BULLS" contains "BULLS" → would fire NBA check).
+    if any(name in q for name in _SOCCER_TEAM_NAMES):
+        return "Soccer"
+    # Soccer FC-suffix heuristic early: " FC", "FC ", etc. almost always means football.
+    if any(q.find(sfx) != -1 for sfx in _SOCCER_FC_SUFFIXES):
+        return "Soccer"
+
     # Basketball — NBA + college team names
     if any(t in q for t in _NBA_TEAMS | _COLLEGE_BB):
         return "Basketball"
@@ -192,7 +205,9 @@ def classify_sport(question: str) -> str:
     # ("Rangers vs. Blue Jackets" → Blue Jackets is NHL-exclusive)
     if any(kw in q for kw in _NHL_KEYWORDS) or any(t in q for t in _NHL_TEAMS):
         return "Hockey"
-    # Rangers without an NHL co-team → assume NHL (NY Rangers more common on Polymarket)
+    # Rangers without an NHL co-team → assume NHL (NY Rangers more common on Polymarket).
+    # Guard: "Rangers FC" style names are Scottish football; the FC-suffix check above
+    # already returned "Soccer" for those, so reaching here means no FC suffix present.
     if "RANGERS" in q and not any(kw in q for kw in _MLB_KEYWORDS):
         return "Hockey"
 
@@ -208,12 +223,6 @@ def classify_sport(question: str) -> str:
 
     # Soccer — competition keywords
     if any(kw in q for kw in _SOCCER_KEYWORDS):
-        return "Soccer"
-    # Soccer — known team name fragments
-    if any(name in q for name in _SOCCER_TEAM_NAMES):
-        return "Soccer"
-    # Soccer — team suffix heuristic
-    if any(q.find(sfx) != -1 for sfx in _SOCCER_FC_SUFFIXES):
         return "Soccer"
     # Low O/U (< 10) with no other match → soccer
     if ou_match and float(ou_match.group(1)) < 10:

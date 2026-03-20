@@ -69,6 +69,71 @@ python run.py
 # Dashboard available at http://localhost:8000
 ```
 
+## VPN Tunnelling (Canadian IP)
+
+Polymarket requires a Canadian IP. Rather than enabling a VPN system-wide, you can route **only this app's traffic** through a Canadian VPN connection using Docker + [gluetun](https://github.com/qdm12/gluetun).
+
+### Prerequisites
+
+1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) for Windows (free for personal use, WSL2 backend required — default on Windows 11)
+2. Obtain a Canadian OpenVPN config file (`.ovpn`) from your VPN provider
+
+### Setup
+
+**1. Add your `.ovpn` file**
+
+Place your OpenVPN config at `vpn/canada.ovpn` (or any name — update `docker-compose.vpn.yml` if you use a different name).
+
+> If the `.ovpn` file contains `block-outside-dns`, remove that line — it is a Windows-only directive not supported inside the Linux container.
+
+**2. Add VPN credentials to `.env`**
+
+```env
+# ProtonVPN: find these at account.proton.me → Account → OpenVPN/IKEv2 credentials
+OPENVPN_USER=your_openvpn_username
+OPENVPN_PASSWORD=your_openvpn_password
+
+# Enable the proxy
+PROXY_URL=http://localhost:8888
+```
+
+**3. Start with VPN**
+
+```bat
+start-with-vpn.bat
+```
+
+This script starts the gluetun container, waits until the VPN tunnel is healthy, then launches the app. Your browser and all other applications remain on your normal connection.
+
+### Manual start
+
+```bash
+# Start VPN container
+docker compose -f docker-compose.vpn.yml up -d
+
+# Check it's healthy and confirm Canadian IP
+docker inspect --format={{.State.Health.Status}} polymarket-vpn
+curl -x http://localhost:8888 https://api.ipify.org?format=json
+
+# Then run the app normally
+python run.py
+
+# Stop VPN when done
+docker compose -f docker-compose.vpn.yml down
+```
+
+### Without VPN
+
+Comment out `PROXY_URL` in `.env` and run `python run.py` directly (e.g. if your system VPN is already active).
+
+### Environment variables added for VPN
+
+| Variable | Description |
+|---|---|
+| `PROXY_URL` | HTTP proxy URL for routing app traffic through VPN (e.g. `http://localhost:8888`) |
+| `OPENVPN_USER` | OpenVPN username (passed to gluetun container) |
+| `OPENVPN_PASSWORD` | OpenVPN password (passed to gluetun container) |
+
 ## Project Structure
 
 ```

@@ -1,0 +1,5 @@
+*.ovpn
+*.key
+*.crt
+*.pem
+credentials.txt

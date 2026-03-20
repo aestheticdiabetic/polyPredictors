@@ -8,3 +8,8 @@ data/*.db
 !data/.gitkeep
 logs/*
 !logs/.gitkeep
+vpn/*.ovpn
+vpn/credentials.txt
+vpn/*.key
+vpn/*.crt
+vpn/*.pem
