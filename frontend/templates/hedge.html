@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Polymarket Whale Copier</title>
+  <title>Hedge-Aware Strategy</title>
   <link rel="stylesheet" href="/static/css/style.css" />
 </head>
 <body>
@@ -15,12 +15,12 @@
        ================================================================ -->
   <header class="app-header">
     <div class="brand">
-      <div class="brand-icon">🐋</div>
-      <h1>Polymarket Whale Copier</h1>
+      <div class="brand-icon">🛡️</div>
+      <h1>Hedge-Aware Strategy</h1>
     </div>
     <div class="header-right">
-      <a href="/whales" style="display:inline-flex;align-items:center;gap:5px;color:var(--text-secondary);font-size:0.82rem;padding:6px 12px;border-radius:var(--radius-sm);border:1px solid var(--border);transition:color 150ms ease,border-color 150ms ease;text-decoration:none;margin-right:8px" onmouseover="this.style.color='var(--text-primary)';this.style.borderColor='var(--accent)'" onmouseout="this.style.color='var(--text-secondary)';this.style.borderColor='var(--border)'">&#128202; Whale Analysis</a>
-      <a href="/hedge" style="display:inline-flex;align-items:center;gap:5px;color:#8b5cf6;font-size:0.82rem;padding:6px 12px;border-radius:var(--radius-sm);border:1px solid rgba(139,92,246,0.3);transition:color 150ms ease,border-color 150ms ease;text-decoration:none;margin-right:12px" onmouseover="this.style.borderColor='#8b5cf6'" onmouseout="this.style.borderColor='rgba(139,92,246,0.3)'">&#128737; Hedge Strategy</a>
+      <a href="/hedge/whales" style="display:inline-flex;align-items:center;gap:5px;color:var(--text-secondary);font-size:0.82rem;padding:6px 12px;border-radius:var(--radius-sm);border:1px solid var(--border);transition:color 150ms ease,border-color 150ms ease;text-decoration:none;margin-right:8px" onmouseover="this.style.color='var(--text-primary)';this.style.borderColor='var(--accent)'" onmouseout="this.style.color='var(--text-secondary)';this.style.borderColor='var(--border)'">&#128202; Whale Analysis</a>
+      <a href="/" style="display:inline-flex;align-items:center;gap:5px;color:var(--text-secondary);font-size:0.82rem;padding:6px 12px;border-radius:var(--radius-sm);border:1px solid var(--border);transition:color 150ms ease,border-color 150ms ease;text-decoration:none;margin-right:12px" onmouseover="this.style.color='var(--text-primary)';this.style.borderColor='var(--accent)'" onmouseout="this.style.color='var(--text-secondary)';this.style.borderColor='var(--border)'">&#8592; Standard</a>
       <span class="session-timer">
         Session: <span id="timer-value">00:00:00</span>
       </span>
@@ -34,13 +34,12 @@
   <section class="card" style="margin-bottom:24px">
     <div class="control-panel">
 
-      <!-- Left: mode + runtime -->
+      <!-- Left: mode (fixed) + runtime -->
       <div style="display:flex;flex-direction:column;gap:16px">
         <div class="control-group">
           <div class="control-label">Mode</div>
           <div class="mode-toggle">
-            <button id="mode-sim-btn">SIMULATION</button>
-            <button id="mode-real-btn">REAL</button>
+            <button id="mode-sim-btn" class="active" style="cursor:default;opacity:1">HEDGE SIM</button>
           </div>
         </div>
         <div class="control-group">
@@ -323,8 +322,6 @@
     </div>
   </section>
 
-  <!-- Whale Analysis moved to /whales -->
-
 </div><!-- /app-container -->
 
 <!-- ================================================================
@@ -348,6 +345,6 @@
 <!-- Toast container -->
 <div id="toast-container" class="toast-container"></div>
 
-<script src="/static/js/app.js"></script>
+<script src="/static/js/hedge.js"></script>
 </body>
 </html>

@@ -148,11 +148,22 @@ async def get_status(db: DBSession = Depends(get_db)):
 # ---------------------------------------------------------------------------
 @app.post("/api/session/start")
 async def start_session(body: SessionStartRequest, db: DBSession = Depends(get_db)):
-    """Start a new monitoring session."""
+    """Start a new monitoring session.
 
-    # Prevent starting if already running
-    if whale_monitor.is_running():
-        raise HTTPException(status_code=400, detail="A monitoring session is already running")
+    Multiple modes (e.g. SIMULATION + HEDGE_SIM) can run simultaneously for
+    side-by-side comparison. Starting a mode that is already active is rejected;
+    starting a second mode while another is running is allowed.
+    """
+
+    # Reject if the same mode is already running (different modes are fine)
+    existing = db.query(MonitoringSession).filter_by(
+        mode=body.mode, is_active=True
+    ).first()
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A {body.mode} session is already running",
+        )
 
     # Validate REAL mode requirements
     if body.mode == "REAL" and not settings.credentials_valid():
@@ -161,16 +172,17 @@ async def start_session(body: SessionStartRequest, db: DBSession = Depends(get_d
             detail="REAL mode requires Polymarket credentials in .env",
         )
 
-    # Close any lingering active sessions
-    db.query(MonitoringSession).filter_by(is_active=True).update(
-        {"is_active": False, "stopped_at": datetime.utcnow()}
-    )
+    # Close any lingering stale sessions with the same mode
+    db.query(MonitoringSession).filter(
+        MonitoringSession.mode == body.mode,
+        MonitoringSession.is_active == True,  # noqa: E712
+    ).update({"is_active": False, "stopped_at": datetime.utcnow()})
     db.commit()
 
     starting_balance = (
-        settings.SIM_STARTING_BALANCE
-        if body.mode == "SIMULATION"
-        else (await poly_client.get_wallet_balance() or 0.0)
+        (await poly_client.get_wallet_balance() or 0.0)
+        if body.mode == "REAL"
+        else settings.SIM_STARTING_BALANCE
     )
 
     session = MonitoringSession(
@@ -183,9 +195,10 @@ async def start_session(body: SessionStartRequest, db: DBSession = Depends(get_d
     db.commit()
     db.refresh(session)
 
-    whale_monitor.start_monitoring(session.id)
+    # Start the monitor if it isn't already polling (it will pick up all active sessions)
+    whale_monitor.start_monitoring()
 
-    # Auto-stop if runtime_hours specified
+    # Auto-stop this mode after runtime_hours if specified
     if body.runtime_hours:
         from apscheduler.triggers.date import DateTrigger
         from datetime import timedelta
@@ -195,8 +208,9 @@ async def start_session(body: SessionStartRequest, db: DBSession = Depends(get_d
             whale_monitor._scheduler.add_job(
                 func=_auto_stop_session,
                 trigger=DateTrigger(run_date=stop_at),
-                id="auto_stop",
+                id=f"auto_stop_{body.mode}",
                 replace_existing=True,
+                kwargs={"mode": body.mode},
             )
         except Exception as exc:
             logger.warning("Could not schedule auto-stop: %s", exc)
@@ -206,34 +220,57 @@ async def start_session(body: SessionStartRequest, db: DBSession = Depends(get_d
 
 
 @app.post("/api/session/stop")
-async def stop_session(db: DBSession = Depends(get_db)):
-    """Stop the current monitoring session."""
-    active_session = db.query(MonitoringSession).filter_by(is_active=True).first()
+async def stop_session(
+    mode: Optional[str] = Query(None),
+    db: DBSession = Depends(get_db),
+):
+    """Stop monitoring session(s).
 
-    whale_monitor.stop_monitoring()
+    If `mode` is provided, only sessions of that mode are stopped (e.g. HEDGE_SIM
+    while SIMULATION keeps running). Omit `mode` to stop all active sessions.
+    The whale monitor is shut down only when no active sessions remain.
+    """
+    query = db.query(MonitoringSession).filter_by(is_active=True)
+    if mode:
+        query = query.filter(MonitoringSession.mode == mode)
 
-    if active_session:
-        active_session.is_active = False
-        active_session.stopped_at = datetime.utcnow()
-        db.commit()
-        return {"session": active_session.to_dict(), "message": "Session stopped"}
+    sessions_to_stop = query.all()
+    stopped = None
+    for s in sessions_to_stop:
+        s.is_active = False
+        s.stopped_at = datetime.utcnow()
+        stopped = s
+    db.commit()
 
-    return {"session": None, "message": "No active session to stop"}
+    # Only stop the poller when no active sessions remain
+    remaining = db.query(MonitoringSession).filter_by(is_active=True).count()
+    if remaining == 0:
+        whale_monitor.stop_monitoring()
+
+    return {
+        "session": stopped.to_dict() if stopped else None,
+        "message": "Session stopped" if stopped else "No active session to stop",
+    }
 
 
-def _auto_stop_session():
-    """Called by scheduler when runtime_hours expires."""
+def _auto_stop_session(mode: str = None):
+    """Called by scheduler when runtime_hours expires for a session."""
     db = SessionLocal()
+    remaining = 0
     try:
-        session = db.query(MonitoringSession).filter_by(is_active=True).first()
-        if session:
+        query = db.query(MonitoringSession).filter_by(is_active=True)
+        if mode:
+            query = query.filter(MonitoringSession.mode == mode)
+        for session in query.all():
             session.is_active = False
             session.stopped_at = datetime.utcnow()
-            db.commit()
+        db.commit()
+        remaining = db.query(MonitoringSession).filter_by(is_active=True).count()
     finally:
         db.close()
-    whale_monitor.stop_monitoring()
-    logger.info("Auto-stopped session after runtime expiry")
+    if remaining == 0:
+        whale_monitor.stop_monitoring()
+    logger.info("Auto-stopped %s session after runtime expiry", mode or "all")
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +362,40 @@ async def refresh_profiles():
 # ---------------------------------------------------------------------------
 # Bet Ledger
 # ---------------------------------------------------------------------------
+def _apply_mode_filter(query, mode: str):
+    """
+    Apply a mode filter to a CopiedBet query.
+    - 'standard' → SIMULATION or REAL only (excludes HEDGE_SIM)
+    - 'SIMULATION' / 'REAL' / 'HEDGE_SIM' → exact match
+    - 'all' or anything else → no filter
+    """
+    m = mode.upper()
+    if m in ("SIMULATION", "REAL", "HEDGE_SIM"):
+        return query.filter(CopiedBet.mode == m)
+    if m == "STANDARD":
+        return query.filter(CopiedBet.mode.in_(["SIMULATION", "REAL"]))
+    return query
+
+
+def _apply_session_mode_filter(query, mode: str):
+    """Same as _apply_mode_filter but for MonitoringSession rows."""
+    m = mode.upper()
+    if m in ("SIMULATION", "REAL", "HEDGE_SIM"):
+        return query.filter(MonitoringSession.mode == m)
+    if m == "STANDARD":
+        return query.filter(MonitoringSession.mode.in_(["SIMULATION", "REAL"]))
+    return query
+
+
+@app.get("/api/sessions/latest")
+async def get_latest_session(mode: str = Query("all"), db: DBSession = Depends(get_db)):
+    """Return the most recent session (active or stopped), optionally filtered by mode."""
+    query = db.query(MonitoringSession)
+    query = _apply_session_mode_filter(query, mode)
+    session = query.order_by(MonitoringSession.id.desc()).first()
+    return {"session": session.to_dict() if session else None}
+
+
 @app.get("/api/ledger")
 async def get_ledger(
     page: int = Query(1, ge=1),
@@ -332,13 +403,13 @@ async def get_ledger(
     mode: str = Query("all"),
     status: str = Query("all"),
     sort: str = Query("default"),  # "default" = newest first; "close_asc" = soonest close first
+    since: Optional[str] = Query(None),   # ISO datetime — filter opened_at >= since
+    until: Optional[str] = Query(None),   # ISO datetime — filter opened_at <= until
     db: DBSession = Depends(get_db),
 ):
     """Paginated bet ledger with optional filters."""
     query = db.query(CopiedBet)
-
-    if mode.upper() in ("SIMULATION", "REAL"):
-        query = query.filter(CopiedBet.mode == mode.upper())
+    query = _apply_mode_filter(query, mode)
 
     if status.upper() != "ALL":
         status_map = {
@@ -350,6 +421,19 @@ async def get_ledger(
         }
         db_status = status_map.get(status.lower(), status.upper())
         query = query.filter(CopiedBet.status == db_status)
+
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00")).replace(tzinfo=None)
+            query = query.filter(CopiedBet.opened_at >= since_dt)
+        except ValueError:
+            pass
+    if until:
+        try:
+            until_dt = datetime.fromisoformat(until.replace("Z", "+00:00")).replace(tzinfo=None)
+            query = query.filter(CopiedBet.opened_at <= until_dt)
+        except ValueError:
+            pass
 
     total = query.count()
 
@@ -398,16 +482,13 @@ async def ledger_stats(
 ):
     """Aggregate stats across all (or mode-filtered) bets."""
     query = db.query(CopiedBet)
-    if mode.upper() in ("SIMULATION", "REAL"):
-        query = query.filter(CopiedBet.mode == mode.upper())
-
+    query = _apply_mode_filter(query, mode)
     bets = query.all()
 
     total_bets = len(bets)
     placed = [b for b in bets if b.status != "SKIPPED"]
     wins = [b for b in bets if b.status == "CLOSED_WIN"]
     losses = [b for b in bets if b.status == "CLOSED_LOSS"]
-    closed = [b for b in bets if b.status in ("CLOSED_WIN", "CLOSED_LOSS", "CLOSED_NEUTRAL")]
     closed_pnl = [b.pnl_usdc for b in bets if b.pnl_usdc is not None]
     total_pnl = round(sum(closed_pnl), 2)
     decided = [b for b in bets if b.status in ("CLOSED_WIN", "CLOSED_LOSS")]
@@ -417,11 +498,22 @@ async def ledger_stats(
 
     # Capital currently at risk (sum of size_usdc for all OPEN bets)
     open_bets = [b for b in bets if b.status == "OPEN"]
-    capital_at_risk = round(sum(b.size_usdc for b in open_bets if b.mode != "SIMULATION"), 2)
-    sim_capital_at_risk = round(sum(b.size_usdc for b in open_bets if b.mode == "SIMULATION"), 2)
+    capital_at_risk = round(sum(b.size_usdc for b in open_bets if b.mode == "REAL"), 2)
+    sim_capital_at_risk = round(sum(b.size_usdc for b in open_bets if b.mode in ("SIMULATION", "HEDGE_SIM")), 2)
 
-    # Current session balance
-    active = db.query(MonitoringSession).filter_by(is_active=True).first()
+    # Session balance: scope to the relevant session type so cross-mode
+    # contamination is avoided (e.g. HEDGE_SIM active ≠ standard balance).
+    m = mode.upper()
+    if m == "STANDARD":
+        active = (
+            db.query(MonitoringSession)
+            .filter(MonitoringSession.is_active == True, MonitoringSession.mode.in_(["SIMULATION", "REAL"]))
+            .first()
+        )
+    elif m in ("SIMULATION", "REAL", "HEDGE_SIM"):
+        active = db.query(MonitoringSession).filter_by(is_active=True, mode=m).first()
+    else:
+        active = db.query(MonitoringSession).filter_by(is_active=True).first()
     balance = active.current_balance_usdc if active else settings.SIM_STARTING_BALANCE
 
     return {
@@ -442,11 +534,13 @@ async def ledger_stats(
 # Per-whale analysis
 # ---------------------------------------------------------------------------
 @app.get("/api/stats/by-whale")
-async def stats_by_whale(db: DBSession = Depends(get_db)):
+async def stats_by_whale(mode: str = Query("all"), db: DBSession = Depends(get_db)):
     """Aggregate copied_bets performance broken down by whale."""
     from collections import defaultdict
 
-    bets = db.query(CopiedBet).filter(CopiedBet.status != "SKIPPED").all()
+    query = db.query(CopiedBet).filter(CopiedBet.status != "SKIPPED")
+    query = _apply_mode_filter(query, mode)
+    bets = query.all()
 
     # Build alias lookup from Whale table
     whales = db.query(Whale).all()
@@ -505,7 +599,7 @@ async def stats_by_whale(db: DBSession = Depends(get_db)):
 # Per-whale category breakdown
 # ---------------------------------------------------------------------------
 @app.get("/api/stats/by-whale-category")
-async def stats_by_whale_category(db: DBSession = Depends(get_db)):
+async def stats_by_whale_category(mode: str = Query("all"), db: DBSession = Depends(get_db)):
     """
     Aggregate closed CopiedBets broken down by whale × sport × bet_type.
     Returns per-whale sport and bet-type breakdowns for the analysis page.
@@ -516,11 +610,11 @@ async def stats_by_whale_category(db: DBSession = Depends(get_db)):
     def _empty_bucket():
         return {"wins": 0, "losses": 0, "neutral": 0, "closed": 0, "pnl_values": []}
 
-    closed_bets = (
-        db.query(CopiedBet)
-        .filter(CopiedBet.status.in_(["CLOSED_WIN", "CLOSED_LOSS", "CLOSED_NEUTRAL"]))
-        .all()
+    query = db.query(CopiedBet).filter(
+        CopiedBet.status.in_(["CLOSED_WIN", "CLOSED_LOSS", "CLOSED_NEUTRAL"])
     )
+    query = _apply_mode_filter(query, mode)
+    closed_bets = query.all()
 
     whales = db.query(Whale).all()
     alias_map = {w.address: (w.alias or w.address) for w in whales}
@@ -640,17 +734,29 @@ async def whale_analysis_page(request: Request):
     return templates.TemplateResponse("whales.html", {"request": request})
 
 
+@app.get("/hedge", response_class=HTMLResponse)
+async def hedge_dashboard(request: Request):
+    return templates.TemplateResponse("hedge.html", {"request": request})
+
+
+@app.get("/hedge/whales", response_class=HTMLResponse)
+async def hedge_whales_page(request: Request):
+    return templates.TemplateResponse("hedge_whales.html", {"request": request})
+
+
 # ---------------------------------------------------------------------------
 # Activity feed
 # ---------------------------------------------------------------------------
 @app.get("/api/activity")
-async def get_activity(db: DBSession = Depends(get_db)):
+async def get_activity(mode: str = Query("all"), db: DBSession = Depends(get_db)):
     """
     Returns the last 20 CopiedBets for the live feed, sorted by ID descending.
     Includes max_id so the frontend can skip re-renders when nothing changed.
     """
+    query = db.query(CopiedBet)
+    query = _apply_mode_filter(query, mode)
     bets = (
-        db.query(CopiedBet)
+        query
         .order_by(CopiedBet.id.desc())
         .limit(20)
         .all()
@@ -821,12 +927,22 @@ def _signal_to_dict(sig: AddToPositionSignal) -> dict:
 
 
 @app.get("/api/signals/stats")
-async def get_signals_stats(db: DBSession = Depends(get_db)):
+async def get_signals_stats(mode: str = Query("all"), db: DBSession = Depends(get_db)):
     """
     Aggregate statistics for all add-to-position signals.
     Used to power the "Should I Follow?" dashboard widget.
     """
-    signals = db.query(AddToPositionSignal).all()
+    query = db.query(AddToPositionSignal)
+    m = mode.upper()
+    if m in ("SIMULATION", "REAL", "HEDGE_SIM"):
+        query = query.join(CopiedBet, AddToPositionSignal.copied_bet_id == CopiedBet.id).filter(
+            CopiedBet.mode == m
+        )
+    elif m == "STANDARD":
+        query = query.join(CopiedBet, AddToPositionSignal.copied_bet_id == CopiedBet.id).filter(
+            CopiedBet.mode.in_(["SIMULATION", "REAL"])
+        )
+    signals = query.all()
 
     total           = len(signals)
     open_count      = 0
@@ -889,12 +1005,23 @@ async def get_signals_stats(db: DBSession = Depends(get_db)):
 async def get_signals(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
+    mode: str = Query("all"),
     db: DBSession = Depends(get_db),
 ):
     """Return add-to-position signals with computed hypothetical P&L."""
-    total = db.query(AddToPositionSignal).count()
+    base = db.query(AddToPositionSignal)
+    m = mode.upper()
+    if m in ("SIMULATION", "REAL", "HEDGE_SIM"):
+        base = base.join(CopiedBet, AddToPositionSignal.copied_bet_id == CopiedBet.id).filter(
+            CopiedBet.mode == m
+        )
+    elif m == "STANDARD":
+        base = base.join(CopiedBet, AddToPositionSignal.copied_bet_id == CopiedBet.id).filter(
+            CopiedBet.mode.in_(["SIMULATION", "REAL"])
+        )
+    total = base.count()
     signals = (
-        db.query(AddToPositionSignal)
+        base
         .order_by(AddToPositionSignal.id.desc())
         .offset((page - 1) * limit)
         .limit(limit)

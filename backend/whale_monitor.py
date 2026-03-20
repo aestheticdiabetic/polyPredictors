@@ -105,23 +105,23 @@ class WhaleMonitor:
         finally:
             db.close()
 
-    def start_monitoring(self, session_id: int):
+    def start_monitoring(self):
         """
-        Start the polling scheduler for the given session.
+        Start the polling scheduler.
+        The monitor processes every active MonitoringSession found in the DB
+        on each tick, so multiple modes (SIMULATION + HEDGE_SIM) run in parallel.
         Calls refresh_risk_profiles() immediately, then polls every
         POLLING_INTERVAL_SECONDS seconds.
         """
         with self._lock:
             if self._running:
-                logger.warning("Monitor already running, ignoring start request")
+                logger.debug("Monitor already running — new session will be picked up automatically")
                 return
-
-            self._session_id = session_id
             self._running = True
 
         logger.info(
-            "Starting whale monitor (session %d, interval %ds)",
-            session_id, settings.POLLING_INTERVAL_SECONDS,
+            "Starting whale monitor (interval %ds)",
+            settings.POLLING_INTERVAL_SECONDS,
         )
 
         # Kick off immediate risk profile refresh
@@ -130,12 +130,14 @@ class WhaleMonitor:
         except Exception as exc:
             logger.error("Initial refresh_risk_profiles error: %s", exc)
 
-        # Main polling job
+        # Main polling job — next_run_time=datetime.now() fires the first poll
+        # immediately instead of waiting the full interval.
         self._scheduler.add_job(
             func=self.poll_whales,
             trigger=IntervalTrigger(seconds=settings.POLLING_INTERVAL_SECONDS),
             id="poll_whales",
             replace_existing=True,
+            next_run_time=datetime.now(),
         )
 
         # Hourly risk profile refresh
@@ -152,7 +154,7 @@ class WhaleMonitor:
         logger.info("Whale monitor started")
 
     def stop_monitoring(self):
-        """Stop all scheduled jobs and mark the current session as stopped."""
+        """Stop polling. DB session state is managed by the API layer."""
         with self._lock:
             if not self._running:
                 return
@@ -166,20 +168,6 @@ class WhaleMonitor:
             except Exception:
                 pass
 
-        if self._session_id:
-            db = SessionLocal()
-            try:
-                session = db.query(MonitoringSession).filter_by(id=self._session_id).first()
-                if session:
-                    session.is_active = False
-                    session.stopped_at = datetime.utcnow()
-                    db.commit()
-            except Exception as exc:
-                logger.error("Error stopping session in DB: %s", exc)
-            finally:
-                db.close()
-
-        self._session_id = None
         logger.info("Whale monitor stopped (resolution checker still running)")
 
     def shutdown(self):
@@ -259,7 +247,7 @@ class WhaleMonitor:
         trades list is already fetched (parallel); passing None triggers a
         standalone fetch (e.g. for manual / test invocations).
         """
-        if not self._running or not self._session_id:
+        if not self._running:
             return
 
         if trades is None:
@@ -303,11 +291,9 @@ class WhaleMonitor:
             if not whale:
                 return
 
-            session = db.query(MonitoringSession).filter_by(
-                id=self._session_id, is_active=True
-            ).first()
-            if not session:
-                logger.warning("Session %d no longer active", self._session_id)
+            active_sessions = db.query(MonitoringSession).filter_by(is_active=True).all()
+            if not active_sessions:
+                logger.warning("No active sessions — stopping monitor")
                 self._running = False
                 return
 
@@ -317,9 +303,7 @@ class WhaleMonitor:
                 try:
                     whale_bet = await self._save_whale_bet(trade, whale, ts, db)
                     if whale_bet:
-                        # Fetch market metadata and live price in parallel.
-                        # get_market receives token_id as a fallback for markets
-                        # whose condition_id returns 404/422 on the direct endpoint.
+                        # Fetch market metadata and live price once, reuse for all sessions
                         market_result, price_result = await asyncio.gather(
                             self._client.get_market(
                                 whale_bet.market_id, token_id=whale_bet.token_id
@@ -330,13 +314,16 @@ class WhaleMonitor:
                         market_info = market_result if isinstance(market_result, dict) else {}
                         live_price = price_result if isinstance(price_result, float) else None
 
-                        self._bet_engine.process_new_whale_bet(
-                            whale_bet=whale_bet,
-                            session=session,
-                            db=db,
-                            market_info=market_info,
-                            live_price=live_price,
-                        )
+                        # Process the whale bet for every active session (supports
+                        # simultaneous SIMULATION + HEDGE_SIM for side-by-side comparison)
+                        for session in active_sessions:
+                            self._bet_engine.process_new_whale_bet(
+                                whale_bet=whale_bet,
+                                session=session,
+                                db=db,
+                                market_info=market_info,
+                                live_price=live_price,
+                            )
 
                     if new_last_seen is None or ts > new_last_seen:
                         new_last_seen = ts
@@ -468,18 +455,23 @@ class WhaleMonitor:
                         or ""
                     )
 
-                    # Only act if we hold an open position in this market
+                    # Only act if we hold an open position in this market that was
+                    # opened by following THIS whale — do not close positions we
+                    # copied from a different whale just because this whale exited
+                    # the same market.
                     open_pos = None
                     if token_id:
                         open_pos = (
                             db.query(CopiedBet)
-                            .filter_by(status="OPEN", token_id=token_id)
+                            .filter_by(status="OPEN", token_id=token_id,
+                                       whale_address=address)
                             .first()
                         )
                     if not open_pos and market_id:
                         open_pos = (
                             db.query(CopiedBet)
-                            .filter_by(status="OPEN", market_id=market_id)
+                            .filter_by(status="OPEN", market_id=market_id,
+                                       whale_address=address)
                             .first()
                         )
 
@@ -524,7 +516,7 @@ class WhaleMonitor:
                     whale_alias = whale.alias or address[:10]
                     exit_reason = f"Whale exited ({whale_alias} sold @ {exit_price:.3f})"
 
-                    if open_pos.mode == "SIMULATION":
+                    if open_pos.mode in ("SIMULATION", "HEDGE_SIM"):
                         self._bet_engine.simulate_sell(
                             copied_bet=open_pos,
                             current_price=exit_price,
@@ -752,7 +744,6 @@ class WhaleMonitor:
         """Return current monitor status for API."""
         return {
             "running": self._running,
-            "session_id": self._session_id,
             "tracked_whales": len(self._last_seen),
         }
 

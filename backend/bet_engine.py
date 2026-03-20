@@ -5,6 +5,7 @@ position closing, and resolution checking.
 """
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -68,6 +69,9 @@ class BetEngine:
         # ---- CASE 2: Whale is opening / adding to a position ----------
         # Scope to THIS whale's position so that a different whale entering the
         # same market doesn't incorrectly trigger "add to position" logic.
+        # Each whale's positions are tracked independently — EXIT signals are
+        # also scoped by whale address so one whale's exit can never close
+        # a position that was opened by following a different whale.
         whale_address = whale.address if whale else None
         existing_open = self._find_open_position(
             market_id=whale_bet.market_id,
@@ -78,8 +82,40 @@ class BetEngine:
         )
 
         if existing_open is not None:
-            # Whale is adding to a position we already hold -> signal only
+            # Same whale is adding to a position we already hold -> signal only
             return self._handle_add_to_position(whale_bet, existing_open, session, db)
+
+        # ---- HEDGE GUARD (HEDGE_SIM only): same whale, same market, opposite outcome ---
+        if session.mode == "HEDGE_SIM" and whale_address:
+            opposite_pos = self._find_opposite_outcome_position(
+                market_id=whale_bet.market_id,
+                token_id=whale_bet.token_id,
+                session_mode=session.mode,
+                db=db,
+                whale_address=whale_address,
+            )
+            if opposite_pos is not None:
+                existing_outcome = opposite_pos.outcome or opposite_pos.token_id[:8]
+                new_outcome = whale_bet.outcome or whale_bet.token_id[:8]
+                skip_reason = (
+                    f"Whale hedging — already hold {existing_outcome} in this market "
+                    f"(whale entered {new_outcome} on opposite side)"
+                )
+                logger.info(
+                    "Hedge detected for whale %s in market %s: hold %s, new signal %s — skipping",
+                    whale_address[:10], whale_bet.market_id[:16], existing_outcome, new_outcome,
+                )
+                whale_avg = whale.avg_bet_size_usdc if whale else 0.0
+                risk_factor = risk_calc.calculate_risk_factor(whale_bet.size_usdc, whale_avg)
+                bet_size_usdc = risk_calc.calculate_bet_size(
+                    session_balance=session.current_balance_usdc,
+                    risk_factor=risk_factor,
+                    max_bet_pct=settings.MAX_BET_PCT,
+                )
+                return self._create_skipped_bet(
+                    whale_bet=whale_bet, session=session, bet_size_usdc=bet_size_usdc,
+                    risk_factor=risk_factor, whale_avg=whale_avg, skip_reason=skip_reason, db=db,
+                )
 
         # ---- CASE 3: Fresh position ------------------------------------
 
@@ -180,7 +216,7 @@ class BetEngine:
         # Place or simulate
         entry_price = whale_bet.price
         try:
-            if mode == "SIMULATION":
+            if mode in ("SIMULATION", "HEDGE_SIM"):
                 shares, actual_price = self.simulate_buy(
                     session=session,
                     market_id=whale_bet.market_id,
@@ -400,10 +436,9 @@ class BetEngine:
         db = SessionLocal()
         try:
             open_bets = db.query(CopiedBet).filter(CopiedBet.status == "OPEN").all()
+            logger.info("check_resolution: %d open bet(s) to check", len(open_bets))
             if not open_bets:
                 return
-
-            logger.debug("check_resolution: checking %d open bet(s)", len(open_bets))
 
             # Fetch price + endDate for all open bets in parallel
             loop = asyncio.new_event_loop()
@@ -421,9 +456,17 @@ class BetEngine:
             now = datetime.now(timezone.utc)
             min_hours = settings.MIN_MARKET_HOURS_TO_CLOSE
 
+            _LIVE_SPORTS = {
+                "Soccer", "Basketball", "Tennis", "eSports",
+                "American Football", "Baseball", "Hockey",
+            }
+
             for bet, (price, end_dt, is_resolved) in zip(open_bets, resolution_data):
                 if price is None:
                     continue
+
+                # Must be computed before any case that references it
+                is_live_sport = bet.market_category in _LIVE_SPORTS
 
                 # Resolve the session for this bet's mode (cached)
                 if bet.mode not in session_cache:
@@ -447,7 +490,12 @@ class BetEngine:
                 # settle at 0.0. Skipping prevents a transient API glitch from
                 # wiping open positions with a 100% loss.
                 market_ended = hours_remaining is not None and hours_remaining < 0
-                if price == 0.0 and not market_ended:
+                if price == 0.0 and not market_ended and not is_resolved:
+                    # price=0.0 on an active market is API noise *unless* the oracle
+                    # has confirmed it (is_resolved=True means opposing token = 1.0).
+                    # Some markets use endDate as the UMA settlement deadline (days in
+                    # the future), so market_ended is False even for finished events.
+                    # We must not skip those — they are legitimately settled at 0.
                     logger.warning(
                         "Skipping price=0.0 for active bet %d (%.1fh to close) — "
                         "likely API noise, not closing",
@@ -519,20 +567,6 @@ class BetEngine:
                         )
                     continue
 
-                # For live sports markets (Soccer, Basketball, Tennis, eSports,
-                # American Football, Baseball) price movement during an event is
-                # just live odds fluctuating — it does NOT indicate final outcome.
-                # Only the on-chain oracle settlement (Case 1, after market end)
-                # gives a reliable signal for these markets.
-                # For prediction markets (Politics, Crypto, Other) the price does
-                # gradually converge to 0/1 as the outcome becomes clear, so
-                # price-based early exit (Cases 2 & 3) remains valid there.
-                _LIVE_SPORTS = {
-                    "Soccer", "Basketball", "Tennis", "eSports",
-                    "American Football", "Baseball", "Hockey",
-                }
-                is_live_sport = bet.market_category in _LIVE_SPORTS
-
                 # --- Case 2: Near-expiry window ---
                 if hours_remaining is not None and 0 <= hours_remaining < min_hours:
                     logger.debug(
@@ -558,11 +592,14 @@ class BetEngine:
                     continue
 
                 # --- Case 3: Standard resolution threshold ---
-                # Only applies to prediction markets (non-sports) where price
-                # converging to an extreme genuinely signals outcome.
-                # Live sports prices fluctuate wildly during play and must not be
-                # used as resolution signals before the event ends.
-                if not is_live_sport and (price >= 0.95 or price <= 0.05):
+                # For non-sports: price converging to an extreme signals outcome.
+                # For live sports: ignore price unless the oracle has confirmed it
+                # (is_resolved=True), because live in-play prices fluctuate wildly
+                # and must not be used as resolution signals before the event ends.
+                # When is_resolved=True the endDate may be a future UMA settlement
+                # deadline rather than the game end time, so market_ended is False
+                # even for long-finished matches — we close them here instead.
+                if (not is_live_sport or is_resolved) and (price >= 0.95 or price <= 0.05):
                     self.simulate_sell(
                         copied_bet=bet, current_price=price, session=session, db=db,
                         close_reason=f"Price reached resolution threshold ({price:.3f})",
@@ -583,10 +620,29 @@ class BetEngine:
     async def _fetch_resolution_data(
         self, token_ids: list
     ) -> list[tuple[Optional[float], Optional[datetime], bool]]:
-        """Fetch price, endDate and resolved flag for multiple tokens in parallel."""
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http:
+        """Fetch price, endDate and resolved flag for multiple tokens.
+
+        Requests are throttled to at most MAX_CONCURRENT concurrent connections
+        to avoid rate-limiting on the Gamma API.  Each failed request is retried
+        once after a short back-off before giving up and returning (None, None, False).
+        """
+        MAX_CONCURRENT = 4
+        RETRY_DELAY = 1.5  # seconds
+
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
+
+        async def _fetch_with_limit(tid: str, http: httpx.AsyncClient):
+            async with sem:
+                result = await self._get_resolution_data_async(tid, http)
+                if result[0] is None:
+                    # Single retry after a short back-off
+                    await asyncio.sleep(RETRY_DELAY)
+                    result = await self._get_resolution_data_async(tid, http)
+                return result
+
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as http:
             return await asyncio.gather(
-                *[self._get_resolution_data_async(tid, http) for tid in token_ids]
+                *[_fetch_with_limit(tid, http) for tid in token_ids]
             )
 
     async def _get_resolution_data_async(
@@ -603,10 +659,33 @@ class BetEngine:
             resp.raise_for_status()
             data = resp.json()
             markets = data if isinstance(data, list) else data.get("markets", [])
+            if not markets:
+                logger.warning(
+                    "_get_resolution_data_async: empty markets list for token %s "
+                    "(response keys: %s)",
+                    token_id[:16],
+                    list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                )
+                return None, None, False
             for market in markets:
                 tokens = market.get("clobTokenIds", [])
+                if isinstance(tokens, str):
+                    try:
+                        tokens = json.loads(tokens)
+                    except (json.JSONDecodeError, ValueError):
+                        tokens = []
                 outcomes = market.get("outcomePrices", [])
+                if isinstance(outcomes, str):
+                    try:
+                        outcomes = json.loads(outcomes)
+                    except (json.JSONDecodeError, ValueError):
+                        outcomes = []
                 if token_id not in tokens:
+                    logger.debug(
+                        "_get_resolution_data_async: token %s not in clobTokenIds %s",
+                        token_id[:16],
+                        [t[:8] for t in tokens],
+                    )
                     continue
 
                 # Parse price
@@ -664,11 +743,27 @@ class BetEngine:
                     except (TypeError, ValueError, IndexError):
                         pass
 
+                # Primary signal: opposing token ≥ 0.99 (oracle set price to "1")
                 is_resolved = other_price_val >= 0.99
+
+                # Secondary signal: umaResolutionStatus="resolved" means the
+                # oracle has finalised on-chain even if outcomePrices hasn't
+                # updated yet (e.g. still shows ["0","0"] due to API lag).
+                uma_status = (market.get("umaResolutionStatus") or "").lower()
+                if uma_status == "resolved" and not is_resolved:
+                    logger.info(
+                        "_get_resolution_data_async: umaResolutionStatus=resolved "
+                        "but outcomePrices=%s (price lag) — treating as resolved for token %s",
+                        outcomes, token_id[:16],
+                    )
+                    is_resolved = True
 
                 return price, end_dt, is_resolved
         except Exception as exc:
-            logger.debug("_get_resolution_data_async error for %s: %s", token_id, exc)
+            logger.warning(
+                "_get_resolution_data_async error for %s: %s (%s)",
+                token_id, exc, type(exc).__name__,
+            )
         return None, None, False
 
     # ------------------------------------------------------------------
@@ -713,6 +808,7 @@ class BetEngine:
                 whale_avg_bet_usdc=whale_bet.whale.avg_bet_size_usdc if whale_bet.whale else 0.0,
                 status="SKIPPED",
                 skip_reason="EXIT signal but no open position to close",
+                opened_at=datetime.utcnow(),
             )
             db.add(copied_bet)
             db.commit()
@@ -723,7 +819,7 @@ class BetEngine:
         whale_alias = whale_bet.whale.alias if whale_bet.whale else whale_bet.whale_address[:10]
         exit_reason = f"Whale exited ({whale_alias} sold @ {exit_price:.3f})"
 
-        if session.mode == "SIMULATION":
+        if session.mode in ("SIMULATION", "HEDGE_SIM"):
             self.simulate_sell(
                 copied_bet=open_pos,
                 current_price=exit_price,
@@ -809,6 +905,7 @@ class BetEngine:
             whale_avg_bet_usdc=whale_avg,
             status="SKIPPED",
             skip_reason=skip_reason,
+            opened_at=datetime.utcnow(),
         )
         db.add(copied_bet)
         db.commit()
@@ -868,3 +965,25 @@ class BetEngine:
         if whale_address is not None:
             q = q.filter(CopiedBet.whale_address == whale_address)
         return q.first()
+
+    def _find_opposite_outcome_position(
+        self,
+        market_id: str,
+        token_id: str,
+        session_mode: str,
+        db: DBSession,
+        whale_address: str,
+    ) -> Optional[CopiedBet]:
+        """Return an OPEN position for the same whale in the same market but on a
+        different token_id (opposite outcome). Used for hedge detection in HEDGE_SIM mode."""
+        return (
+            db.query(CopiedBet)
+            .filter(
+                CopiedBet.market_id == market_id,
+                CopiedBet.token_id != token_id,
+                CopiedBet.whale_address == whale_address,
+                CopiedBet.status == "OPEN",
+                CopiedBet.mode == session_mode,
+            )
+            .first()
+        )

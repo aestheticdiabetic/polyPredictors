@@ -136,6 +136,12 @@ a:hover { text-decoration: underline; }
   border: 1px solid rgba(255,71,87,0.3);
 }
 
+.mode-badge.hedge {
+  background: rgba(139,92,246,0.15);
+  color: #8b5cf6;
+  border: 1px solid rgba(139,92,246,0.3);
+}
+
 .mode-badge.idle {
   background: rgba(87,101,116,0.15);
   color: var(--neutral);

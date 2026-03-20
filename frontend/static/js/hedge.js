@@ -1,6 +1,8 @@
 /**
- * Polymarket Whale Copier - Frontend Application
- * Single-file vanilla JS for the dashboard SPA.
+ * Polymarket Whale Copier - Hedge-Aware Strategy Dashboard
+ * Mirrors app.js but hardwired to HEDGE_SIM mode.
+ * Hedge detection (skip opposite-outcome bets from same whale) is active
+ * for all sessions started from this page.
  */
 
 'use strict';
@@ -10,48 +12,42 @@
 // ============================================================
 const State = {
   session:           null,
-  mode:              'SIMULATION',
-  runtimeHours:      null,   // null = manual
+  mode:              'HEDGE_SIM',   // fixed — no toggle
+  runtimeHours:      null,
   ledgerPage:        1,
   ledgerStatus:      'all',
-  ledgerMode:        'standard',  // excludes HEDGE_SIM; use 'all' only for cross-mode reports
-  ledgerSort:        'default',  // 'default' = newest first; 'close_asc' = soonest close first
-  ledgerSince:       null,       // ISO string — set when "This Session" tab is active
-  ledgerUntil:       null,       // ISO string — upper bound for session filter
-  latestSession:     null,       // cached session object for the banner
+  ledgerMode:        'HEDGE_SIM',   // always filter to this mode
+  ledgerSort:        'default',
+  ledgerSince:       null,
+  ledgerUntil:       null,
+  latestSession:     null,
   signalsPage:       1,
-  signalsTab:        'all',   // 'all' | 'win' | 'loss' | 'open'
-  signalsGroupPage:  1,       // client-side page for grouped signal rows
+  signalsTab:        'all',
+  signalsGroupPage:  1,
   timerInterval:     null,
   pollInterval:      null,
   ledgerInterval:    null,
-  lastActivityMaxId: 0,    // Fix #6: dirty-check — skip re-render when unchanged
+  lastActivityMaxId: 0,
 };
 
-// Fix #7: in-flight guard — prevents overlapping concurrent fetches per endpoint
 const _inFlight = new Set();
 
 // ============================================================
-// DOM refs (populated after DOMContentLoaded)
+// DOM refs
 // ============================================================
 const $ = id => document.getElementById(id);
 let DOM = {};
 
 function cacheDom() {
   DOM = {
-    // Header
     modeBadge:       $('mode-badge'),
     sessionTimer:    $('session-timer'),
     timerVal:        $('timer-value'),
 
-    // Controls
-    modeSimBtn:      $('mode-sim-btn'),
-    modeRealBtn:     $('mode-real-btn'),
     startBtn:        $('start-btn'),
     stopBtn:         $('stop-btn'),
     balanceValue:    $('balance-value'),
 
-    // Stats
     statBets:        $('stat-bets'),
     statCapital:     $('stat-capital'),
     statSimCapital:  $('stat-sim-capital'),
@@ -59,33 +55,27 @@ function cacheDom() {
     statPnl:         $('stat-pnl'),
     statDuration:    $('stat-duration'),
 
-    // Whales
     whaleTableBody:  $('whale-table-body'),
     addWhaleAddr:    $('add-whale-addr'),
     addWhaleAlias:   $('add-whale-alias'),
     addWhaleBtn:     $('add-whale-btn'),
     discoverBtn:     $('discover-btn'),
 
-    // Activity
     activityFeed:    $('activity-feed'),
 
-    // Ledger
     ledgerTableBody: $('ledger-table-body'),
     ledgerPagination:$('ledger-pagination'),
     ledgerInfo:      $('ledger-info'),
     sessionBanner:   $('session-banner'),
 
-    // Signals
     signalsTableBody:  $('signals-table-body'),
     signalsPagination: $('signals-pagination'),
     signalsInfo:       $('signals-info'),
 
-    // Modal
     modalOverlay:    $('modal-overlay'),
     modalBody:       $('modal-body'),
     modalClose:      $('modal-close'),
 
-    // Toast
     toastContainer:  $('toast-container'),
   };
 }
@@ -96,17 +86,14 @@ function cacheDom() {
 document.addEventListener('DOMContentLoaded', () => {
   cacheDom();
   bindEvents();
-  setMode('SIMULATION');
-  setRuntime(null); // Manual by default
+  setRuntime(null);
 
-  // Initial load
   fetchStatus();
   fetchWhales();
   fetchActivity();
   fetchLedger();
   fetchSignals();
 
-  // Polling
   State.pollInterval = setInterval(() => {
     fetchStatus();
     if (State.session && State.session.is_active) {
@@ -126,9 +113,6 @@ document.addEventListener('DOMContentLoaded', () => {
 // Event binding
 // ============================================================
 function bindEvents() {
-  DOM.modeSimBtn.addEventListener('click', () => setMode('SIMULATION'));
-  DOM.modeRealBtn.addEventListener('click', () => setMode('REAL'));
-
   DOM.startBtn.addEventListener('click', startSession);
   DOM.stopBtn.addEventListener('click', stopSession);
 
@@ -141,7 +125,6 @@ function bindEvents() {
     if (e.target === DOM.modalOverlay) closeModal();
   });
 
-  // Runtime selector buttons
   document.querySelectorAll('.runtime-selector button').forEach(btn => {
     btn.addEventListener('click', () => {
       const val = btn.dataset.hours;
@@ -151,7 +134,6 @@ function bindEvents() {
     });
   });
 
-  // Ledger filter tabs
   document.querySelectorAll('.filter-tab[data-status]').forEach(tab => {
     tab.addEventListener('click', async () => {
       const s = tab.dataset.status;
@@ -177,25 +159,13 @@ function bindEvents() {
     });
   });
 
-  // Refresh profiles button
   const refreshBtn = $('refresh-profiles-btn');
   if (refreshBtn) refreshBtn.addEventListener('click', refreshProfiles);
 }
 
 // ============================================================
-// Mode & Runtime
+// Runtime
 // ============================================================
-function setMode(mode) {
-  State.mode = mode;
-  if (mode === 'SIMULATION') {
-    DOM.modeSimBtn.classList.add('active-sim');
-    DOM.modeRealBtn.classList.remove('active-real');
-  } else {
-    DOM.modeSimBtn.classList.remove('active-sim');
-    DOM.modeRealBtn.classList.add('active-real');
-  }
-}
-
 function setRuntime(hours) {
   State.runtimeHours = hours;
 }
@@ -209,17 +179,17 @@ async function startSession() {
   setButtonLoading(DOM.startBtn, true);
   try {
     const resp = await api('POST', '/api/session/start', {
-      mode: State.mode,
+      mode: 'HEDGE_SIM',
       runtime_hours: State.runtimeHours,
     });
 
     State.session = resp.session;
-    State.lastActivityMaxId = 0; // force activity re-render for new session
+    State.lastActivityMaxId = 0;
     updateSessionUI();
     startTimer();
     fetchLedger();
     fetchWhales();
-    showToast('Session started in ' + State.mode + ' mode', 'success');
+    showToast('Hedge-Aware session started', 'success');
   } catch (err) {
     showToast(err.message || 'Failed to start session', 'error');
   } finally {
@@ -232,7 +202,7 @@ async function stopSession() {
 
   setButtonLoading(DOM.stopBtn, true);
   try {
-    const resp = await api('POST', `/api/session/stop?mode=${State.mode}`);
+    const resp = await api('POST', '/api/session/stop?mode=HEDGE_SIM');
     State.session = resp.session;
     updateSessionUI();
     stopTimer();
@@ -253,12 +223,11 @@ async function fetchStatus() {
   _inFlight.add('status');
   try {
     const data = await api('GET', '/api/status');
-    // Exclude HEDGE_SIM sessions from the standard dashboard — they run on /hedge
-    State.session = (data.session && data.session.mode !== 'HEDGE_SIM') ? data.session : null;
+    // Only show a session on this page if it's a HEDGE_SIM session
+    State.session = (data.session && data.session.mode === 'HEDGE_SIM') ? data.session : null;
     updateSessionUI();
 
-    // Stats scoped to standard modes only (SIMULATION + REAL, no HEDGE_SIM)
-    const stats = await api('GET', '/api/ledger/stats?mode=standard');
+    const stats = await api('GET', '/api/ledger/stats?mode=HEDGE_SIM');
     updateStats(stats);
   } catch (err) {
     // Silently fail on status polls
@@ -271,23 +240,17 @@ function updateSessionUI() {
   const s = State.session;
   const isActive = s && s.is_active;
 
-  // Mode badge
   if (!s) {
     DOM.modeBadge.textContent = 'IDLE';
     DOM.modeBadge.className = 'mode-badge idle';
-  } else if (s.mode === 'SIMULATION') {
-    DOM.modeBadge.textContent = 'SIMULATION';
-    DOM.modeBadge.className = 'mode-badge simulation';
   } else {
-    DOM.modeBadge.textContent = 'REAL';
-    DOM.modeBadge.className = 'mode-badge real';
+    DOM.modeBadge.textContent = 'HEDGE';
+    DOM.modeBadge.className = 'mode-badge hedge';
   }
 
-  // Balance
   const balance = s ? s.current_balance_usdc : 200;
   DOM.balanceValue.textContent = formatUSDC(balance);
 
-  // Buttons
   DOM.startBtn.disabled = isActive;
   DOM.stopBtn.disabled = !isActive;
 
@@ -424,7 +387,7 @@ async function toggleWhale(address, active) {
     await fetchWhales();
   } catch (err) {
     showToast(err.message || 'Toggle failed', 'error');
-    await fetchWhales(); // revert UI
+    await fetchWhales();
   }
 }
 
@@ -514,8 +477,7 @@ async function fetchActivity() {
   if (_inFlight.has('activity')) return;
   _inFlight.add('activity');
   try {
-    const data = await api('GET', '/api/activity?mode=standard');
-    // Fix #6: skip full DOM re-render when feed hasn't changed
+    const data = await api('GET', '/api/activity?mode=HEDGE_SIM');
     if (data.max_id === State.lastActivityMaxId) return;
     State.lastActivityMaxId = data.max_id;
     renderActivity(data.activity);
@@ -572,7 +534,7 @@ async function fetchLedger() {
       page: State.ledgerPage,
       limit: 50,
       status: State.ledgerStatus,
-      mode: State.ledgerMode,
+      mode: 'HEDGE_SIM',
       sort: State.ledgerSort,
     });
     if (State.ledgerSince) params.set('since', State.ledgerSince);
@@ -593,7 +555,7 @@ function renderLedger(bets, pagination) {
         <td colspan="10">
           <div class="empty-state">
             <div class="empty-icon">📋</div>
-            <p>No bets yet. Start a session and add whales to track.</p>
+            <p>No bets yet. Start a Hedge-Aware session and add whales to track.</p>
           </div>
         </td>
       </tr>`;
@@ -637,9 +599,7 @@ function renderLedger(bets, pagination) {
       : '<span class="text-muted">—</span>';
 
     const actionDir = bet.side === 'SELL' ? 'EXIT' : 'BUY ' + (bet.outcome || '');
-
     const whaleLabel = escHtml(bet.whale_alias || formatAddress(bet.whale_address));
-
     const closesHtml = formatClosesIn(bet.market_close_at, bet.status);
 
     return `
@@ -647,7 +607,7 @@ function renderLedger(bets, pagination) {
         <td class="mono text-muted" style="font-size:0.75rem">${time}</td>
         <td title="${escHtml(bet.whale_address)}">${whaleLabel}</td>
         <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(bet.question)}">${escHtml(truncate(bet.question || bet.market_id, 40))}</td>
-        <td><span class="badge ${bet.mode === 'SIMULATION' ? 'badge-sim' : 'badge-real'}">${actionDir}</span></td>
+        <td><span class="badge badge-sim">${actionDir}</span></td>
         <td class="mono">${bet.price_at_entry ? bet.price_at_entry.toFixed(3) : '—'}</td>
         <td class="mono">${bet.size_usdc > 0 ? '$' + bet.size_usdc.toFixed(2) : '—'}</td>
         <td>${pnlHtml}</td>
@@ -672,7 +632,6 @@ function renderPagination(pagination) {
   let html = '';
   html += `<button onclick="changeLedgerPage(${page - 1})" ${page <= 1 ? 'disabled' : ''}>&lsaquo;</button>`;
 
-  // Show at most 7 page buttons
   const lo = Math.max(1, page - 3);
   const hi = Math.min(pages, page + 3);
   if (lo > 1) html += `<button onclick="changeLedgerPage(1)">1</button><span class="pagination-info">...</span>`;
@@ -696,10 +655,10 @@ function changeLedgerPage(page) {
 // ============================================================
 async function fetchAndShowSessionBanner() {
   try {
-    const data = await api('GET', '/api/sessions/latest?mode=standard');
+    const data = await api('GET', '/api/sessions/latest');
     const s = data.session;
     State.latestSession = s;
-    if (!s) {
+    if (!s || s.mode !== 'HEDGE_SIM') {
       if (DOM.sessionBanner) DOM.sessionBanner.style.display = 'none';
       fetchLedger();
       return;
@@ -717,8 +676,6 @@ async function fetchAndShowSessionBanner() {
 function renderSessionBanner(s) {
   if (!DOM.sessionBanner) return;
 
-  const modeColor = s.mode === 'SIMULATION' ? 'var(--warning)' : 'var(--danger)';
-  const modeBg    = s.mode === 'SIMULATION' ? 'var(--warning-dim)' : 'var(--danger-dim)';
   const statusLabel = s.is_active
     ? '<span style="color:var(--success);font-weight:600">ACTIVE</span>'
     : '<span style="color:var(--text-muted)">STOPPED</span>';
@@ -741,7 +698,7 @@ function renderSessionBanner(s) {
   DOM.sessionBanner.innerHTML = `
     <div style="padding:10px 16px;background:var(--bg-secondary);display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)">
       <span style="font-weight:600;font-size:0.85rem">Session #${s.id}</span>
-      <span style="background:${modeBg};color:${modeColor};padding:2px 8px;border-radius:10px;font-size:0.72rem;font-weight:700">${s.mode}</span>
+      <span style="background:rgba(139,92,246,0.15);color:#8b5cf6;padding:2px 8px;border-radius:10px;font-size:0.72rem;font-weight:700">HEDGE</span>
       ${statusLabel}
       <span class="text-muted" style="font-size:0.78rem;margin-left:4px">Started ${startedStr} &mdash; ${durationStr}</span>
     </div>
@@ -765,8 +722,8 @@ async function fetchSignals() {
   _inFlight.add('signals');
   try {
     const [data, stats] = await Promise.all([
-      api('GET', `/api/signals?page=${State.signalsPage}&limit=200&mode=standard`),
-      api('GET', '/api/signals/stats?mode=standard'),
+      api('GET', `/api/signals?page=${State.signalsPage}&limit=200&mode=HEDGE_SIM`),
+      api('GET', '/api/signals/stats?mode=HEDGE_SIM'),
     ]);
     _cachedSignals = data.signals || [];
     renderSignalsWidget(stats);
@@ -809,7 +766,6 @@ function renderSignalsWidget(stats) {
 
   widget.style.display = '';
 
-  // Header: verdict banner
   const header = $('signals-verdict-header');
   const verdictCfg = {
     follow:             { bg: 'rgba(0,200,100,0.12)', color: 'var(--success)', icon: '✅', text: 'Worth Following — these double-downs have been profitable' },
@@ -822,7 +778,6 @@ function renderSignalsWidget(stats) {
   header.style.color = cfg.color;
   header.innerHTML = `<span>${cfg.icon}</span> Should I follow these signals? &nbsp;<span style="font-weight:400">${cfg.text}</span>`;
 
-  // Stat cells
   $('sig-stat-total').textContent    = stats.total_signals;
   $('sig-stat-resolved').textContent = stats.resolved_signals > 0
     ? `${stats.resolved_signals} (${stats.profitable}W / ${stats.losing}L)`
@@ -848,24 +803,15 @@ function renderSignalsGrouped(signals, tab, page) {
   const tbody = DOM.signalsTableBody;
   if (!tbody) return;
 
-  // Group by copied_bet_id first
   const groups = {};
   for (const s of (signals || [])) {
     const key = s.copied_bet_id;
     if (!groups[key]) {
-      groups[key] = {
-        copied_bet_id: key,
-        bet_question:  s.bet_question,
-        bet_status:    s.bet_status,
-        whale_alias:   s.whale_alias,
-        whale_address: s.whale_address,
-        signals:       [],
-      };
+      groups[key] = { copied_bet_id: key, bet_question: s.bet_question, bet_status: s.bet_status, whale_alias: s.whale_alias, whale_address: s.whale_address, signals: [] };
     }
     groups[key].signals.push(s);
   }
 
-  // Filter groups by tab
   let rows = Object.values(groups);
   if (tab === 'win')  rows = rows.filter(g => g.bet_status === 'CLOSED_WIN');
   if (tab === 'loss') rows = rows.filter(g => g.bet_status === 'CLOSED_LOSS');
@@ -877,7 +823,6 @@ function renderSignalsGrouped(signals, tab, page) {
   const start = (safePage - 1) * SIGNALS_PER_PAGE;
   rows = rows.slice(start, start + SIGNALS_PER_PAGE);
 
-  // Render pagination
   if (DOM.signalsInfo) {
     const end = Math.min(start + SIGNALS_PER_PAGE, total);
     DOM.signalsInfo.textContent = total > 0 ? `Showing ${start + 1}–${end} of ${total}` : '';
@@ -911,16 +856,14 @@ function renderSignalsGrouped(signals, tab, page) {
   };
 
   tbody.innerHTML = rows.map(g => {
-    const count            = g.signals.length;
-    const totalWhaleAdded  = g.signals.reduce((acc, s) => acc + s.whale_additional_usdc, 0);
-    const totalSuggested   = g.signals.reduce((acc, s) => acc + (s.suggested_add_usdc ?? s.whale_additional_usdc), 0);
-    const avgPrice         = g.signals.reduce((acc, s) => acc + s.price, 0) / count;
-    const totalHypoPnl     = g.signals.reduce((acc, s) =>
-      acc + (s.hypothetical_pnl_usdc != null ? s.hypothetical_pnl_usdc : 0), 0);
-    const hasUnresolved    = g.signals.some(s => s.hypothetical_pnl_usdc == null);
+    const count           = g.signals.length;
+    const totalWhaleAdded = g.signals.reduce((acc, s) => acc + s.whale_additional_usdc, 0);
+    const totalSuggested  = g.signals.reduce((acc, s) => acc + (s.suggested_add_usdc ?? s.whale_additional_usdc), 0);
+    const avgPrice        = g.signals.reduce((acc, s) => acc + s.price, 0) / count;
+    const totalHypoPnl    = g.signals.reduce((acc, s) => acc + (s.hypothetical_pnl_usdc != null ? s.hypothetical_pnl_usdc : 0), 0);
+    const hasUnresolved   = g.signals.some(s => s.hypothetical_pnl_usdc == null);
 
-    const statusBadge = STATUS_BADGE[g.bet_status]
-      || `<span class="badge badge-neutral">${escHtml(g.bet_status || '?')}</span>`;
+    const statusBadge = STATUS_BADGE[g.bet_status] || `<span class="badge badge-neutral">${escHtml(g.bet_status || '?')}</span>`;
 
     let pnlHtml;
     if (g.bet_status === 'OPEN' || g.bet_status === 'PENDING') {
@@ -950,25 +893,16 @@ function renderSignalsGrouped(signals, tab, page) {
   }).join('');
 }
 
-// Whale analysis moved to /whales page
-
 // ============================================================
 // Helpers
 // ============================================================
 async function api(method, url, body) {
-  const opts = {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-  };
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
   if (body !== undefined) opts.body = JSON.stringify(body);
-
   const resp = await fetch(url, opts);
   if (!resp.ok) {
     let detail = `HTTP ${resp.status}`;
-    try {
-      const err = await resp.json();
-      detail = err.detail || err.message || detail;
-    } catch (_) {}
+    try { const err = await resp.json(); detail = err.detail || err.message || detail; } catch (_) {}
     throw new Error(detail);
   }
   return resp.json();
@@ -997,30 +931,19 @@ function updateSortButton() {
 
 function formatClosesIn(marketCloseAt, status) {
   if (!marketCloseAt) return '<span class="text-muted">—</span>';
-
-  // Treat stored value as UTC (naive UTC from backend)
   const closeStr = marketCloseAt.endsWith('Z') ? marketCloseAt : marketCloseAt + 'Z';
-  const closeMs = new Date(closeStr).getTime();
-  const nowMs = Date.now();
-  const diffMs = closeMs - nowMs;
-  const diffSec = Math.floor(diffMs / 1000);
-
+  const diffSec = Math.floor((new Date(closeStr).getTime() - Date.now()) / 1000);
   if (diffSec < 0) {
-    // Market has ended
     if (status === 'OPEN') return '<span style="color:var(--danger);font-weight:600">EXPIRED</span>';
     return '<span class="text-muted">closed</span>';
   }
-
-  const days  = Math.floor(diffSec / 86400);
+  const days = Math.floor(diffSec / 86400);
   const hours = Math.floor((diffSec % 86400) / 3600);
   const mins  = Math.floor((diffSec % 3600) / 60);
-
   let label;
   if (days > 0)       label = `${days}d ${hours}h`;
   else if (hours > 0) label = `${hours}h ${mins}m`;
   else                label = `${mins}m`;
-
-  // Highlight near-expiry (< 1h)
   const style = diffSec < 3600 ? 'color:var(--warning);font-weight:600' : '';
   return style ? `<span style="${style}">${label}</span>` : label;
 }
@@ -1048,12 +971,7 @@ function truncate(str, len) {
 
 function escHtml(str) {
   if (!str) return '';
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function setButtonLoading(btn, loading) {

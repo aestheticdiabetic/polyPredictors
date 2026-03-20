@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 _MARKET_CACHE_TTL = 3600  # seconds
+_PRICE_CACHE_TTL = 30      # seconds — live prices refresh every 30 s
+_PRICE_NEGATIVE_TTL = 300  # seconds — 404 (no order book) cached for 5 min
 
 
 class PolymarketClient:
@@ -26,8 +28,10 @@ class PolymarketClient:
             follow_redirects=True,
             proxy=settings.PROXY_URL or None,
         )
-        # {condition_id: (data, expires_at)} — 1-hour TTL market metadata cache
+        # {condition_id / "token:{token_id}": (data, expires_at)} — 1-hour TTL market metadata cache
         self._market_cache: dict = {}
+        # {"price:{token_id}:{side}": (price_or_None, expires_at)} — short-lived price cache
+        self._price_cache: dict = {}
 
     async def close(self):
         await self._http.aclose()
@@ -195,27 +199,42 @@ class PolymarketClient:
     async def get_last_trade_price(self, token_id: str) -> Optional[float]:
         """
         Retrieve the last trade price for a token from Gamma API market data.
-        Falls back to CLOB price if not available.
+        Uses _market_cache (keyed "token:{token_id}") to avoid re-fetching data
+        that get_market already cached; falls back to a fresh request only when
+        the cache has no entry yet.
         """
-        # Search for a market containing this token_id
-        url = f"{settings.GAMMA_API_BASE}/markets"
-        params = {"clob_token_ids": token_id}
-        try:
-            resp = await self._http.get(url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-            markets = data if isinstance(data, list) else data.get("markets", [])
-            for market in markets:
-                tokens = market.get("clobTokenIds", [])
-                outcomes = market.get("outcomePrices", [])
-                if token_id in tokens and outcomes:
-                    idx = tokens.index(token_id)
-                    if idx < len(outcomes):
-                        return float(outcomes[idx])
+        now = time.monotonic()
+        cache_key = f"token:{token_id}"
+
+        # Check the shared market cache first (populated by get_market token fallback)
+        cached = self._market_cache.get(cache_key)
+        market = None
+        if cached and cached[1] > now:
+            market = cached[0]
+        else:
+            # Fetch from Gamma and populate the cache for future callers
+            url = f"{settings.GAMMA_API_BASE}/markets"
+            try:
+                resp = await self._http.get(url, params={"clob_token_ids": token_id})
+                resp.raise_for_status()
+                data = resp.json()
+                markets = data if isinstance(data, list) else data.get("markets", [])
+                market = markets[0] if markets else None
+                self._market_cache[cache_key] = (market, now + _MARKET_CACHE_TTL)
+            except Exception as exc:
+                logger.debug("get_last_trade_price error for %s: %s", token_id, exc)
+                return None
+
+        if not market:
             return None
-        except Exception as exc:
-            logger.debug("get_last_trade_price error for %s: %s", token_id, exc)
-            return None
+
+        tokens = market.get("clobTokenIds", [])
+        outcomes = market.get("outcomePrices", [])
+        if token_id in tokens and outcomes:
+            idx = tokens.index(token_id)
+            if idx < len(outcomes):
+                return float(outcomes[idx])
+        return None
 
     async def resolve_proxy_wallet(self, address: str) -> Optional[dict]:
         """
@@ -242,7 +261,15 @@ class PolymarketClient:
         """
         Get current best price for a token from the CLOB.
         side: 'BUY' or 'SELL'
+        Caches successful prices for 30 s; caches 404 (no order book) for 5 min
+        so closed/resolved markets don't get hammered on every trade processed.
         """
+        cache_key = f"price:{token_id}:{side}"
+        now = time.monotonic()
+        cached = self._price_cache.get(cache_key)
+        if cached and cached[1] > now:
+            return cached[0]
+
         url = f"{settings.CLOB_HOST}/price"
         params = {"token_id": token_id, "side": side}
         try:
@@ -250,8 +277,16 @@ class PolymarketClient:
             resp.raise_for_status()
             data = resp.json()
             price_str = data.get("price")
-            if price_str is not None:
-                return float(price_str)
+            price = float(price_str) if price_str is not None else None
+            self._price_cache[cache_key] = (price, now + _PRICE_CACHE_TTL)
+            return price
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                # No active order book — market likely resolved or thin.
+                # Cache the miss so we don't hammer the endpoint for every trade.
+                self._price_cache[cache_key] = (None, now + _PRICE_NEGATIVE_TTL)
+            else:
+                logger.debug("get_market_price HTTP error for %s: %s", token_id, exc)
             return None
         except Exception as exc:
             logger.debug("get_market_price error for %s: %s", token_id, exc)
