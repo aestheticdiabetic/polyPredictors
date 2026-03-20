@@ -1004,7 +1004,7 @@ async def get_signals_stats(mode: str = Query("all"), db: DBSession = Depends(ge
 @app.get("/api/signals")
 async def get_signals(
     page: int = Query(1, ge=1),
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(50, ge=1, le=5000),
     mode: str = Query("all"),
     db: DBSession = Depends(get_db),
 ):

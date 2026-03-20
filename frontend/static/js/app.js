@@ -765,7 +765,7 @@ async function fetchSignals() {
   _inFlight.add('signals');
   try {
     const [data, stats] = await Promise.all([
-      api('GET', `/api/signals?page=${State.signalsPage}&limit=200&mode=standard`),
+      api('GET', `/api/signals?page=1&limit=2000&mode=standard`),
       api('GET', '/api/signals/stats?mode=standard'),
     ]);
     _cachedSignals = data.signals || [];
@@ -848,28 +848,11 @@ function renderSignalsGrouped(signals, tab, page) {
   const tbody = DOM.signalsTableBody;
   if (!tbody) return;
 
-  // Group by copied_bet_id first
-  const groups = {};
-  for (const s of (signals || [])) {
-    const key = s.copied_bet_id;
-    if (!groups[key]) {
-      groups[key] = {
-        copied_bet_id: key,
-        bet_question:  s.bet_question,
-        bet_status:    s.bet_status,
-        whale_alias:   s.whale_alias,
-        whale_address: s.whale_address,
-        signals:       [],
-      };
-    }
-    groups[key].signals.push(s);
-  }
-
-  // Filter groups by tab
-  let rows = Object.values(groups);
-  if (tab === 'win')  rows = rows.filter(g => g.bet_status === 'CLOSED_WIN');
-  if (tab === 'loss') rows = rows.filter(g => g.bet_status === 'CLOSED_LOSS');
-  if (tab === 'open') rows = rows.filter(g => g.bet_status === 'OPEN' || g.bet_status === 'PENDING');
+  // Filter by tab (one row per signal)
+  let rows = (signals || []).slice();
+  if (tab === 'win')  rows = rows.filter(s => s.bet_status === 'CLOSED_WIN');
+  if (tab === 'loss') rows = rows.filter(s => s.bet_status === 'CLOSED_LOSS');
+  if (tab === 'open') rows = rows.filter(s => s.bet_status === 'OPEN' || s.bet_status === 'PENDING');
 
   const total = rows.length;
   const pages = Math.max(1, Math.ceil(total / SIGNALS_PER_PAGE));
@@ -898,7 +881,7 @@ function renderSignalsGrouped(signals, tab, page) {
 
   if (rows.length === 0) {
     const labels = { win: 'successful', loss: 'failed', open: 'open', all: '' };
-    tbody.innerHTML = `<tr><td colspan="8"><div class="empty-state"><p>No ${labels[tab] || ''} double-down signals yet.</p></div></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state"><p>No ${labels[tab] || ''} double-down signals yet.</p></div></td></tr>`;
     return;
   }
 
@@ -910,40 +893,32 @@ function renderSignalsGrouped(signals, tab, page) {
     PENDING:        '<span class="badge badge-neutral">PENDING</span>',
   };
 
-  tbody.innerHTML = rows.map(g => {
-    const count            = g.signals.length;
-    const totalWhaleAdded  = g.signals.reduce((acc, s) => acc + s.whale_additional_usdc, 0);
-    const totalSuggested   = g.signals.reduce((acc, s) => acc + (s.suggested_add_usdc ?? s.whale_additional_usdc), 0);
-    const avgPrice         = g.signals.reduce((acc, s) => acc + s.price, 0) / count;
-    const totalHypoPnl     = g.signals.reduce((acc, s) =>
-      acc + (s.hypothetical_pnl_usdc != null ? s.hypothetical_pnl_usdc : 0), 0);
-    const hasUnresolved    = g.signals.some(s => s.hypothetical_pnl_usdc == null);
-
-    const statusBadge = STATUS_BADGE[g.bet_status]
-      || `<span class="badge badge-neutral">${escHtml(g.bet_status || '?')}</span>`;
+  tbody.innerHTML = rows.map(s => {
+    const statusBadge = STATUS_BADGE[s.bet_status]
+      || `<span class="badge badge-neutral">${escHtml(s.bet_status || '?')}</span>`;
 
     let pnlHtml;
-    if (g.bet_status === 'OPEN' || g.bet_status === 'PENDING') {
+    if (s.bet_status === 'OPEN' || s.bet_status === 'PENDING') {
       pnlHtml = '<span class="text-muted">pending…</span>';
-    } else if (hasUnresolved) {
-      pnlHtml = '<span class="text-muted">partial</span>';
+    } else if (s.hypothetical_pnl_usdc == null) {
+      pnlHtml = '<span class="text-muted">—</span>';
     } else {
-      const cls = totalHypoPnl > 0 ? 'pnl-positive' : totalHypoPnl < 0 ? 'pnl-negative' : 'pnl-zero';
-      pnlHtml = `<span class="${cls}">${formatPnl(totalHypoPnl)}</span>`;
+      const cls = s.hypothetical_pnl_usdc > 0 ? 'pnl-positive' : s.hypothetical_pnl_usdc < 0 ? 'pnl-negative' : 'pnl-zero';
+      pnlHtml = `<span class="${cls}">${formatPnl(s.hypothetical_pnl_usdc)}</span>`;
     }
 
-    const market     = escHtml(truncate(g.bet_question || `Bet #${g.copied_bet_id}`, 50));
-    const whaleLabel = escHtml(g.whale_alias || g.whale_address || '—');
-    const addLabel   = count === 1 ? '1 addition' : `${count} additions`;
+    const investment = s.suggested_add_usdc ?? s.whale_additional_usdc;
+    const market     = escHtml(truncate(s.bet_question || `Bet #${s.copied_bet_id}`, 50));
+    const whaleLabel = escHtml(s.whale_alias || s.whale_address || '—');
+    const ts         = s.timestamp ? new Date(s.timestamp).toLocaleDateString() : '—';
 
     return `
       <tr>
-        <td title="${escHtml(g.bet_question || '')}">${market}</td>
-        <td style="font-size:0.8rem;color:var(--text-muted)" title="${escHtml(g.whale_address || '')}">${whaleLabel}</td>
-        <td class="mono text-muted">${addLabel}</td>
-        <td class="mono text-muted">$${totalWhaleAdded.toFixed(2)}</td>
-        <td class="mono">$${totalSuggested.toFixed(2)}</td>
-        <td class="mono">${avgPrice.toFixed(4)}</td>
+        <td title="${escHtml(s.bet_question || '')}">${market}</td>
+        <td style="font-size:0.8rem;color:var(--text-muted)" title="${escHtml(s.whale_address || '')}">${whaleLabel}</td>
+        <td class="mono text-muted">$${s.whale_additional_usdc.toFixed(2)}</td>
+        <td class="mono">$${investment.toFixed(2)}</td>
+        <td class="mono">${s.price.toFixed(4)}</td>
         <td>${statusBadge}</td>
         <td>${pnlHtml}</td>
       </tr>`;

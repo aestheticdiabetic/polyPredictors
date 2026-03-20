@@ -1,0 +1,125 @@
+POLYMARKET COPIER — COMMON COMMANDS
+=====================================
+
+
+--- DOCKER (normal usage) ---
+
+Start (build image + launch in background):
+  docker compose -f docker-compose.vpn.yml up -d --build
+
+Start without rebuilding:
+  docker compose -f docker-compose.vpn.yml up -d
+
+Stop everything:
+  docker compose -f docker-compose.vpn.yml down
+
+Restart app only (keeps VPN alive):
+  docker restart polymarket-app
+
+Restart everything:
+  docker compose -f docker-compose.vpn.yml restart
+
+Rebuild and restart app only (without touching VPN):
+  docker compose -f docker-compose.vpn.yml up -d --build polymarket-app
+
+App is available at: http://localhost:8000
+
+
+--- LOGS ---
+
+Stream app logs:
+  docker logs polymarket-app -f
+
+Stream VPN logs:
+  docker logs polymarket-vpn -f
+
+Last 100 lines of app logs:
+  docker logs polymarket-app --tail 100
+
+Last 100 lines of VPN logs:
+  docker logs polymarket-vpn --tail 100
+
+
+--- STATUS / DEBUGGING ---
+
+Check container status:
+  docker ps
+
+Check container status (including stopped):
+  docker ps -a
+
+Inspect running app container:
+  docker inspect polymarket-app
+
+Open a shell inside the running app container:
+  docker exec -it polymarket-app bash
+
+Check VPN/proxy is working (run inside app container):
+  curl -x http://localhost:8888 https://api.ipify.org
+
+
+--- UPDATING CODE ---
+
+After editing backend or frontend files, rebuild and restart:
+  docker compose -f docker-compose.vpn.yml up -d --build polymarket-app
+
+The ./data and ./logs directories are mounted as volumes —
+they persist across rebuilds automatically.
+
+
+--- LOCAL DEV (no Docker) ---
+
+Install dependencies:
+  pip install -r requirements.txt
+
+Run locally:
+  python run.py
+
+Run with auto-reload (dev mode):
+  python run.py --reload
+
+Run on a different port:
+  python run.py --port 8080
+
+Run with debug logging:
+  python run.py --log-level debug
+
+
+--- TESTS ---
+
+Run all tests:
+  python -m pytest tests/
+
+Run a specific test file:
+  python -m pytest tests/test_scan_bug.py -v
+
+
+--- DATABASE ---
+
+The SQLite database lives at:  ./data/polymarket_copier.db
+
+Open it directly (if sqlite3 is installed):
+  sqlite3 data/polymarket_copier.db
+
+Useful SQL queries:
+  .tables                             -- list all tables
+  SELECT * FROM copied_bets LIMIT 10; -- view recent bets
+  SELECT status, COUNT(*) FROM copied_bets GROUP BY status;
+  SELECT * FROM add_to_position_signals ORDER BY id DESC LIMIT 20;
+
+Back up the database:
+  cp data/polymarket_copier.db data/polymarket_copier.db.bak
+
+
+--- VPN CONFIG ---
+
+OpenVPN config file lives at:  ./vpn/ca-113.protonvpn.udp.ovpn
+Credentials are set via OPENVPN_USER / OPENVPN_PASSWORD in .env
+
+To swap VPN server, replace the .ovpn file and restart:
+  docker compose -f docker-compose.vpn.yml restart gluetun
+
+
+--- QUICK START BAT (Windows) ---
+
+Double-click start-with-vpn.bat   — builds and starts everything
