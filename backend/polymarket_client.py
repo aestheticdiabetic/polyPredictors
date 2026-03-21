@@ -191,9 +191,15 @@ class PolymarketClient:
                     condition_id,
                 )
             return market
-        except Exception as exc:
-            logger.debug("get_market token fallback error for %s: %s", token_id, exc)
+        except httpx.HTTPStatusError as exc:
+            # Definitive HTTP error (404 = token not found) — cache negatively so we
+            # don't hammer the API on every poll for a dead/unknown token.
+            logger.debug("get_market token fallback HTTP error for %s: %s", token_id, exc)
             self._market_cache[cache_key] = (None, now + _NEGATIVE_TTL)
+            return None
+        except Exception as exc:
+            # Transient network error — don't cache so the next poll can retry.
+            logger.debug("get_market token fallback transient error for %s: %s", token_id, exc)
             return None
 
     async def get_last_trade_price(self, token_id: str) -> Optional[float]:

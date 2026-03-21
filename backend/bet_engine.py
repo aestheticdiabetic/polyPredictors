@@ -23,6 +23,7 @@ from backend.database import (
     CopiedBet,
     MonitoringSession,
     SessionLocal,
+    Whale,
     WhaleBet,
 )
 from backend.risk_calculator import RiskCalculator
@@ -174,16 +175,26 @@ class BetEngine:
             )
 
         # Market guard
-        ok, skip_reason = risk_calc.should_place_bet(
-            market_info or {},
-            min_hours_to_close=settings.MIN_MARKET_HOURS_TO_CLOSE,
-            whale_price=whale_bet.price,
-            live_price=live_price,
-        )
+        # If Gamma couldn't return market metadata but the CLOB has a live price,
+        # the market is demonstrably still active (CLOB order books only exist for
+        # open markets).  In that case bypass the metadata check entirely — we don't
+        # want to miss the initial bet just because the Gamma API had a transient
+        # failure or negatively cached a bad condition_id format.  Price staleness
+        # is still validated below via check_price_staleness.
+        effective_market_info = market_info or {}
+        if not effective_market_info and live_price is not None:
+            ok, skip_reason = True, ""
+        else:
+            ok, skip_reason = risk_calc.should_place_bet(
+                effective_market_info,
+                min_hours_to_close=settings.MIN_MARKET_HOURS_TO_CLOSE,
+                whale_price=whale_bet.price,
+                live_price=live_price,
+            )
         if not ok:
             # If the market is already closed/resolved, drop silently — no ledger entry.
             # Policy skips (balance, price drift, etc.) still get a SKIPPED record.
-            if self._is_closed_market_skip(market_info or {}, skip_reason):
+            if self._is_closed_market_skip(effective_market_info, skip_reason):
                 logger.debug(
                     "Dropping whale_bet %d silently — market already closed: %s",
                     whale_bet.id, skip_reason,
@@ -614,12 +625,20 @@ class BetEngine:
                 "American Football", "Baseball", "Hockey",
             }
 
+            # Whales whose bets should never be exited early via near-expiry
+            # price thresholds — they hold positions to full oracle resolution.
+            _NO_NEAR_EXPIRY_ALIASES = {"Crpyto", "Crpyto(lowball)"}
+            _no_near_expiry_addresses: set[str] = {
+                w.address
+                for w in db.query(Whale).filter(Whale.alias.in_(_NO_NEAR_EXPIRY_ALIASES)).all()
+            }
+
             for bet, (price, end_dt, is_resolved) in zip(open_bets, resolution_data):
                 if price is None:
                     continue
 
                 # Must be computed before any case that references it
-                is_live_sport = bet.market_category in _LIVE_SPORTS or bet.market_category == "Crypto"
+                is_live_sport = bet.market_category in _LIVE_SPORTS
 
                 # Resolve the session for this bet's mode (cached)
                 if bet.mode not in session_cache:
@@ -735,7 +754,14 @@ class BetEngine:
                         "Near-expiry monitoring: bet %d closes in %.2fh, price=%.4f",
                         bet.id, hours_remaining, price,
                     )
-                    if not is_live_sport and (price >= 0.80 or price <= 0.20):
+                    skip_near_expiry = bet.whale_address in _no_near_expiry_addresses
+                    if skip_near_expiry:
+                        logger.debug(
+                            "Near-expiry: skipping price-based close for whale-excluded bet %d "
+                            "(%.2fh left, price=%.4f) — waiting for oracle settlement",
+                            bet.id, hours_remaining, price,
+                        )
+                    elif not is_live_sport and (price >= 0.80 or price <= 0.20):
                         logger.info(
                             "Near-expiry close: bet %d price=%.4f crosses 0.80/0.20 "
                             "with %.2fh remaining",
@@ -922,8 +948,29 @@ class BetEngine:
                     except (TypeError, ValueError, IndexError):
                         pass
 
-                # Primary signal: opposing token ≥ 0.99 (oracle set price to "1")
-                is_resolved = other_price_val >= 0.99
+                # Primary signal: EITHER token ≥ 0.99 (oracle set price to "1").
+                # Must check both: when our token WINS (price=1.0, other=0.0)
+                # the old check (other >= 0.99) would return False and leave the
+                # bet stuck open forever.
+                price_val: float = 0.0
+                if outcomes and idx < len(outcomes):
+                    try:
+                        price_val = float(outcomes[idx])
+                    except (TypeError, ValueError):
+                        pass
+                is_resolved = other_price_val >= 0.99 or price_val >= 0.99
+
+                # When the oracle has settled our token at 1.0 (we won) but the
+                # CLOB order book is gone (price returns 0.0 due to no liquidity),
+                # override the CLOB price with the oracle price so the close logic
+                # correctly registers a win rather than a loss.
+                if price_val >= 0.99 and price < 0.95:
+                    logger.info(
+                        "_get_resolution_data_async: oracle price_val=%.4f overrides "
+                        "CLOB price=%.4f for winning token %s",
+                        price_val, price, token_id[:16],
+                    )
+                    price = price_val
 
                 # Secondary signal: umaResolutionStatus="resolved" means the
                 # oracle has finalised on-chain even if outcomePrices hasn't
@@ -969,29 +1016,15 @@ class BetEngine:
         )
 
         if open_pos is None:
-            # We never had a position here; log a skipped EXIT
-            copied_bet = CopiedBet(
-                whale_bet_id=whale_bet.id,
-                whale_address=whale_bet.whale.address,
-                mode=session.mode,
-                market_id=whale_bet.market_id,
-                token_id=whale_bet.token_id,
-                question=whale_bet.question,
-                side=whale_bet.side,
-                outcome=whale_bet.outcome,
-                price_at_entry=whale_bet.price,
-                size_usdc=0.0,
-                size_shares=0.0,
-                risk_factor=1.0,
-                whale_bet_usdc=whale_bet.size_usdc,
-                whale_avg_bet_usdc=whale_bet.whale.avg_bet_size_usdc if whale_bet.whale else 0.0,
-                status="SKIPPED",
-                skip_reason="EXIT signal but no open position to close",
-                opened_at=datetime.utcnow(),
+            # We never held a position here — this EXIT is orphaned (whale sold a
+            # market we either missed or skipped at entry).  Nothing to close, so
+            # drop silently.  The WhaleBet row already records the event; creating a
+            # SKIPPED CopiedBet here only adds noise to the ledger.
+            logger.debug(
+                "_handle_exit: no open position for whale_bet %d (market %s, %s mode) — skipping silently",
+                whale_bet.id, whale_bet.market_id[:16], session.mode,
             )
-            db.add(copied_bet)
-            db.commit()
-            return copied_bet
+            return None
 
         # Close existing position
         exit_price = whale_bet.price
