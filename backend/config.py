@@ -53,6 +53,13 @@ class Settings:
     DRIFT_RETRY_INTERVAL_SECONDS: int = int(os.getenv("DRIFT_RETRY_INTERVAL_SECONDS", "5"))
     DRIFT_RETRY_WINDOW_SECONDS: int = int(os.getenv("DRIFT_RETRY_WINDOW_SECONDS", "120"))
 
+    # How often (seconds) to check for redeemable positions and redeem them on-chain.
+    # Only active when REAL credentials are configured. Default 5 minutes.
+    REDEMPTION_CHECK_INTERVAL_SECONDS: int = int(os.getenv("REDEMPTION_CHECK_INTERVAL_SECONDS", "300"))
+
+    # Polygon RPC URL used for on-chain redemption transactions.
+    POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+
     # Minimum USDC trading volume a leaderboard trader must have to appear in the
     # Discover Whales modal.  The Polymarket API does not expose a prediction count,
     # so volume is used as the practical proxy for high-activity traders.

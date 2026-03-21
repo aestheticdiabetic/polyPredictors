@@ -14,7 +14,7 @@ const State = {
   runtimeHours:      null,   // null = manual
   ledgerPage:        1,
   ledgerStatus:      'all',
-  ledgerMode:        'standard',  // excludes HEDGE_SIM; use 'all' only for cross-mode reports
+  ledgerMode:        'SIMULATION',  // scoped to the active tab (SIMULATION or REAL)
   ledgerSort:        'default',  // 'default' = newest first; 'close_asc' = soonest close first
   ledgerSince:       null,       // ISO string — set when "This Session" tab is active
   ledgerUntil:       null,       // ISO string — upper bound for session filter
@@ -187,12 +187,29 @@ function bindEvents() {
 // ============================================================
 function setMode(mode) {
   State.mode = mode;
+  State.ledgerMode = mode;  // ledger/signals/stats now scoped to the viewed tab
+  State.ledgerPage = 1;
   if (mode === 'SIMULATION') {
     DOM.modeSimBtn.classList.add('active-sim');
     DOM.modeRealBtn.classList.remove('active-real');
   } else {
     DOM.modeSimBtn.classList.remove('active-sim');
     DOM.modeRealBtn.classList.add('active-real');
+  }
+  // Re-fetch everything scoped to the new mode
+  fetchModeStats();
+  fetchLedger();
+  fetchSignals();
+  // For REAL tab: show live wallet balance immediately (even before a session starts)
+  if (mode === 'REAL') fetchWalletBalance();
+}
+
+async function fetchWalletBalance() {
+  try {
+    const data = await api('GET', '/api/wallet/balance');
+    DOM.balanceValue.textContent = formatUSDC(data.balance);
+  } catch (err) {
+    // Credentials not configured or request failed — leave balance as-is
   }
 }
 
@@ -256,14 +273,27 @@ async function fetchStatus() {
     // Exclude HEDGE_SIM sessions from the standard dashboard — they run on /hedge
     State.session = (data.session && data.session.mode !== 'HEDGE_SIM') ? data.session : null;
     updateSessionUI();
-
-    // Stats scoped to standard modes only (SIMULATION + REAL, no HEDGE_SIM)
-    const stats = await api('GET', '/api/ledger/stats?mode=standard');
-    updateStats(stats);
+    await fetchModeStats();
   } catch (err) {
     // Silently fail on status polls
   } finally {
     _inFlight.delete('status');
+  }
+}
+
+async function fetchModeStats() {
+  try {
+    const stats = await api('GET', `/api/ledger/stats?mode=${State.mode}`);
+    updateStats(stats);
+    // REAL mode: always show live wallet balance (session_balance is 0 before first session)
+    // SIMULATION: use session balance from stats
+    if (State.mode === 'REAL') {
+      fetchWalletBalance();
+    } else {
+      DOM.balanceValue.textContent = formatUSDC(stats.session_balance ?? 0);
+    }
+  } catch (err) {
+    // Silently fail
   }
 }
 
@@ -283,11 +313,7 @@ function updateSessionUI() {
     DOM.modeBadge.className = 'mode-badge real';
   }
 
-  // Balance
-  const balance = s ? s.current_balance_usdc : 200;
-  DOM.balanceValue.textContent = formatUSDC(balance);
-
-  // Buttons
+  // Buttons (balance is driven by fetchModeStats, not the session object)
   DOM.startBtn.disabled = isActive;
   DOM.stopBtn.disabled = !isActive;
 
@@ -696,7 +722,7 @@ function changeLedgerPage(page) {
 // ============================================================
 async function fetchAndShowSessionBanner() {
   try {
-    const data = await api('GET', '/api/sessions/latest?mode=standard');
+    const data = await api('GET', `/api/sessions/latest?mode=${State.mode}`);
     const s = data.session;
     State.latestSession = s;
     if (!s) {
@@ -765,8 +791,8 @@ async function fetchSignals() {
   _inFlight.add('signals');
   try {
     const [data, stats] = await Promise.all([
-      api('GET', `/api/signals?page=1&limit=2000&mode=standard`),
-      api('GET', '/api/signals/stats?mode=standard'),
+      api('GET', `/api/signals?page=1&limit=2000&mode=${State.mode}`),
+      api('GET', `/api/signals/stats?mode=${State.mode}`),
     ]);
     _cachedSignals = data.signals || [];
     renderSignalsWidget(stats);

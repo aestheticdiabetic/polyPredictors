@@ -128,6 +128,20 @@ async def index(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Wallet
+# ---------------------------------------------------------------------------
+@app.get("/api/wallet/balance")
+async def get_wallet_balance():
+    """Return the live USDC balance for the configured funder wallet."""
+    if not settings.credentials_valid():
+        raise HTTPException(status_code=400, detail="Wallet credentials not configured")
+    balance = await poly_client.get_wallet_balance()
+    if balance is None:
+        raise HTTPException(status_code=502, detail="Failed to fetch wallet balance")
+    return {"balance": round(balance, 2)}
+
+
+# ---------------------------------------------------------------------------
 # Status
 # ---------------------------------------------------------------------------
 @app.get("/api/status")
@@ -505,16 +519,25 @@ async def ledger_stats(
     # contamination is avoided (e.g. HEDGE_SIM active ≠ standard balance).
     m = mode.upper()
     if m == "STANDARD":
-        active = (
-            db.query(MonitoringSession)
-            .filter(MonitoringSession.is_active == True, MonitoringSession.mode.in_(["SIMULATION", "REAL"]))
-            .first()
+        session_q = db.query(MonitoringSession).filter(
+            MonitoringSession.mode.in_(["SIMULATION", "REAL"])
         )
     elif m in ("SIMULATION", "REAL", "HEDGE_SIM"):
-        active = db.query(MonitoringSession).filter_by(is_active=True, mode=m).first()
+        session_q = db.query(MonitoringSession).filter(MonitoringSession.mode == m)
     else:
-        active = db.query(MonitoringSession).filter_by(is_active=True).first()
-    balance = active.current_balance_usdc if active else settings.SIM_STARTING_BALANCE
+        session_q = db.query(MonitoringSession)
+
+    # Prefer the active session; fall back to most recent if none running
+    active = (
+        session_q.filter(MonitoringSession.is_active == True).first()  # noqa: E712
+        or session_q.order_by(MonitoringSession.id.desc()).first()
+    )
+    if active:
+        balance = active.current_balance_usdc
+    elif m == "REAL":
+        balance = 0.0  # No REAL session ever started — show 0, not sim default
+    else:
+        balance = settings.SIM_STARTING_BALANCE
 
     return {
         "total_bets": total_bets,

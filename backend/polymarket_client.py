@@ -339,8 +339,9 @@ class PolymarketClient:
             return ClobClient(
                 host=settings.CLOB_HOST,
                 chain_id=137,  # Polygon
-                private_key=settings.POLY_PRIVATE_KEY,
+                key=settings.POLY_PRIVATE_KEY,
                 creds=creds,
+                signature_type=2,   # Polymarket proxy wallet (funder != signer EOA)
                 funder=settings.POLY_FUNDER_ADDRESS,
             )
         except ImportError:
@@ -393,17 +394,18 @@ class PolymarketClient:
             raise
 
     async def get_wallet_balance(self) -> Optional[float]:
-        """Fetch USDC balance for the configured funder address."""
-        if not settings.POLY_FUNDER_ADDRESS:
+        """Fetch USDC balance for the configured funder address via authenticated CLOB API."""
+        if not settings.credentials_valid():
             return None
-        url = f"{settings.CLOB_HOST}/balance"
-        params = {"address": settings.POLY_FUNDER_ADDRESS}
         try:
-            resp = await self._http.get(url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-            balance = data.get("balance") or data.get("usdc_balance")
-            return float(balance) if balance is not None else None
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+            client = self._get_clob_client()
+            resp = client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=2)
+            )
+            # Response: {"balance": "34970873", ...} — raw value in micro-USDC (6 decimals)
+            raw = resp.get("balance") if isinstance(resp, dict) else None
+            return round(float(raw) / 1_000_000, 2) if raw is not None else None
         except Exception as exc:
             logger.debug("get_wallet_balance error: %s", exc)
             return None

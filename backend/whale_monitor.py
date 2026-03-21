@@ -55,6 +55,16 @@ class WhaleMonitor:
             trigger=IntervalTrigger(seconds=settings.POLLING_INTERVAL_SECONDS),
             id="poll_exits_always",
         )
+        if settings.credentials_valid():
+            self._resolution_scheduler.add_job(
+                func=self._auto_redemption_job,
+                trigger=IntervalTrigger(seconds=settings.REDEMPTION_CHECK_INTERVAL_SECONDS),
+                id="auto_redeem",
+            )
+            logger.info(
+                "Auto-redemption job registered (every %ds)",
+                settings.REDEMPTION_CHECK_INTERVAL_SECONDS,
+            )
         self._resolution_scheduler.start()
         logger.info(
             "Permanent background scheduler started "
@@ -730,6 +740,24 @@ class WhaleMonitor:
             self._bet_engine.check_resolution()
         except Exception as exc:
             logger.error("check_resolution error: %s", exc)
+
+    def _auto_redemption_job(self):
+        """Periodically redeem resolved positions on-chain. Runs in permanent scheduler."""
+        from backend.redemption import check_and_redeem
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(check_and_redeem())
+            redeemed = result.get("redeemed", 0)
+            if redeemed > 0:
+                total = result.get("total_value", 0.0)
+                logger.info(
+                    "Auto-redeemed %d position(s) for $%.2f", redeemed, total
+                )
+        except Exception as exc:
+            logger.error("Auto-redemption job error: %s", exc)
+        finally:
+            loop.close()
 
     # ------------------------------------------------------------------
     # Utilities

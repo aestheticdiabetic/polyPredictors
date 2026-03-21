@@ -226,6 +226,18 @@ class BetEngine:
             )
 
         if bet_size_usdc < settings.MIN_BET_USDC:
+            if mode == "REAL":
+                # Polymarket CLOB requires orders > $1 — skip rather than inflate
+                return self._create_skipped_bet(
+                    whale_bet=whale_bet,
+                    session=session,
+                    bet_size_usdc=bet_size_usdc,
+                    risk_factor=risk_factor,
+                    whale_avg=whale_avg,
+                    skip_reason=f"Below $1 minimum (${bet_size_usdc:.2f})",
+                    db=db,
+                )
+            # Simulation: clamp up so ledger always shows a valid size
             bet_size_usdc = settings.MIN_BET_USDC
             logger.debug(
                 "Bet size below minimum — clamping to $%.2f for whale_bet %d",
@@ -305,6 +317,9 @@ class BetEngine:
                 )
                 if fill_price:
                     entry_price = float(fill_price)
+                # Deduct from session balance (simulate_buy handles this for SIM)
+                session.current_balance_usdc = max(0.0, session.current_balance_usdc - bet_size_usdc)
+                db.add(session)
                 bet_status = "OPEN"
                 skip_reason_val = None
         except Exception as exc:
@@ -486,6 +501,72 @@ class BetEngine:
         logger.info("REAL SELL: token=%s shares=%.4f", token_id[:16], size_shares)
         return self._client.place_market_sell(token_id, size_shares)
 
+    def _close_bet(
+        self,
+        copied_bet: CopiedBet,
+        current_price: float,
+        session: MonitoringSession,
+        db: DBSession,
+        close_reason: str = "",
+    ) -> float:
+        """
+        Close a position via the appropriate path for its mode.
+        - SIMULATION / HEDGE_SIM: calls simulate_sell (virtual balance update).
+        - REAL: executes a live CLOB sell, then updates records with actual fill.
+        Returns pnl_usdc (0.0 on REAL sell failure — position is NOT marked closed).
+        """
+        if copied_bet.mode in ("SIMULATION", "HEDGE_SIM"):
+            return self.simulate_sell(copied_bet, current_price, session, db, close_reason)
+
+        # REAL mode — execute on-chain sell via CLOB
+        fill_price = current_price
+        try:
+            order_resp = self.place_real_sell(copied_bet.token_id, copied_bet.size_shares)
+            raw = (
+                order_resp.get("price")
+                or order_resp.get("avgPrice")
+                or order_resp.get("average_price")
+            )
+            if raw:
+                fill_price = float(raw)
+        except Exception as exc:
+            logger.error(
+                "Real sell failed for bet %d: %s — position NOT closed, will retry",
+                copied_bet.id, exc,
+            )
+            return 0.0
+
+        proceeds = copied_bet.size_shares * fill_price
+        pnl = proceeds - copied_bet.size_usdc
+
+        session.current_balance_usdc = max(0.0, session.current_balance_usdc + proceeds)
+        session.total_pnl_usdc = round((session.total_pnl_usdc or 0.0) + pnl, 2)
+
+        if pnl > 0.01:
+            copied_bet.status = "CLOSED_WIN"
+            session.total_wins += 1
+        elif pnl < -0.01:
+            copied_bet.status = "CLOSED_LOSS"
+            session.total_losses += 1
+        else:
+            copied_bet.status = "CLOSED_NEUTRAL"
+
+        copied_bet.pnl_usdc = round(pnl, 2)
+        copied_bet.resolution_price = fill_price
+        copied_bet.closed_at = datetime.utcnow()
+        if close_reason:
+            copied_bet.close_reason = close_reason
+
+        db.add(copied_bet)
+        db.add(session)
+
+        logger.info(
+            "REAL SELL (resolution): bet %d %.4f shares @ %.4f = $%.2f pnl=$%.2f | balance -> $%.2f",
+            copied_bet.id, copied_bet.size_shares, fill_price, proceeds, pnl,
+            session.current_balance_usdc,
+        )
+        return round(pnl, 2)
+
     # ------------------------------------------------------------------
     # Resolution checker
     # ------------------------------------------------------------------
@@ -619,7 +700,7 @@ class BetEngine:
                             "Force-close: bet %d market ended %.1fh ago, price=%.4f (YES resolved)",
                             bet.id, hours_since_close, price,
                         )
-                        self.simulate_sell(
+                        self._close_bet(
                             copied_bet=bet, current_price=price, session=session, db=db,
                             close_reason="Market ended",
                         )
@@ -636,7 +717,7 @@ class BetEngine:
                                 "Force-close: bet %d market ended %.1fh ago, price=%.4f (NO resolved, oracle confirmed)",
                                 bet.id, hours_since_close, price,
                             )
-                            self.simulate_sell(
+                            self._close_bet(
                                 copied_bet=bet, current_price=price, session=session, db=db,
                                 close_reason="Market ended",
                             )
@@ -660,7 +741,7 @@ class BetEngine:
                             "with %.2fh remaining",
                             bet.id, price, hours_remaining,
                         )
-                        self.simulate_sell(
+                        self._close_bet(
                             copied_bet=bet, current_price=price, session=session, db=db,
                             close_reason=f"Near-expiry exit ({hours_remaining:.1f}h left, price {price:.3f})",
                         )
@@ -681,7 +762,7 @@ class BetEngine:
                 # deadline rather than the game end time, so market_ended is False
                 # even for long-finished matches — we close them here instead.
                 if (not is_live_sport or is_resolved) and (price >= 0.95 or price <= 0.05):
-                    self.simulate_sell(
+                    self._close_bet(
                         copied_bet=bet, current_price=price, session=session, db=db,
                         close_reason=f"Price reached resolution threshold ({price:.3f})",
                     )
@@ -1082,8 +1163,16 @@ class BetEngine:
                 )
                 continue
 
-            # 5. Price is back in range — execute placement
+            # 5. Price is back in range — check minimum before executing
             mode = session.mode
+            if mode == "REAL" and item.bet_size_usdc < settings.MIN_BET_USDC:
+                logger.info(
+                    "Drift watchlist: whale_bet=%d skipped — size $%.2f below $1 minimum",
+                    whale_bet_id, item.bet_size_usdc,
+                )
+                del self._drift_watchlist[whale_bet_id]
+                continue
+
             try:
                 if mode in ("SIMULATION", "HEDGE_SIM"):
                     size_shares, actual_price = self.simulate_buy(
@@ -1109,6 +1198,9 @@ class BetEngine:
                         or order_resp.get("average_price")
                     )
                     actual_price = float(fill_price) if fill_price else (live_price or item.whale_price)
+                    # Deduct from session balance (simulate_buy handles this for SIM)
+                    session.current_balance_usdc = max(0.0, session.current_balance_usdc - item.bet_size_usdc)
+                    db.add(session)
             except Exception as exc:
                 logger.error("Drift watchlist: placement failed for whale_bet=%d: %s", whale_bet_id, exc)
                 del self._drift_watchlist[whale_bet_id]
