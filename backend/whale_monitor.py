@@ -167,6 +167,16 @@ class WhaleMonitor:
             replace_existing=True,
         )
 
+        # Hourly wallet balance sync — keeps session.current_balance_usdc aligned
+        # with the live wallet so bet sizing stays accurate over long sessions.
+        if settings.credentials_valid():
+            self._scheduler.add_job(
+                func=self._sync_real_balance,
+                trigger=IntervalTrigger(hours=1),
+                id="sync_real_balance",
+                replace_existing=True,
+            )
+
         if not self._scheduler.running:
             self._scheduler.start()
 
@@ -181,7 +191,7 @@ class WhaleMonitor:
 
         logger.info("Stopping whale monitor")
 
-        for job_id in ("poll_whales", "refresh_risk_profiles", "drift_retry"):
+        for job_id in ("poll_whales", "refresh_risk_profiles", "drift_retry", "sync_real_balance"):
             try:
                 self._scheduler.remove_job(job_id)
             except Exception:
@@ -212,14 +222,11 @@ class WhaleMonitor:
         if not self._bet_engine._drift_watchlist:
             return
         db = SessionLocal()
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self._bet_engine.retry_drift_watchlist(db))
+            asyncio.run(self._bet_engine.retry_drift_watchlist(db))
         except Exception as exc:
             logger.error("_run_drift_retry error: %s", exc)
         finally:
-            loop.close()
             db.close()
 
     def poll_whales(self):
@@ -249,13 +256,7 @@ class WhaleMonitor:
 
         logger.debug("Polling %d active whales", len(addresses))
 
-        # Fix #1: one event loop for the entire poll cycle
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._poll_all_async(addresses))
-        finally:
-            loop.close()
+        asyncio.run(self._poll_all_async(addresses))
 
     async def _poll_all_async(self, addresses: list):
         """
@@ -416,12 +417,7 @@ class WhaleMonitor:
         if not addresses:
             return
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._poll_exits_async(addresses))
-        finally:
-            loop.close()
+        asyncio.run(self._poll_exits_async(addresses))
 
     async def _poll_exits_async(self, addresses: list):
         """Fetch recent activity for all whales in parallel, then handle exits."""
@@ -493,28 +489,29 @@ class WhaleMonitor:
                         or ""
                     )
 
-                    # Only act if we hold an open position in this market that was
-                    # opened by following THIS whale — do not close positions we
-                    # copied from a different whale just because this whale exited
-                    # the same market.
-                    open_pos = None
+                    # Find ALL open positions for this token from this whale — each
+                    # whale BUY creates its own CopiedBet, so an EXIT should close
+                    # every tranche we hold simultaneously.
+                    open_positions = []
                     if token_id:
-                        open_pos = (
+                        open_positions = (
                             db.query(CopiedBet)
                             .filter_by(status="OPEN", token_id=token_id,
                                        whale_address=address)
-                            .first()
+                            .order_by(CopiedBet.opened_at.asc())
+                            .all()
                         )
-                    if not open_pos and market_id:
-                        open_pos = (
+                    if not open_positions and market_id:
+                        open_positions = (
                             db.query(CopiedBet)
                             .filter_by(status="OPEN", market_id=market_id,
                                        whale_address=address)
-                            .first()
+                            .order_by(CopiedBet.opened_at.asc())
+                            .all()
                         )
 
-                    if not open_pos:
-                        # No position — still update last_seen so we don't re-check
+                    if not open_positions:
+                        # No positions — still update last_seen so we don't re-check
                         if new_last_seen is None or ts > new_last_seen:
                             new_last_seen = ts
                         continue
@@ -528,6 +525,7 @@ class WhaleMonitor:
                         continue
 
                     # Find the most recent session matching this position's mode
+                    open_pos = open_positions[0]
                     session = (
                         db.query(MonitoringSession)
                         .filter_by(mode=open_pos.mode)
@@ -547,33 +545,19 @@ class WhaleMonitor:
                         exit_price = open_pos.price_at_entry
 
                     logger.info(
-                        "Background exit: whale %s exited %s @ %.4f — closing bet %d",
-                        address[:10], (market_id or token_id)[:16], exit_price, open_pos.id,
+                        "Background exit: whale %s exited %s @ %.4f — closing %d position(s)",
+                        address[:10], (market_id or token_id)[:16], exit_price, len(open_positions),
                     )
 
                     whale_alias = whale.alias or address[:10]
                     exit_reason = f"Whale exited ({whale_alias} sold @ {exit_price:.3f})"
 
-                    if open_pos.mode in ("SIMULATION", "HEDGE_SIM"):
-                        self._bet_engine.simulate_sell(
-                            copied_bet=open_pos,
-                            current_price=exit_price,
-                            session=session,
-                            db=db,
-                            close_reason=exit_reason,
-                        )
-                    else:
-                        try:
-                            self._bet_engine.place_real_sell(open_pos.token_id, open_pos.size_shares)
-                            open_pos.status = "CLOSED_NEUTRAL"
-                            open_pos.resolution_price = exit_price
-                            open_pos.closed_at = datetime.utcnow()
-                            open_pos.close_reason = exit_reason
-                            db.add(open_pos)
-                        except Exception as exc:
-                            logger.error(
-                                "Background real sell failed for bet %d: %s", open_pos.id, exc
-                            )
+                    # Close every open tranche for this token atomically
+                    # (single CLOB sell for the combined balance so the first
+                    # sell cannot consume tokens belonging to subsequent tranches)
+                    self._bet_engine._close_all_tranches(
+                        open_positions, exit_price, session, db, exit_reason
+                    )
 
                     db.commit()
 
@@ -640,11 +624,13 @@ class WhaleMonitor:
             trade.get("shares")
             or trade.get("size")
             or trade.get("contractsFilled")
-            or 0.0
         )
         try:
-            size_shares = float(size_shares_raw)
+            size_shares = float(size_shares_raw) if size_shares_raw is not None else 0.0
         except (TypeError, ValueError):
+            size_shares = 0.0
+        # Fall back to deriving from USDC cost when the API omits shares or returns 0
+        if size_shares <= 0:
             size_shares = size_usdc / max(price, 0.001)
 
         # Market identifiers
@@ -732,6 +718,49 @@ class WhaleMonitor:
             db.close()
 
     # ------------------------------------------------------------------
+    # Wallet balance sync (REAL mode)
+    # ------------------------------------------------------------------
+
+    def _sync_real_balance(self):
+        """
+        Re-fetch the live wallet balance from Polymarket and update any active
+        REAL session's current_balance_usdc.  Runs hourly so bet sizing stays
+        accurate even if small discrepancies accumulate (e.g. partial fills,
+        gas costs, manual trades outside the copier).
+        """
+        try:
+            balance = asyncio.run(self._client.get_wallet_balance())
+        except Exception as exc:
+            logger.error("_sync_real_balance: wallet fetch error: %s", exc)
+            return
+
+        if balance is None:
+            logger.debug("_sync_real_balance: no balance returned — skipping")
+            return
+
+        db = SessionLocal()
+        try:
+            session = (
+                db.query(MonitoringSession)
+                .filter_by(mode="REAL", is_active=True)
+                .order_by(MonitoringSession.id.desc())
+                .first()
+            )
+            if session:
+                old = session.current_balance_usdc
+                session.current_balance_usdc = balance
+                db.commit()
+                logger.info(
+                    "Balance sync: REAL session balance $%.2f → $%.2f (live wallet)",
+                    old, balance,
+                )
+        except Exception as exc:
+            logger.error("_sync_real_balance: DB error: %s", exc)
+            db.rollback()
+        finally:
+            db.close()
+
+    # ------------------------------------------------------------------
     # Resolution wrapper (sync -> runs in scheduler thread)
     # ------------------------------------------------------------------
 
@@ -744,10 +773,8 @@ class WhaleMonitor:
     def _auto_redemption_job(self):
         """Periodically redeem resolved positions on-chain. Runs in permanent scheduler."""
         from backend.redemption import check_and_redeem
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         try:
-            result = loop.run_until_complete(check_and_redeem())
+            result = asyncio.run(check_and_redeem())
             redeemed = result.get("redeemed", 0)
             if redeemed > 0:
                 total = result.get("total_value", 0.0)
@@ -756,8 +783,6 @@ class WhaleMonitor:
                 )
         except Exception as exc:
             logger.error("Auto-redemption job error: %s", exc)
-        finally:
-            loop.close()
 
     # ------------------------------------------------------------------
     # Utilities

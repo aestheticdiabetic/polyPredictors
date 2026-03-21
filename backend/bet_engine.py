@@ -7,6 +7,7 @@ position closing, and resolution checking.
 import asyncio
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -56,6 +57,9 @@ class BetEngine:
         # whale_bet_id → _WatchItem: near-expiry bets that were drift-skipped,
         # retried every DRIFT_RETRY_INTERVAL_SECONDS with a fresh price.
         self._drift_watchlist: dict[int, _WatchItem] = {}
+        # Guards _drift_watchlist against concurrent access from poll_whales
+        # and drift_retry scheduler jobs running in different threads.
+        self._drift_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -88,23 +92,11 @@ class BetEngine:
             return self._handle_exit(whale_bet, session, db)
 
         # ---- CASE 2: Whale is opening / adding to a position ----------
-        # Scope to THIS whale's position so that a different whale entering the
-        # same market doesn't incorrectly trigger "add to position" logic.
-        # Each whale's positions are tracked independently — EXIT signals are
-        # also scoped by whale address so one whale's exit can never close
-        # a position that was opened by following a different whale.
+        # Each whale BUY is treated as an independent position — even if we already
+        # hold an open position in this token, we open a new CopiedBet so that every
+        # entry tranche is tracked separately and can be exited at the correct time.
+        # EXIT signals close ALL open positions for the token (see _handle_exit).
         whale_address = whale.address if whale else None
-        existing_open = self._find_open_position(
-            market_id=whale_bet.market_id,
-            token_id=whale_bet.token_id,
-            session_mode=session.mode,
-            db=db,
-            whale_address=whale_address,
-        )
-
-        if existing_open is not None:
-            # Same whale is adding to a position we already hold -> signal only
-            return self._handle_add_to_position(whale_bet, existing_open, session, db)
 
         # ---- HEDGE GUARD (HEDGE_SIM only): same whale, same market, opposite outcome ---
         if session.mode == "HEDGE_SIM" and whale_address:
@@ -317,9 +309,28 @@ class BetEngine:
                     size_usdc=bet_size_usdc,
                     price=whale_bet.price,
                 )
-                # Extract actual fill size from order response
-                shares_filled = order_resp.get("size_matched", bet_size_usdc / max(whale_bet.price, 0.01))
-                size_shares = float(shares_filled)
+                # Detect FOK/unmatched cancellations — no tokens were actually received
+                order_status_raw = str(order_resp.get("status", "")).upper()
+                if order_status_raw in ("UNMATCHED", "CANCELLED", "CANCELED"):
+                    size_shares = 0.0
+                    logger.warning(
+                        "REAL BUY status=%s for token %s — order not filled, recording size_shares=0",
+                        order_status_raw, whale_bet.token_id[:16],
+                    )
+                else:
+                    # Extract actual fill size from order response.
+                    # When size_matched is absent, estimate from cost/price but floor
+                    # to 2dp — the CLOB uses round_down (floor) when filling buys, so
+                    # our estimate must match or be under, never over.
+                    # e.g. $1.45 / 0.590 = 2.4576 → floor → 2.45 (not round → 2.46)
+                    import math as _math
+                    raw_matched = order_resp.get("size_matched")
+                    if raw_matched is not None:
+                        size_shares = float(raw_matched)
+                    else:
+                        size_shares = _math.floor(
+                            bet_size_usdc / max(whale_bet.price, 0.01) * 100
+                        ) / 100
                 # Use actual fill price if the exchange reports it (avoids slippage mismatch)
                 fill_price = (
                     order_resp.get("price")
@@ -529,23 +540,108 @@ class BetEngine:
         if copied_bet.mode in ("SIMULATION", "HEDGE_SIM"):
             return self.simulate_sell(copied_bet, current_price, session, db, close_reason)
 
-        # REAL mode — execute on-chain sell via CLOB
+        # REAL mode — resolved markets (price ≥ 0.98 or ≤ 0.02) have no CLOB
+        # order book; attempting a sell returns "not enough balance/allowance".
+        # Close the DB record at the oracle price and let auto-redemption recover
+        # the USDC on-chain (runs every REDEMPTION_CHECK_INTERVAL_SECONDS).
+        # NOTE: keep this threshold tight (0.98/0.02) — a whale can legitimately
+        # exit an open market at 0.95-0.97, and we must still place the CLOB sell.
         fill_price = current_price
-        try:
-            order_resp = self.place_real_sell(copied_bet.token_id, copied_bet.size_shares)
-            raw = (
-                order_resp.get("price")
-                or order_resp.get("avgPrice")
-                or order_resp.get("average_price")
+        if current_price >= 0.98 or current_price <= 0.02:
+            logger.info(
+                "REAL close bet %d at oracle price %.4f (resolved — skipping CLOB sell, redemption will settle)",
+                copied_bet.id, current_price,
             )
-            if raw:
-                fill_price = float(raw)
-        except Exception as exc:
-            logger.error(
-                "Real sell failed for bet %d: %s — position NOT closed, will retry",
-                copied_bet.id, exc,
-            )
-            return 0.0
+        else:
+            # Short-circuit: if size_shares==0 the buy was never filled — skip the API call
+            if copied_bet.size_shares == 0.0:
+                logger.warning(
+                    "Real sell bet %d: size_shares=0 — buy was never filled, closing as neutral (full refund)",
+                    copied_bet.id,
+                )
+                session.current_balance_usdc += copied_bet.size_usdc
+                session.total_pnl_usdc = round((session.total_pnl_usdc or 0.0), 2)
+                copied_bet.status = "CLOSED_NEUTRAL"
+                copied_bet.pnl_usdc = 0.0
+                copied_bet.resolution_price = copied_bet.price_at_entry
+                copied_bet.closed_at = datetime.utcnow()
+                if close_reason:
+                    copied_bet.close_reason = close_reason
+                db.add(copied_bet)
+                db.add(session)
+                logger.info(
+                    "REAL unfilled-buy neutral close: bet %d refunded $%.2f | balance -> $%.2f",
+                    copied_bet.id, copied_bet.size_usdc, session.current_balance_usdc,
+                )
+                return 0.0
+            try:
+                order_resp = self.place_real_sell(copied_bet.token_id, copied_bet.size_shares)
+                if order_resp.get("status") == "no_position":
+                    # CLOB says "not enough balance/allowance" — could be a size_shares
+                    # mismatch (our DB estimate is slightly off from actual fill due to
+                    # fee deduction, tick-size rounding, or partial fill).
+                    # Query the Data API for the real on-chain balance and retry before
+                    # giving up.  Only close neutral if the position is genuinely absent.
+                    actual_shares = self._get_actual_position_size(copied_bet.token_id)
+                    if actual_shares and actual_shares > 0:
+                        logger.warning(
+                            "Real sell bet %d: CLOB rejected size_shares=%.4f but Data API "
+                            "shows %.4f shares on-chain — retrying sell with actual balance",
+                            copied_bet.id, copied_bet.size_shares, actual_shares,
+                        )
+                        try:
+                            retry_resp = self.place_real_sell(copied_bet.token_id, actual_shares)
+                            if retry_resp.get("status") != "no_position":
+                                # Success — use actual shares for correct P&L
+                                copied_bet.size_shares = actual_shares
+                                raw = (
+                                    retry_resp.get("price")
+                                    or retry_resp.get("avgPrice")
+                                    or retry_resp.get("average_price")
+                                )
+                                if raw:
+                                    fill_price = float(raw)
+                                logger.info(
+                                    "Real sell bet %d: retry with %.4f shares succeeded",
+                                    copied_bet.id, actual_shares,
+                                )
+                            else:
+                                # Still no position after retry — genuine absence
+                                logger.warning(
+                                    "Real sell bet %d: retry also returned no_position — "
+                                    "closing neutral (tokens may have already been redeemed)",
+                                    copied_bet.id,
+                                )
+                                fill_price = copied_bet.price_at_entry
+                        except Exception as retry_exc:
+                            logger.error(
+                                "Real sell bet %d retry error: %s — position NOT closed",
+                                copied_bet.id, retry_exc,
+                            )
+                            return 0.0
+                    else:
+                        # Data API also shows no position (0 or absent) — genuinely absent.
+                        # Could be: FOK-cancelled buy, concurrent close, or already redeemed.
+                        logger.warning(
+                            "Real sell bet %d: no on-chain position confirmed by Data API "
+                            "(size_shares=%.4f) — closing as neutral",
+                            copied_bet.id, copied_bet.size_shares,
+                        )
+                        fill_price = copied_bet.price_at_entry  # proceeds ≈ size_usdc → pnl ≈ 0
+                else:
+                    raw = (
+                        order_resp.get("price")
+                        or order_resp.get("avgPrice")
+                        or order_resp.get("average_price")
+                    )
+                    if raw:
+                        fill_price = float(raw)
+            except Exception as exc:
+                logger.error(
+                    "Real sell failed for bet %d: %s — position NOT closed, will retry",
+                    copied_bet.id, exc,
+                )
+                return 0.0
 
         proceeds = copied_bet.size_shares * fill_price
         pnl = proceeds - copied_bet.size_usdc
@@ -579,8 +675,258 @@ class BetEngine:
         return round(pnl, 2)
 
     # ------------------------------------------------------------------
+    # Multi-tranche close (single CLOB sell for combined balance)
+    # ------------------------------------------------------------------
+
+    def _close_all_tranches(
+        self,
+        open_positions: list,
+        exit_price: float,
+        session: MonitoringSession,
+        db: DBSession,
+        exit_reason: str = "",
+    ) -> None:
+        """Close multiple open positions for the same token atomically.
+
+        SIMULATION/HEDGE_SIM: each position is closed independently (virtual).
+        REAL, single position: delegates to _close_bet (normal path).
+        REAL, multiple positions: places ONE CLOB sell for the combined balance
+        so that the first sell cannot consume tokens belonging to a later tranche,
+        which would cause the second sell to return no_position → NEUTRAL.
+        """
+        if not open_positions:
+            return
+
+        mode = open_positions[0].mode
+
+        if mode in ("SIMULATION", "HEDGE_SIM"):
+            for pos in open_positions:
+                self.simulate_sell(pos, exit_price, session, db, exit_reason)
+            return
+
+        if len(open_positions) == 1:
+            self._close_bet(open_positions[0], exit_price, session, db, exit_reason)
+            return
+
+        # --- REAL mode: multiple tranches, single sell ---
+        import math as _math
+        token_id = open_positions[0].token_id
+
+        logger.info(
+            "_close_all_tranches: REAL closing %d tranches for %s @ %.4f",
+            len(open_positions), token_id[:16], exit_price,
+        )
+        for pos in open_positions:
+            logger.info(
+                "  tranche bet %d: entry=%.4f size_usdc=%.2f size_shares=%.4f",
+                pos.id, pos.price_at_entry, pos.size_usdc, pos.size_shares,
+            )
+
+        # Separate unfilled buys (size_shares==0) — close as NEUTRAL with refund
+        filled, unfilled = [], []
+        for pos in open_positions:
+            (unfilled if pos.size_shares == 0 else filled).append(pos)
+
+        for pos in unfilled:
+            session.current_balance_usdc += pos.size_usdc
+            pos.status = "CLOSED_NEUTRAL"
+            pos.pnl_usdc = 0.0
+            pos.resolution_price = pos.price_at_entry
+            pos.closed_at = datetime.utcnow()
+            if exit_reason:
+                pos.close_reason = exit_reason
+            db.add(pos)
+            logger.warning(
+                "_close_all_tranches: bet %d refunded $%.2f (buy was never filled)",
+                pos.id, pos.size_usdc,
+            )
+        db.add(session)
+
+        if not filled:
+            return
+
+        # For resolved markets: no CLOB sell — let redemption handle USDC
+        fill_price = exit_price
+        db_total_shares = sum(p.size_shares for p in filled)
+        sell_shares = db_total_shares  # default
+
+        actual = None  # on-chain balance; used later to compute fill-scale
+        if exit_price < 0.98 and exit_price > 0.02:
+            # Query actual on-chain balance BEFORE attempting the sell.
+            # This avoids selling more than one tranche's worth on a retry.
+            actual = self._get_actual_position_size(token_id)
+            logger.info(
+                "_close_all_tranches: Data API actual balance = %s (DB total = %.4f)",
+                f"{actual:.4f}" if actual is not None else "ERROR", db_total_shares,
+            )
+
+            if actual is None:
+                # API error — fall back to DB total (floored)
+                sell_shares = _math.floor(db_total_shares * 100) / 100
+                logger.warning(
+                    "_close_all_tranches: Data API error — using DB total %.4f (floored: %.4f)",
+                    db_total_shares, sell_shares,
+                )
+            elif actual == 0.0:
+                # Confirmed no position on chain — close all as NEUTRAL
+                logger.warning(
+                    "_close_all_tranches: Data API confirms 0 shares for %s — closing all as neutral",
+                    token_id[:16],
+                )
+                for pos in filled:
+                    pos.status = "CLOSED_NEUTRAL"
+                    pos.pnl_usdc = 0.0
+                    pos.resolution_price = pos.price_at_entry
+                    pos.closed_at = datetime.utcnow()
+                    if exit_reason:
+                        pos.close_reason = exit_reason
+                    db.add(pos)
+                db.add(session)
+                return
+            else:
+                sell_shares = _math.floor(actual * 100) / 100
+
+            # Single CLOB sell for total balance
+            try:
+                order_resp = self.place_real_sell(token_id, sell_shares)
+                if order_resp.get("status") == "no_position":
+                    logger.error(
+                        "_close_all_tranches: CLOB no_position selling %.4f shares of %s "
+                        "(Data API showed %.4f) — positions NOT closed, will retry",
+                        sell_shares, token_id[:16],
+                        actual if actual is not None else db_total_shares,
+                    )
+                    return  # leave positions OPEN for next exit poll
+                raw = (
+                    order_resp.get("price")
+                    or order_resp.get("avgPrice")
+                    or order_resp.get("average_price")
+                )
+                if raw:
+                    fill_price = float(raw)
+            except Exception as exc:
+                logger.error(
+                    "_close_all_tranches: sell failed for %s: %s — positions NOT closed",
+                    token_id[:16], exc,
+                )
+                return
+        else:
+            logger.info(
+                "_close_all_tranches: resolved price %.4f — skipping CLOB sell, redemption will settle",
+                exit_price,
+            )
+
+        # Distribute proceeds proportionally by invested USDC.
+        #
+        # When actual on-chain balance < DB total (e.g. one buy was partially/never
+        # filled but still recorded with size_shares > 0), we must NOT use the full
+        # size_usdc as each position's cost basis — that overstates the cost and turns
+        # profitable exits into apparent losses.
+        #
+        # Fix: compute fill_scale = actual / db_total.  Each position's effective cost
+        # is size_usdc * fill_scale; the remainder (size_usdc * (1-fill_scale)) is an
+        # unfilled-buy refund returned to the session balance.  This ensures a position
+        # entered at 0.870 and exited at 0.880 never shows a loss.
+        total_invested = sum(p.size_usdc for p in filled)
+        total_proceeds = sell_shares * fill_price
+
+        # fill_scale: fraction of DB-recorded shares that actually existed on-chain.
+        # 1.0 when actual is unknown (API error) or for resolved-price path.
+        if actual is not None and db_total_shares > 0:
+            fill_scale = min(actual / db_total_shares, 1.0)
+        else:
+            fill_scale = 1.0
+
+        if fill_scale < 0.99:
+            logger.warning(
+                "_close_all_tranches: fill_scale=%.3f (actual=%.4f DB=%.4f) — "
+                "unfilled portions will be refunded",
+                fill_scale,
+                actual if actual is not None else 0.0,
+                db_total_shares,
+            )
+
+        for pos in filled:
+            weight = (pos.size_usdc / total_invested) if total_invested > 0 else (1.0 / len(filled))
+            pos_proceeds = total_proceeds * weight          # from the CLOB sell
+            refund = pos.size_usdc * (1.0 - fill_scale)    # unfilled portion back to balance
+            effective_cost = pos.size_usdc * fill_scale     # what we actually paid for real tokens
+            pos_pnl = round(pos_proceeds - effective_cost, 2)
+
+            session.current_balance_usdc = max(0.0, session.current_balance_usdc + pos_proceeds + refund)
+            session.total_pnl_usdc = round((session.total_pnl_usdc or 0.0) + pos_pnl, 2)
+
+            if pos_pnl > 0.01:
+                pos.status = "CLOSED_WIN"
+                session.total_wins += 1
+            elif pos_pnl < -0.01:
+                pos.status = "CLOSED_LOSS"
+                session.total_losses += 1
+            else:
+                pos.status = "CLOSED_NEUTRAL"
+
+            pos.pnl_usdc = pos_pnl
+            pos.resolution_price = fill_price
+            pos.closed_at = datetime.utcnow()
+            if exit_reason:
+                pos.close_reason = exit_reason
+            db.add(pos)
+            db.add(session)
+
+            logger.info(
+                "_close_all_tranches: bet %d → %s pnl=$%.2f (%.0f%% weight, scale=%.3f, refund=$%.2f) | balance -> $%.2f",
+                pos.id, pos.status, pos_pnl, weight * 100, fill_scale, refund, session.current_balance_usdc,
+            )
+
+    # ------------------------------------------------------------------
     # Resolution checker
     # ------------------------------------------------------------------
+
+    def _resolve_archived_bet_price(self, bet: "CopiedBet") -> float:
+        """
+        Determine a fallback close price for a bet whose market has been
+        archived (Gamma API returns no data for its token).
+
+        REAL mode: query the on-chain CTF balance.
+          - balance > 0  → winning token still held → 1.0 (redemption will settle)
+          - balance = 0  → lost or already redeemed → entry price (neutral P&L)
+        SIM / HEDGE_SIM: outcome is unknowable; close at entry price (0 P&L).
+        """
+        if bet.mode == "REAL" and self._client is not None:
+            try:
+                # Use Data API /positions — get_balance_allowance(CONDITIONAL)
+                # always returns 0 for proxy wallets so is unreliable here.
+                import requests as _requests
+                resp = _requests.get(
+                    f"{settings.DATA_API_BASE}/positions",
+                    params={"user": settings.POLY_FUNDER_ADDRESS},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                positions = data if isinstance(data, list) else data.get("data", data.get("positions", []))
+                pos = next((p for p in positions if str(p.get("asset", "")) == bet.token_id), None)
+                if pos is not None:
+                    size = float(pos.get("size", 0))
+                    if size > 0:
+                        logger.info(
+                            "Archive resolve: bet %d token %s Data API size=%.4f "
+                            "→ closing at 1.0 (redemption will settle)",
+                            bet.id, bet.token_id[:16], size,
+                        )
+                        return 1.0
+                logger.info(
+                    "Archive resolve: bet %d token %s Data API size=0 or not found "
+                    "→ closing at entry price %.4f (lost or already redeemed)",
+                    bet.id, bet.token_id[:16], bet.price_at_entry,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Archive resolve: Data API position check failed for bet %d: %s "
+                    "— using entry price",
+                    bet.id, exc,
+                )
+        return bet.price_at_entry
 
     def check_resolution(self):
         """
@@ -605,14 +951,9 @@ class BetEngine:
                 return
 
             # Fetch price + endDate for all open bets in parallel
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                resolution_data = loop.run_until_complete(
-                    self._fetch_resolution_data([b.token_id for b in open_bets])
-                )
-            finally:
-                loop.close()
+            resolution_data = asyncio.run(
+                self._fetch_resolution_data([b.token_id for b in open_bets])
+            )
 
             # Cache sessions by mode so we only query once per mode
             session_cache: dict[str, Optional[MonitoringSession]] = {}
@@ -635,6 +976,40 @@ class BetEngine:
 
             for bet, (price, end_dt, is_resolved) in zip(open_bets, resolution_data):
                 if price is None:
+                    # Archive-timeout fallback: Polymarket removes resolved markets
+                    # from the Gamma API index within a few hours of settlement.
+                    # If Gamma has no data AND the market closed >2h ago, the market
+                    # is archived and will never return price data.  Force-close to
+                    # avoid positions being stuck OPEN indefinitely.
+                    if bet.market_close_at is not None:
+                        mc = (
+                            bet.market_close_at.replace(tzinfo=timezone.utc)
+                            if bet.market_close_at.tzinfo is None
+                            else bet.market_close_at
+                        )
+                        hours_since_close = (now - mc).total_seconds() / 3600
+                        ARCHIVE_TIMEOUT_H = 2.0
+                        if hours_since_close > ARCHIVE_TIMEOUT_H:
+                            if bet.mode not in session_cache:
+                                session_cache[bet.mode] = (
+                                    db.query(MonitoringSession)
+                                    .filter_by(mode=bet.mode)
+                                    .order_by(MonitoringSession.id.desc())
+                                    .first()
+                                )
+                            session_for_archive = session_cache.get(bet.mode)
+                            if session_for_archive:
+                                fallback_price = self._resolve_archived_bet_price(bet)
+                                logger.warning(
+                                    "Archive timeout: bet %d no Gamma data %.1fh after "
+                                    "market close — force-closing at %.4f",
+                                    bet.id, hours_since_close, fallback_price,
+                                )
+                                self._close_bet(
+                                    copied_bet=bet, current_price=fallback_price,
+                                    session=session_for_archive, db=db,
+                                    close_reason=f"Archive timeout ({hours_since_close:.1f}h since close)",
+                                )
                     continue
 
                 # Must be computed before any case that references it
@@ -741,11 +1116,54 @@ class BetEngine:
                                 close_reason="Market ended",
                             )
                     else:
-                        logger.debug(
-                            "Market ended %.1fh ago but not yet oracle-resolved "
-                            "(price=%.4f, resolved=%s) — waiting for on-chain settlement (bet %d)",
-                            hours_since_close, price, is_resolved, bet.id,
-                        )
+                        # Oracle timeout: if the oracle takes too long to formally
+                        # resolve, close anyway based on the current price signal.
+                        #   price <= 0.05 (loss) after ORACLE_TIMEOUT_H → accept as loss
+                        #   mid-range price after ORACLE_STALE_H  → close at current price
+                        # Live sports get longer windows because UMA settlement can
+                        # take 12–24h after game end.
+                        ORACLE_TIMEOUT_H = 8.0 if is_live_sport else 4.0
+                        ORACLE_STALE_H = 24.0 if is_live_sport else 8.0
+                        if price <= 0.05 and hours_since_close > ORACLE_TIMEOUT_H:
+                            logger.info(
+                                "Oracle timeout: bet %d price=%.4f ≤0.05 for %.1fh after "
+                                "market close — force-closing as loss",
+                                bet.id, price, hours_since_close,
+                            )
+                            self._close_bet(
+                                copied_bet=bet, current_price=price, session=session, db=db,
+                                close_reason=f"Oracle timeout ({hours_since_close:.1f}h since close)",
+                            )
+                        elif 0.05 < price < 0.95 and hours_since_close > ORACLE_STALE_H:
+                            logger.warning(
+                                "Oracle stale: bet %d price=%.4f mid-range for %.1fh after "
+                                "market close — force-closing at current price",
+                                bet.id, price, hours_since_close,
+                            )
+                            self._close_bet(
+                                copied_bet=bet, current_price=price, session=session, db=db,
+                                close_reason=f"Oracle stale ({hours_since_close:.1f}h since close)",
+                            )
+                        elif 0.05 < price < 0.95 and bet.mode == "REAL" and not is_live_sport:
+                            # REAL mode non-sport: market ended but oracle hasn't settled yet.
+                            # CLOB order books remain active post-expiry while settlement is pending.
+                            # Attempt to sell now rather than waiting ORACLE_STALE_H hours.
+                            # _close_bet is safe here — if CLOB rejects it raises and bet stays OPEN.
+                            logger.info(
+                                "REAL market-ended: bet %d price=%.4f mid-range %.1fh after close "
+                                "— attempting CLOB sell now (oracle pending)",
+                                bet.id, price, hours_since_close,
+                            )
+                            self._close_bet(
+                                copied_bet=bet, current_price=price, session=session, db=db,
+                                close_reason=f"Market ended, oracle pending ({hours_since_close:.1f}h since close)",
+                            )
+                        else:
+                            logger.debug(
+                                "Market ended %.1fh ago but not yet oracle-resolved "
+                                "(price=%.4f, resolved=%s) — waiting for on-chain settlement (bet %d)",
+                                hours_since_close, price, is_resolved, bet.id,
+                            )
                     continue
 
                 # --- Case 2: Near-expiry window ---
@@ -1001,13 +1419,14 @@ class BetEngine:
         whale_bet: WhaleBet,
         session: MonitoringSession,
         db: DBSession,
-    ) -> CopiedBet:
-        """Whale is selling out of a position - close ours if we have one."""
-        # Use the exiting whale's address to scope the search — prevents a
-        # different whale's EXIT signal from closing a position we opened by
-        # following a different whale in the same market.
+    ) -> Optional[CopiedBet]:
+        """Whale is selling out of a position — close ALL our open positions for that token.
+
+        Each whale BUY creates a separate CopiedBet, so an EXIT from the whale
+        signals we should exit every tranche we hold for this token simultaneously.
+        """
         exiting_whale_address = whale_bet.whale.address if whale_bet.whale else None
-        open_pos = self._find_open_position(
+        open_positions = self._find_all_open_positions(
             market_id=whale_bet.market_id,
             token_id=whale_bet.token_id,
             session_mode=session.mode,
@@ -1015,43 +1434,29 @@ class BetEngine:
             whale_address=exiting_whale_address,
         )
 
-        if open_pos is None:
+        if not open_positions:
             # We never held a position here — this EXIT is orphaned (whale sold a
-            # market we either missed or skipped at entry).  Nothing to close, so
-            # drop silently.  The WhaleBet row already records the event; creating a
-            # SKIPPED CopiedBet here only adds noise to the ledger.
+            # market we either missed or skipped at entry).  Drop silently.
             logger.debug(
-                "_handle_exit: no open position for whale_bet %d (market %s, %s mode) — skipping silently",
+                "_handle_exit: no open positions for whale_bet %d (market %s, %s mode) — skipping silently",
                 whale_bet.id, whale_bet.market_id[:16], session.mode,
             )
             return None
 
-        # Close existing position
         exit_price = whale_bet.price
-        whale_alias = whale_bet.whale.alias if whale_bet.whale else whale_bet.whale_address[:10]
+        whale_alias = (whale_bet.whale.alias or whale_bet.whale.address[:10]) if whale_bet.whale else "?"
         exit_reason = f"Whale exited ({whale_alias} sold @ {exit_price:.3f})"
 
-        if session.mode in ("SIMULATION", "HEDGE_SIM"):
-            self.simulate_sell(
-                copied_bet=open_pos,
-                current_price=exit_price,
-                session=session,
-                db=db,
-                close_reason=exit_reason,
-            )
-        else:
-            try:
-                self.place_real_sell(open_pos.token_id, open_pos.size_shares)
-                open_pos.status = "CLOSED_NEUTRAL"
-                open_pos.pnl_usdc = 0.0
-                open_pos.resolution_price = exit_price
-                open_pos.closed_at = datetime.utcnow()
-                open_pos.close_reason = exit_reason
-            except Exception as exc:
-                logger.error("Real sell failed for copied_bet %d: %s", open_pos.id, exc)
+        logger.info(
+            "_handle_exit: closing %d open position(s) for whale %s token %s @ %.4f",
+            len(open_positions), (exiting_whale_address or "?")[:10],
+            whale_bet.token_id[:16], exit_price,
+        )
+
+        self._close_all_tranches(open_positions, exit_price, session, db, exit_reason)
 
         db.commit()
-        return open_pos
+        return open_positions[0]
 
     def _handle_add_to_position(
         self,
@@ -1133,7 +1538,7 @@ class BetEngine:
     ) -> None:
         """Register a drift-skipped bet for fast-polling retry."""
         expires_at = time.monotonic() + settings.DRIFT_RETRY_WINDOW_SECONDS
-        self._drift_watchlist[whale_bet.id] = _WatchItem(
+        item = _WatchItem(
             copied_bet_id=copied_bet_id,
             whale_bet_id=whale_bet.id,
             session_id=session.id,
@@ -1145,6 +1550,8 @@ class BetEngine:
             whale_avg=whale_avg,
             expires_at=expires_at,
         )
+        with self._drift_lock:
+            self._drift_watchlist[whale_bet.id] = item
         logger.info(
             "Drift watchlist: added whale_bet=%d token=%s…  expires_in=%ds  (watchlist size=%d)",
             whale_bet.id, whale_bet.token_id[:12],
@@ -1158,22 +1565,27 @@ class BetEngine:
         if the price has come back within the drift threshold.  On success the
         existing SKIPPED CopiedBet record is updated to OPEN in-place.
         """
-        if not self._drift_watchlist:
-            return
+        with self._drift_lock:
+            if not self._drift_watchlist:
+                return
+            # Snapshot so async work below doesn't hold the lock
+            items_snapshot = list(self._drift_watchlist.items())
 
         now = time.monotonic()
-        for whale_bet_id, item in list(self._drift_watchlist.items()):
+        for whale_bet_id, item in items_snapshot:
             # 1. Expiry check
             if now > item.expires_at:
                 logger.debug("Drift watchlist: whale_bet=%d expired — removing", whale_bet_id)
-                del self._drift_watchlist[whale_bet_id]
+                with self._drift_lock:
+                    self._drift_watchlist.pop(whale_bet_id, None)
                 continue
 
             # 2. Load and validate session
             session = db.get(MonitoringSession, item.session_id)
-            if not session or not getattr(session, "active", True):
+            if not session or not session.is_active:
                 logger.debug("Drift watchlist: session %d gone — removing whale_bet=%d", item.session_id, whale_bet_id)
-                del self._drift_watchlist[whale_bet_id]
+                with self._drift_lock:
+                    self._drift_watchlist.pop(whale_bet_id, None)
                 continue
 
             # 3. Fetch a live price, bypassing the 30 s cache
@@ -1203,7 +1615,8 @@ class BetEngine:
                     "Drift watchlist: whale_bet=%d skipped — size $%.2f below $1 minimum",
                     whale_bet_id, item.bet_size_usdc,
                 )
-                del self._drift_watchlist[whale_bet_id]
+                with self._drift_lock:
+                    self._drift_watchlist.pop(whale_bet_id, None)
                 continue
 
             try:
@@ -1236,14 +1649,16 @@ class BetEngine:
                     db.add(session)
             except Exception as exc:
                 logger.error("Drift watchlist: placement failed for whale_bet=%d: %s", whale_bet_id, exc)
-                del self._drift_watchlist[whale_bet_id]
+                with self._drift_lock:
+                    self._drift_watchlist.pop(whale_bet_id, None)
                 continue
 
             # 6. Upgrade the existing SKIPPED record to OPEN in-place
             copied_bet = db.get(CopiedBet, item.copied_bet_id)
             if copied_bet is None:
                 logger.warning("Drift watchlist: CopiedBet %d not found — removing", item.copied_bet_id)
-                del self._drift_watchlist[whale_bet_id]
+                with self._drift_lock:
+                    self._drift_watchlist.pop(whale_bet_id, None)
                 continue
 
             copied_bet.status = "OPEN"
@@ -1257,7 +1672,8 @@ class BetEngine:
             db.commit()
             db.refresh(copied_bet)
 
-            del self._drift_watchlist[whale_bet_id]
+            with self._drift_lock:
+                self._drift_watchlist.pop(whale_bet_id, None)
             logger.info(
                 "Drift watchlist: RETRY SUCCESS whale_bet=%d — placed %s @ %.4f for $%.2f  (watchlist size=%d)",
                 whale_bet_id, mode, actual_price, item.bet_size_usdc, len(self._drift_watchlist),
@@ -1353,6 +1769,106 @@ class BetEngine:
         if whale_address is not None:
             q = q.filter(CopiedBet.whale_address == whale_address)
         return q.first()
+
+    def _find_all_open_positions(
+        self,
+        market_id: str,
+        token_id: str,
+        session_mode: str,
+        db: DBSession,
+        whale_address: Optional[str] = None,
+    ) -> list:
+        """Return ALL OPEN CopiedBets for this market/token in entry order (oldest first).
+
+        Used by _handle_exit to close every open tranche simultaneously when the
+        whale exits a position they may have built up across multiple BUY trades.
+        """
+        q = db.query(CopiedBet).filter(
+            CopiedBet.market_id == market_id,
+            CopiedBet.token_id == token_id,
+            CopiedBet.status == "OPEN",
+            CopiedBet.mode == session_mode,
+        ).order_by(CopiedBet.opened_at.asc())
+        if whale_address is not None:
+            q = q.filter(CopiedBet.whale_address == whale_address)
+        return q.all()
+
+    def _get_actual_position_size(self, token_id: str) -> Optional[float]:
+        """
+        Query the Polymarket Data API for our actual on-chain token balance.
+
+        Used as a fallback when place_real_sell returns no_position — the CLOB
+        rejects our sell if size_shares in the DB doesn't exactly match what's
+        on-chain (e.g. due to fee deduction or tick-size rounding on the buy).
+        Returns the actual size if a position is found, 0.0 if absent, or None
+        on API error (caller should treat None as "unknown, don't retry").
+        """
+        import requests as _requests
+        try:
+            resp = _requests.get(
+                f"{settings.DATA_API_BASE}/positions",
+                params={"user": settings.POLY_FUNDER_ADDRESS},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            positions = (
+                data if isinstance(data, list)
+                else data.get("data", data.get("positions", []))
+            )
+            logger.info(
+                "_get_actual_position_size: Data API returned %d position(s) for %s, "
+                "looking for token %s",
+                len(positions), settings.POLY_FUNDER_ADDRESS[:10], token_id[:16],
+            )
+            # Log first few assets to help diagnose format mismatches
+            for p in positions[:5]:
+                logger.debug(
+                    "  Data API position: asset=%s size=%s",
+                    str(p.get("asset", ""))[:20], p.get("size"),
+                )
+
+            # Try exact match first, then strip/normalise for robustness
+            def _matches(asset_val: str) -> bool:
+                a = str(asset_val).strip()
+                t = token_id.strip()
+                if a == t:
+                    return True
+                # Handle leading-zero padding differences between decimal representations
+                try:
+                    return int(a) == int(t)
+                except (ValueError, TypeError):
+                    pass
+                # Handle hex vs decimal
+                try:
+                    a_dec = str(int(a, 16)) if a.startswith("0x") else a
+                    t_dec = str(int(t, 16)) if t.startswith("0x") else t
+                    return a_dec == t_dec
+                except (ValueError, TypeError):
+                    return False
+
+            pos = next(
+                (p for p in positions if _matches(p.get("asset", ""))),
+                None,
+            )
+            if pos is not None:
+                size = float(pos.get("size", 0))
+                logger.info(
+                    "_get_actual_position_size: found %.4f shares for token %s",
+                    size, token_id[:16],
+                )
+                return size
+            logger.info(
+                "_get_actual_position_size: token %s not found in Data API — 0 shares",
+                token_id[:16],
+            )
+            return 0.0
+        except Exception as exc:
+            logger.warning(
+                "_get_actual_position_size error for %s: %s — will not retry sell",
+                token_id[:16], exc,
+            )
+            return None
 
     def _find_opposite_outcome_position(
         self,

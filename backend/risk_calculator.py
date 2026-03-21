@@ -141,6 +141,17 @@ class RiskCalculator:
             or market_info.get("end_date")
         )
         if not end_date_str:
+            # If we have a live price the market is demonstrably still active
+            # (CLOB order books only exist for open markets).  Allow through —
+            # we can't do time-to-close checks but the price staleness guard
+            # downstream will still protect against copying stale odds.
+            if live_price is not None:
+                logger.debug(
+                    "Market has no endDate but live_price=%.4f — allowing through "
+                    "(market is demonstrably active, id=%s)",
+                    live_price, market_info.get("id", "unknown"),
+                )
+                return True, ""
             logger.warning(
                 "Market has no endDate field — skipping to avoid betting on a "
                 "closed market (id=%s)", market_info.get("id", "unknown")

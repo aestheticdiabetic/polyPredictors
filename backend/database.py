@@ -27,7 +27,10 @@ engine = create_engine(
 @event.listens_for(engine, "connect")
 def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
+    # WAL mode requires mmap/-shm files which are unreliable on Docker Windows
+    # bind mounts (NTFS → Linux, incomplete mmap support). DELETE mode is the
+    # classic SQLite journal — slower for concurrent reads but works everywhere.
+    cursor.execute("PRAGMA journal_mode=DELETE")
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 
