@@ -42,6 +42,17 @@ class Settings:
     # 0.20 and the current price is now above 0.25 or below 0.15, skip the bet.
     MAX_PRICE_DRIFT_PCT: float = float(os.getenv("MAX_PRICE_DRIFT_PCT", "0.05"))
 
+    # Minimum USDC to place on any single bet.  Set lower (e.g. 0.02) when following
+    # a whale that places many small tracker bets on long-shot outcomes.
+    MIN_BET_USDC: float = float(os.getenv("MIN_BET_USDC", "1.0"))
+
+    # Drift-skip retry watchlist — for near-expiry markets that were skipped due to
+    # price drift, re-check the price this often (seconds) and for this long (seconds).
+    # Lower DRIFT_RETRY_INTERVAL = more responsive; higher DRIFT_RETRY_WINDOW = more
+    # time for the price to come back within range before giving up.
+    DRIFT_RETRY_INTERVAL_SECONDS: int = int(os.getenv("DRIFT_RETRY_INTERVAL_SECONDS", "5"))
+    DRIFT_RETRY_WINDOW_SECONDS: int = int(os.getenv("DRIFT_RETRY_WINDOW_SECONDS", "120"))
+
     # Minimum USDC trading volume a leaderboard trader must have to appear in the
     # Discover Whales modal.  The Polymarket API does not expose a prediction count,
     # so volume is used as the practical proxy for high-activity traders.

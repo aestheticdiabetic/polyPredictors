@@ -256,19 +256,21 @@ class PolymarketClient:
     # ------------------------------------------------------------------
 
     async def get_market_price(
-        self, token_id: str, side: str = "BUY"
+        self, token_id: str, side: str = "BUY", force_refresh: bool = False
     ) -> Optional[float]:
         """
         Get current best price for a token from the CLOB.
         side: 'BUY' or 'SELL'
         Caches successful prices for 30 s; caches 404 (no order book) for 5 min
         so closed/resolved markets don't get hammered on every trade processed.
+        force_refresh: bypass cache and fetch a live price (used by drift retry loop).
         """
         cache_key = f"price:{token_id}:{side}"
         now = time.monotonic()
-        cached = self._price_cache.get(cache_key)
-        if cached and cached[1] > now:
-            return cached[0]
+        if not force_refresh:
+            cached = self._price_cache.get(cache_key)
+            if cached and cached[1] > now:
+                return cached[0]
 
         url = f"{settings.CLOB_HOST}/price"
         params = {"token_id": token_id, "side": side}
@@ -304,12 +306,13 @@ class PolymarketClient:
             logger.debug("get_order_book error for %s: %s", token_id, exc)
             return None
 
-    async def get_best_price(self, token_id: str) -> Optional[float]:
+    async def get_best_price(self, token_id: str, force_refresh: bool = False) -> Optional[float]:
         """
         Get the best available price by checking both CLOB and Gamma.
         Returns None if no price can be determined.
+        force_refresh: bypass the 30 s price cache (used by drift retry loop).
         """
-        price = await self.get_market_price(token_id, "BUY")
+        price = await self.get_market_price(token_id, "BUY", force_refresh=force_refresh)
         if price is not None:
             return price
         price = await self.get_last_trade_price(token_id)

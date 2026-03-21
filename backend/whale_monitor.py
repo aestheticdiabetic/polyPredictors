@@ -148,6 +148,15 @@ class WhaleMonitor:
             replace_existing=True,
         )
 
+        # Fast drift-retry loop — re-checks price every DRIFT_RETRY_INTERVAL_SECONDS
+        # for near-expiry bets that were skipped due to price drift.
+        self._scheduler.add_job(
+            func=self._run_drift_retry,
+            trigger=IntervalTrigger(seconds=settings.DRIFT_RETRY_INTERVAL_SECONDS),
+            id="drift_retry",
+            replace_existing=True,
+        )
+
         if not self._scheduler.running:
             self._scheduler.start()
 
@@ -162,7 +171,7 @@ class WhaleMonitor:
 
         logger.info("Stopping whale monitor")
 
-        for job_id in ("poll_whales", "refresh_risk_profiles"):
+        for job_id in ("poll_whales", "refresh_risk_profiles", "drift_retry"):
             try:
                 self._scheduler.remove_job(job_id)
             except Exception:
@@ -183,6 +192,25 @@ class WhaleMonitor:
     # ------------------------------------------------------------------
     # Polling
     # ------------------------------------------------------------------
+
+    def _run_drift_retry(self):
+        """
+        Sync wrapper for the async retry_drift_watchlist method.
+        Called every DRIFT_RETRY_INTERVAL_SECONDS by the scheduler.
+        No-ops immediately if the watchlist is empty.
+        """
+        if not self._bet_engine._drift_watchlist:
+            return
+        db = SessionLocal()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._bet_engine.retry_drift_watchlist(db))
+        except Exception as exc:
+            logger.error("_run_drift_retry error: %s", exc)
+        finally:
+            loop.close()
+            db.close()
 
     def poll_whales(self):
         """

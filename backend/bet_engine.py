@@ -7,6 +7,8 @@ position closing, and resolution checking.
 import asyncio
 import json
 import logging
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -30,11 +32,29 @@ logger = logging.getLogger(__name__)
 risk_calc = RiskCalculator()
 
 
+@dataclass
+class _WatchItem:
+    """Tracks a drift-skipped bet on a near-expiry market for fast retry."""
+    copied_bet_id: int        # existing SKIPPED CopiedBet to upgrade on success
+    whale_bet_id: int
+    session_id: int
+    token_id: str
+    market_info: dict
+    whale_price: float
+    bet_size_usdc: float
+    risk_factor: float
+    whale_avg: float
+    expires_at: float         # time.monotonic() deadline
+
+
 class BetEngine:
     """Processes whale bets and manages our copied positions."""
 
     def __init__(self, polymarket_client=None):
         self._client = polymarket_client
+        # whale_bet_id → _WatchItem: near-expiry bets that were drift-skipped,
+        # retried every DRIFT_RETRY_INTERVAL_SECONDS with a fresh price.
+        self._drift_watchlist: dict[int, _WatchItem] = {}
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -120,13 +140,38 @@ class BetEngine:
         # ---- CASE 3: Fresh position ------------------------------------
 
         # Risk calculations
-        whale_avg = whale.avg_bet_size_usdc if whale else 0.0
-        risk_factor = risk_calc.calculate_risk_factor(whale_bet.size_usdc, whale_avg)
-        bet_size_usdc = risk_calc.calculate_bet_size(
-            session_balance=session.current_balance_usdc,
-            risk_factor=risk_factor,
-            max_bet_pct=settings.MAX_BET_PCT,
+        # For the first WHALE_CALIBRATION_BETS placed bets for this whale we don't
+        # yet have a reliable average, so use the minimum as a tracker bet.  Once
+        # we have enough history the normal risk-factor sizing kicks in.
+        _CALIBRATION_THRESHOLD = 15
+        whale_address = whale.address if whale else None
+        placed_count = (
+            db.query(CopiedBet)
+            .filter(
+                CopiedBet.whale_address == whale_address,
+                CopiedBet.mode == session.mode,
+                CopiedBet.status != "SKIPPED",
+            )
+            .count()
+            if whale_address else 0
         )
+
+        if placed_count < _CALIBRATION_THRESHOLD:
+            bet_size_usdc = settings.MIN_BET_USDC
+            risk_factor = 0.0  # sentinel — no risk data yet
+            whale_avg = 0.0
+            logger.info(
+                "Calibration mode: whale %s has %d/%d placed bets — using minimum $%.2f",
+                (whale_address or "?")[:10], placed_count, _CALIBRATION_THRESHOLD, settings.MIN_BET_USDC,
+            )
+        else:
+            whale_avg = whale.avg_bet_size_usdc if whale else 0.0
+            risk_factor = risk_calc.calculate_risk_factor(whale_bet.size_usdc, whale_avg)
+            bet_size_usdc = risk_calc.calculate_bet_size(
+                session_balance=session.current_balance_usdc,
+                risk_factor=risk_factor,
+                max_bet_pct=settings.MAX_BET_PCT,
+            )
 
         # Market guard
         ok, skip_reason = risk_calc.should_place_bet(
@@ -144,7 +189,7 @@ class BetEngine:
                     whale_bet.id, skip_reason,
                 )
                 return None
-            return self._create_skipped_bet(
+            skipped = self._create_skipped_bet(
                 whale_bet=whale_bet,
                 session=session,
                 bet_size_usdc=bet_size_usdc,
@@ -153,6 +198,20 @@ class BetEngine:
                 skip_reason=skip_reason,
                 db=db,
             )
+            # Near-expiry drift skip → add to watchlist for fast retry.
+            # The retry loop checks price every DRIFT_RETRY_INTERVAL_SECONDS and
+            # upgrades this SKIPPED record to OPEN if price comes back within range.
+            if "price drift" in skip_reason and "> 2%" in skip_reason:
+                self._add_to_drift_watchlist(
+                    copied_bet_id=skipped.id,
+                    whale_bet=whale_bet,
+                    session=session,
+                    market_info=market_info or {},
+                    bet_size_usdc=bet_size_usdc,
+                    risk_factor=risk_factor,
+                    whale_avg=whale_avg,
+                )
+            return skipped
 
         # Balance check
         if session.current_balance_usdc < 1.0:
@@ -166,15 +225,11 @@ class BetEngine:
                 db=db,
             )
 
-        if bet_size_usdc < 1.0:
-            return self._create_skipped_bet(
-                whale_bet=whale_bet,
-                session=session,
-                bet_size_usdc=bet_size_usdc,
-                risk_factor=risk_factor,
-                whale_avg=whale_avg,
-                skip_reason="Calculated bet size below minimum ($1.00)",
-                db=db,
+        if bet_size_usdc < settings.MIN_BET_USDC:
+            bet_size_usdc = settings.MIN_BET_USDC
+            logger.debug(
+                "Bet size below minimum — clamping to $%.2f for whale_bet %d",
+                settings.MIN_BET_USDC, whale_bet.id,
             )
 
         # Category filter — skip if this whale has disabled this sport or bet type
@@ -483,7 +538,7 @@ class BetEngine:
                     continue
 
                 # Must be computed before any case that references it
-                is_live_sport = bet.market_category in _LIVE_SPORTS
+                is_live_sport = bet.market_category in _LIVE_SPORTS or bet.market_category == "Crypto"
 
                 # Resolve the session for this bet's mode (cached)
                 if bet.mode not in session_cache:
@@ -906,20 +961,182 @@ class BetEngine:
             max_bet_pct=settings.MAX_BET_PCT,
         )
 
-        signal = AddToPositionSignal(
-            whale_bet_id=whale_bet.id,
-            copied_bet_id=existing_open.id,
-            whale_additional_usdc=whale_bet.size_usdc,
-            whale_additional_shares=whale_bet.size_shares,
-            price=whale_bet.price,
-            timestamp=whale_bet.timestamp,
-            suggested_add_usdc=suggested_add_usdc,
-            note="Whale added to position while we hold",
+        # Upsert: accumulate into the existing signal for this position rather than
+        # creating a new row for every addition.  This keeps one signal per position
+        # showing the total the whale has added and how many times they've added.
+        existing_signal = (
+            db.query(AddToPositionSignal)
+            .filter_by(copied_bet_id=existing_open.id)
+            .first()
         )
-        db.add(signal)
+        if existing_signal:
+            existing_signal.whale_additional_usdc += whale_bet.size_usdc
+            existing_signal.whale_additional_shares += whale_bet.size_shares
+            existing_signal.addition_count = (existing_signal.addition_count or 1) + 1
+            existing_signal.last_addition_at = whale_bet.timestamp
+            existing_signal.price = whale_bet.price          # latest addition price
+            existing_signal.suggested_add_usdc = suggested_add_usdc
+            db.add(existing_signal)
+            logger.info(
+                "Updated add-to-position signal for copied_bet=%d: "
+                "total=$%.2f additions=%d",
+                existing_open.id,
+                existing_signal.whale_additional_usdc,
+                existing_signal.addition_count,
+            )
+        else:
+            signal = AddToPositionSignal(
+                whale_bet_id=whale_bet.id,
+                copied_bet_id=existing_open.id,
+                whale_additional_usdc=whale_bet.size_usdc,
+                whale_additional_shares=whale_bet.size_shares,
+                price=whale_bet.price,
+                timestamp=whale_bet.timestamp,
+                addition_count=1,
+                last_addition_at=whale_bet.timestamp,
+                suggested_add_usdc=suggested_add_usdc,
+                note="Whale added to position while we hold",
+            )
+            db.add(signal)
+
         db.commit()
         # Return the existing open position — no new ledger entry created
         return existing_open
+
+    # ------------------------------------------------------------------
+    # Drift-skip watchlist — fast retry for near-expiry markets
+    # ------------------------------------------------------------------
+
+    def _add_to_drift_watchlist(
+        self,
+        copied_bet_id: int,
+        whale_bet: WhaleBet,
+        session: MonitoringSession,
+        market_info: dict,
+        bet_size_usdc: float,
+        risk_factor: float,
+        whale_avg: float,
+    ) -> None:
+        """Register a drift-skipped bet for fast-polling retry."""
+        expires_at = time.monotonic() + settings.DRIFT_RETRY_WINDOW_SECONDS
+        self._drift_watchlist[whale_bet.id] = _WatchItem(
+            copied_bet_id=copied_bet_id,
+            whale_bet_id=whale_bet.id,
+            session_id=session.id,
+            token_id=whale_bet.token_id,
+            market_info=market_info,
+            whale_price=whale_bet.price,
+            bet_size_usdc=bet_size_usdc,
+            risk_factor=risk_factor,
+            whale_avg=whale_avg,
+            expires_at=expires_at,
+        )
+        logger.info(
+            "Drift watchlist: added whale_bet=%d token=%s…  expires_in=%ds  (watchlist size=%d)",
+            whale_bet.id, whale_bet.token_id[:12],
+            settings.DRIFT_RETRY_WINDOW_SECONDS, len(self._drift_watchlist),
+        )
+
+    async def retry_drift_watchlist(self, db: DBSession) -> None:
+        """
+        Called by the fast-poll scheduler every DRIFT_RETRY_INTERVAL_SECONDS.
+        For each watchlist item: fetch a fresh (uncached) price and place the bet
+        if the price has come back within the drift threshold.  On success the
+        existing SKIPPED CopiedBet record is updated to OPEN in-place.
+        """
+        if not self._drift_watchlist:
+            return
+
+        now = time.monotonic()
+        for whale_bet_id, item in list(self._drift_watchlist.items()):
+            # 1. Expiry check
+            if now > item.expires_at:
+                logger.debug("Drift watchlist: whale_bet=%d expired — removing", whale_bet_id)
+                del self._drift_watchlist[whale_bet_id]
+                continue
+
+            # 2. Load and validate session
+            session = db.get(MonitoringSession, item.session_id)
+            if not session or not getattr(session, "active", True):
+                logger.debug("Drift watchlist: session %d gone — removing whale_bet=%d", item.session_id, whale_bet_id)
+                del self._drift_watchlist[whale_bet_id]
+                continue
+
+            # 3. Fetch a live price, bypassing the 30 s cache
+            try:
+                live_price = await self._client.get_best_price(item.token_id, force_refresh=True)
+            except Exception as exc:
+                logger.debug("Drift watchlist: price fetch failed for whale_bet=%d: %s", whale_bet_id, exc)
+                continue
+
+            # 4. Re-check drift only — all other guards already passed
+            price_ok, price_reason = risk_calc.check_price_staleness(
+                whale_price=item.whale_price,
+                live_price=live_price,
+                max_drift=settings.MAX_PRICE_DRIFT_PCT,
+            )
+            if not price_ok:
+                logger.debug(
+                    "Drift watchlist: whale_bet=%d still drifted (%s) — retrying",
+                    whale_bet_id, price_reason,
+                )
+                continue
+
+            # 5. Price is back in range — execute placement
+            mode = session.mode
+            try:
+                if mode in ("SIMULATION", "HEDGE_SIM"):
+                    size_shares, actual_price = self.simulate_buy(
+                        session=session,
+                        market_id=item.market_info.get("conditionId", ""),
+                        token_id=item.token_id,
+                        question=item.market_info.get("question", ""),
+                        outcome=item.market_info.get("outcome", ""),
+                        price=live_price if live_price is not None else item.whale_price,
+                        size_usdc=item.bet_size_usdc,
+                        db=db,
+                    )
+                else:
+                    order_resp = self.place_real_buy(
+                        token_id=item.token_id,
+                        size_usdc=item.bet_size_usdc,
+                        price=item.whale_price,
+                    )
+                    size_shares = float(order_resp.get("size_matched", item.bet_size_usdc / max(item.whale_price, 0.01)))
+                    fill_price = (
+                        order_resp.get("price")
+                        or order_resp.get("avgPrice")
+                        or order_resp.get("average_price")
+                    )
+                    actual_price = float(fill_price) if fill_price else (live_price or item.whale_price)
+            except Exception as exc:
+                logger.error("Drift watchlist: placement failed for whale_bet=%d: %s", whale_bet_id, exc)
+                del self._drift_watchlist[whale_bet_id]
+                continue
+
+            # 6. Upgrade the existing SKIPPED record to OPEN in-place
+            copied_bet = db.get(CopiedBet, item.copied_bet_id)
+            if copied_bet is None:
+                logger.warning("Drift watchlist: CopiedBet %d not found — removing", item.copied_bet_id)
+                del self._drift_watchlist[whale_bet_id]
+                continue
+
+            copied_bet.status = "OPEN"
+            copied_bet.price_at_entry = actual_price
+            copied_bet.size_shares = size_shares
+            copied_bet.skip_reason = None
+            copied_bet.opened_at = datetime.utcnow()
+            session.total_bets_placed += 1
+            db.add(copied_bet)
+            db.add(session)
+            db.commit()
+            db.refresh(copied_bet)
+
+            del self._drift_watchlist[whale_bet_id]
+            logger.info(
+                "Drift watchlist: RETRY SUCCESS whale_bet=%d — placed %s @ %.4f for $%.2f  (watchlist size=%d)",
+                whale_bet_id, mode, actual_price, item.bet_size_usdc, len(self._drift_watchlist),
+            )
 
     def _create_skipped_bet(
         self,
@@ -931,6 +1148,7 @@ class BetEngine:
         skip_reason: str,
         db: DBSession,
     ) -> CopiedBet:
+        market_category, bet_type_cat = classify(whale_bet.question)
         copied_bet = CopiedBet(
             whale_bet_id=whale_bet.id,
             whale_address=whale_bet.whale.address,
@@ -948,6 +1166,8 @@ class BetEngine:
             whale_avg_bet_usdc=whale_avg,
             status="SKIPPED",
             skip_reason=skip_reason,
+            market_category=market_category,
+            bet_type=bet_type_cat,
             opened_at=datetime.utcnow(),
         )
         db.add(copied_bet)

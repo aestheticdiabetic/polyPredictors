@@ -907,16 +907,21 @@ function renderSignalsGrouped(signals, tab, page) {
       pnlHtml = `<span class="${cls}">${formatPnl(s.hypothetical_pnl_usdc)}</span>`;
     }
 
-    const investment = s.suggested_add_usdc ?? s.whale_additional_usdc;
-    const market     = escHtml(truncate(s.bet_question || `Bet #${s.copied_bet_id}`, 50));
-    const whaleLabel = escHtml(s.whale_alias || s.whale_address || '—');
-    const ts         = s.timestamp ? new Date(s.timestamp).toLocaleDateString() : '—';
+    const investment   = s.suggested_add_usdc ?? s.whale_additional_usdc;
+    const market       = escHtml(truncate(s.bet_question || `Bet #${s.copied_bet_id}`, 50));
+    const whaleLabel   = escHtml(s.whale_alias || s.whale_address || '—');
+    const lastTs       = s.last_addition_at || s.timestamp;
+    const ts           = lastTs ? new Date(lastTs).toLocaleDateString() : '—';
+    const count        = s.addition_count || 1;
+    const countBadge   = count > 1
+      ? ` <span style="font-size:0.75rem;color:var(--text-muted)">×${count}</span>`
+      : '';
 
     return `
       <tr>
         <td title="${escHtml(s.bet_question || '')}">${market}</td>
         <td style="font-size:0.8rem;color:var(--text-muted)" title="${escHtml(s.whale_address || '')}">${whaleLabel}</td>
-        <td class="mono text-muted">$${s.whale_additional_usdc.toFixed(2)}</td>
+        <td class="mono text-muted">$${s.whale_additional_usdc.toFixed(2)}${countBadge}</td>
         <td class="mono">$${investment.toFixed(2)}</td>
         <td class="mono">${s.price.toFixed(4)}</td>
         <td>${statusBadge}</td>
@@ -1025,7 +1030,7 @@ function formatUSDC(amount) {
 
 function formatPnl(pnl) {
   if (pnl == null) return '—';
-  const sign = pnl >= 0 ? '+' : '';
+  const sign = pnl >= 0 ? '+' : '-';
   return sign + '$' + Math.abs(pnl).toFixed(2);
 }
 

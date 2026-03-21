@@ -215,10 +215,10 @@ class AddToPositionSignal(Base):
     whale_bet_id = Column(Integer, ForeignKey("whale_bets.id"), nullable=False)
     copied_bet_id = Column(Integer, ForeignKey("copied_bets.id"), nullable=False)
 
-    whale_additional_usdc = Column(Float, nullable=False)
-    whale_additional_shares = Column(Float, nullable=False, default=0.0)
-    price = Column(Float, nullable=False)
-    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow)
+    whale_additional_usdc = Column(Float, nullable=False)    # cumulative total across all additions
+    whale_additional_shares = Column(Float, nullable=False, default=0.0)  # cumulative
+    price = Column(Float, nullable=False)                    # price of the most recent addition
+    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow)  # first addition
 
     # Scaled bet size we would add under our own sizing rules (risk-factor
     # adjusted to our session balance), distinct from the whale's raw addition.
@@ -226,6 +226,10 @@ class AddToPositionSignal(Base):
 
     hypothetical_pnl_usdc = Column(Float, nullable=True)
     note = Column(Text, nullable=True)
+
+    # Grouped addition tracking — one signal row per position, updated on each addition
+    addition_count = Column(Integer, nullable=False, default=1)
+    last_addition_at = Column(DateTime, nullable=True)
 
     # Relationships
     whale_bet = relationship("WhaleBet", back_populates="add_to_position_signal")
@@ -243,6 +247,8 @@ class AddToPositionSignal(Base):
             "suggested_add_usdc": round(self.suggested_add_usdc, 2) if self.suggested_add_usdc is not None else None,
             "hypothetical_pnl_usdc": round(self.hypothetical_pnl_usdc, 2) if self.hypothetical_pnl_usdc is not None else None,
             "note": self.note,
+            "addition_count": self.addition_count if self.addition_count is not None else 1,
+            "last_addition_at": self.last_addition_at.isoformat() if self.last_addition_at else None,
         }
 
 
@@ -327,7 +333,9 @@ def _migrate():
         ("copied_bets",           "market_category",   "VARCHAR(50)"),
         ("copied_bets",           "bet_type",          "VARCHAR(50)"),
         ("whales",                "category_filters",  "TEXT"),
-        ("add_to_position_signals", "suggested_add_usdc", "FLOAT"),
+        ("add_to_position_signals", "suggested_add_usdc",  "FLOAT"),
+        ("add_to_position_signals", "addition_count",      "INTEGER DEFAULT 1"),
+        ("add_to_position_signals", "last_addition_at",    "DATETIME"),
     ]
     with engine.connect() as conn:
         for table, column, col_type in migrations:

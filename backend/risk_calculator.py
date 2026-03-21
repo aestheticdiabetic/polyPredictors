@@ -7,11 +7,12 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
+from backend.config import settings
+
 logger = logging.getLogger(__name__)
 
 _MIN_RISK_FACTOR = 0.5
 _MAX_RISK_FACTOR = 3.0
-_MIN_BET_USDC = 1.0
 
 
 class RiskCalculator:
@@ -75,7 +76,7 @@ class RiskCalculator:
         hard_cap = base_bet * _MAX_RISK_FACTOR  # absolute ceiling
 
         result = min(bet_size, hard_cap)
-        result = max(_MIN_BET_USDC, result)
+        result = max(settings.MIN_BET_USDC, result)
 
         # Never bet more than the full balance
         result = min(result, session_balance)
