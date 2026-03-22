@@ -464,12 +464,15 @@ class PolymarketClient:
             resp = client.post_order(signed_order)
             return resp if isinstance(resp, dict) else {"status": "ok", "response": str(resp)}
 
-        fee = self._taker_fee_cache.get(token_id, 0)
+        # Default to 1000 bps (10%) — the standard Polymarket taker fee.
+        # Starting at 0 caused every first buy to fail and retry (4-6s delay),
+        # allowing significant price movement between intent and fill.
+        fee = self._taker_fee_cache.get(token_id, 1000)
         try:
             return _attempt(fee)
         except Exception as exc:
             # Parse required fee from error message, e.g.:
-            # "invalid fee rate (0), current market's taker fee: 1000"
+            # "invalid fee rate (1000), current market's taker fee: 0"
             match = re.search(r"taker fee[:\s]+(\d+)", str(exc), re.IGNORECASE)
             if match:
                 required_fee = int(match.group(1))

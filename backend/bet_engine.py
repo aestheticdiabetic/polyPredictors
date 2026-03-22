@@ -655,8 +655,18 @@ class BetEngine:
                         try:
                             retry_resp = self.place_real_sell(copied_bet.token_id, actual_shares)
                             if retry_resp.get("status") != "no_position":
-                                # Success — use actual shares for correct P&L
+                                # Success — use actual shares for correct P&L.
+                                # Also update price_at_entry so the ledger shows the
+                                # true effective fill price (size_usdc / actual_shares)
+                                # rather than the whale's price.  Without this, a fill
+                                # at $1.00/share on a market priced at $0.78 appears as
+                                # a win when sold at $0.80 (0.80 > 0.78) but is actually
+                                # a loss (bought at $1.00, sold at $0.80).
                                 copied_bet.size_shares = actual_shares
+                                if actual_shares > 0:
+                                    copied_bet.price_at_entry = round(
+                                        copied_bet.size_usdc / actual_shares, 4
+                                    )
                                 raw = (
                                     retry_resp.get("price")
                                     or retry_resp.get("avgPrice")
@@ -665,8 +675,10 @@ class BetEngine:
                                 if raw:
                                     fill_price = float(raw)
                                 logger.info(
-                                    "Real sell bet %d: retry with %.4f shares succeeded",
+                                    "Real sell bet %d: retry with %.4f shares succeeded "
+                                    "(effective entry price updated to %.4f)",
                                     copied_bet.id, actual_shares,
+                                    copied_bet.price_at_entry,
                                 )
                             else:
                                 # Still no position after retry — genuine absence
