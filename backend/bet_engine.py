@@ -92,10 +92,12 @@ class BetEngine:
             return self._handle_exit(whale_bet, session, db)
 
         # ---- CASE 2: Whale is opening / adding to a position ----------
-        # Each whale BUY is treated as an independent position — even if we already
-        # hold an open position in this token, we open a new CopiedBet so that every
-        # entry tranche is tracked separately and can be exited at the correct time.
-        # EXIT signals close ALL open positions for the token (see _handle_exit).
+        # Two sub-cases:
+        #   a) Same price (within _SAME_PRICE_TOLERANCE): whale is adding more capital
+        #      to an existing position at the same entry level → AddToPositionSignal.
+        #   b) Different price: whale is opening a NEW independent tranche at a different
+        #      entry level → new CopiedBet tracked separately for per-tranche exit.
+        # EXIT signals close tranches proportionally (see _handle_exit).
         whale_address = whale.address if whale else None
 
         # ---- HEDGE GUARD (HEDGE_SIM only): same whale, same market, opposite outcome ---
@@ -130,7 +132,45 @@ class BetEngine:
                     risk_factor=risk_factor, whale_avg=whale_avg, skip_reason=skip_reason, db=db,
                 )
 
-        # ---- CASE 3: Fresh position ------------------------------------
+        # ---- SAME-PRICE ADD-TO-POSITION GUARD ---------------------------------
+        # If the whale already holds an OPEN position in this token at approximately
+        # the same price, record as an add-to-position signal rather than opening
+        # a new tranche.  Trades at a meaningfully different price are independent
+        # positions held until the whale exits that specific entry level.
+        _SAME_PRICE_TOLERANCE = 0.03  # 3 cents absolute — same entry level (tick variation)
+        if whale_address:
+            existing_for_token = (
+                db.query(CopiedBet)
+                .filter(
+                    CopiedBet.whale_address == whale_address,
+                    CopiedBet.token_id == whale_bet.token_id,
+                    CopiedBet.status == "OPEN",
+                    CopiedBet.mode == mode,
+                )
+                .all()
+            )
+            if existing_for_token:
+                closest = min(
+                    existing_for_token,
+                    key=lambda p: abs(whale_bet.price - p.price_at_entry),
+                )
+                price_diff = abs(whale_bet.price - closest.price_at_entry)
+                if price_diff <= _SAME_PRICE_TOLERANCE:
+                    logger.info(
+                        "Add-to-position: whale %s bought %s @ %.3f within %.2f of "
+                        "existing entry %.3f — recording signal, no new tranche",
+                        whale_address[:10], whale_bet.token_id[:16],
+                        whale_bet.price, _SAME_PRICE_TOLERANCE, closest.price_at_entry,
+                    )
+                    return self._handle_add_to_position(whale_bet, closest, session, db)
+                logger.info(
+                    "New price tranche: whale %s bought %s @ %.3f "
+                    "(diff=%.3f from existing %.3f > %.2f tolerance) — opening new tranche",
+                    whale_address[:10], whale_bet.token_id[:16],
+                    whale_bet.price, price_diff, closest.price_at_entry, _SAME_PRICE_TOLERANCE,
+                )
+
+        # ---- CASE 3: Fresh position / new price tranche -------------------
 
         # Risk calculations
         # For the first WHALE_CALIBRATION_BETS placed bets for this whale we don't
@@ -318,27 +358,50 @@ class BetEngine:
                         order_status_raw, whale_bet.token_id[:16],
                     )
                 else:
-                    # Extract actual fill size from order response.
-                    # When size_matched is absent, estimate from cost/price but floor
-                    # to 2dp — the CLOB uses round_down (floor) when filling buys, so
-                    # our estimate must match or be under, never over.
-                    # e.g. $1.45 / 0.590 = 2.4576 → floor → 2.45 (not round → 2.46)
                     import math as _math
+
+                    # Extract fill price first — needed for share calculation below.
+                    fill_price_raw = (
+                        order_resp.get("price")
+                        or order_resp.get("avgPrice")
+                        or order_resp.get("average_price")
+                    )
+                    fill_price = float(fill_price_raw) if fill_price_raw else float(whale_bet.price)
+                    entry_price = fill_price
+
+                    # Determine actual shares received.
+                    #
+                    # Polymarket CLOB market-buy orders have maker=USDC, taker=shares.
+                    # The `size_matched` response field can be in EITHER unit depending
+                    # on how the CLOB processes the order:
+                    #   • If size_matched < size_usdc: it's reporting USDC (maker side)
+                    #     — shares must be derived as size_usdc / fill_price.
+                    #   • If size_matched >= size_usdc: it's already shares (taker side)
+                    #     — safe to use directly.
+                    # Since all token prices are < $1.00, shares > USDC always, so
+                    # size_matched < size_usdc is an unambiguous signal for the USDC case.
                     raw_matched = order_resp.get("size_matched")
-                    if raw_matched is not None:
-                        size_shares = float(raw_matched)
+                    if raw_matched is not None and float(raw_matched) > 0:
+                        raw_matched_f = float(raw_matched)
+                        if raw_matched_f < bet_size_usdc * 1.01:
+                            # size_matched is USDC (makerAmount) — convert to shares
+                            size_shares = _math.floor(
+                                bet_size_usdc / fill_price * 100
+                            ) / 100
+                            logger.warning(
+                                "REAL BUY: size_matched=%.4f interpreted as USDC "
+                                "(< size_usdc=%.2f × 1.01) — converting to shares "
+                                "via fill_price=%.4f → %.4f shares",
+                                raw_matched_f, bet_size_usdc, fill_price, size_shares,
+                            )
+                        else:
+                            # size_matched is shares (takerAmount)
+                            size_shares = _math.floor(raw_matched_f * 100) / 100
                     else:
+                        # size_matched absent — estimate from cost / fill_price
                         size_shares = _math.floor(
-                            bet_size_usdc / max(whale_bet.price, 0.01) * 100
+                            bet_size_usdc / fill_price * 100
                         ) / 100
-                # Use actual fill price if the exchange reports it (avoids slippage mismatch)
-                fill_price = (
-                    order_resp.get("price")
-                    or order_resp.get("avgPrice")
-                    or order_resp.get("average_price")
-                )
-                if fill_price:
-                    entry_price = float(fill_price)
                 # Deduct from session balance (simulate_buy handles this for SIM)
                 session.current_balance_usdc = max(0.0, session.current_balance_usdc - bet_size_usdc)
                 db.add(session)
@@ -1414,17 +1477,65 @@ class BetEngine:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _compute_exit_fraction(self, whale_bet: WhaleBet, db: DBSession) -> float:
+        """Estimate what fraction of the whale's position this exit represents.
+
+        Sums all tracked BUY shares for this whale/token, subtracts prior SELLs,
+        then returns current_exit_shares / remaining_position.
+
+        Returns 1.0 (full exit) when data is insufficient to determine the fraction.
+        """
+        from sqlalchemy import func as _func
+        if not (whale_bet.whale_id and whale_bet.token_id and whale_bet.size_shares > 0):
+            return 1.0
+
+        total_bought = (
+            db.query(_func.sum(WhaleBet.size_shares))
+            .filter(
+                WhaleBet.whale_id == whale_bet.whale_id,
+                WhaleBet.token_id == whale_bet.token_id,
+                WhaleBet.bet_type == "OPEN",
+            )
+            .scalar()
+        ) or 0.0
+
+        # Prior sells — exclude the current exit so we don't double-count it
+        total_prior_sold = (
+            db.query(_func.sum(WhaleBet.size_shares))
+            .filter(
+                WhaleBet.whale_id == whale_bet.whale_id,
+                WhaleBet.token_id == whale_bet.token_id,
+                WhaleBet.bet_type == "EXIT",
+                WhaleBet.id != whale_bet.id,
+            )
+            .scalar()
+        ) or 0.0
+
+        remaining = max(total_bought - total_prior_sold, 0.0)
+        if remaining <= 0:
+            return 1.0  # can't determine — default to full exit (close everything)
+
+        fraction = whale_bet.size_shares / remaining
+        return min(fraction, 1.0)
+
     def _handle_exit(
         self,
         whale_bet: WhaleBet,
         session: MonitoringSession,
         db: DBSession,
     ) -> Optional[CopiedBet]:
-        """Whale is selling out of a position — close ALL our open positions for that token.
+        """Whale is selling out of a position.
 
-        Each whale BUY creates a separate CopiedBet, so an EXIT from the whale
-        signals we should exit every tranche we hold for this token simultaneously.
+        - Single tranche: always close it.
+        - Multiple tranches: compute what fraction of the whale's total position
+          this exit represents.  If >= _FULL_EXIT_THRESHOLD → close all tranches.
+          Otherwise → close the oldest N tranches proportionally (FIFO), leaving
+          remaining tranches open until the whale exits those entry levels too.
+
+        Each whale BUY creates a separate CopiedBet tracked independently.
         """
+        _FULL_EXIT_THRESHOLD = 0.80  # ≥80% of position sold → treat as full exit
+
         exiting_whale_address = whale_bet.whale.address if whale_bet.whale else None
         open_positions = self._find_all_open_positions(
             market_id=whale_bet.market_id,
@@ -1447,13 +1558,36 @@ class BetEngine:
         whale_alias = (whale_bet.whale.alias or whale_bet.whale.address[:10]) if whale_bet.whale else "?"
         exit_reason = f"Whale exited ({whale_alias} sold @ {exit_price:.3f})"
 
-        logger.info(
-            "_handle_exit: closing %d open position(s) for whale %s token %s @ %.4f",
-            len(open_positions), (exiting_whale_address or "?")[:10],
-            whale_bet.token_id[:16], exit_price,
-        )
-
-        self._close_all_tranches(open_positions, exit_price, session, db, exit_reason)
+        if len(open_positions) == 1:
+            # Single tranche — always close regardless of fraction
+            logger.info(
+                "_handle_exit: closing 1 tranche for whale %s token %s @ %.4f",
+                (exiting_whale_address or "?")[:10], whale_bet.token_id[:16], exit_price,
+            )
+            self._close_all_tranches(open_positions, exit_price, session, db, exit_reason)
+        else:
+            # Multiple tranches — determine full vs partial exit
+            exit_fraction = self._compute_exit_fraction(whale_bet, db)
+            if exit_fraction >= _FULL_EXIT_THRESHOLD:
+                logger.info(
+                    "_handle_exit: full exit (%.0f%%) — closing all %d tranches "
+                    "for whale %s token %s @ %.4f",
+                    exit_fraction * 100, len(open_positions),
+                    (exiting_whale_address or "?")[:10], whale_bet.token_id[:16], exit_price,
+                )
+                self._close_all_tranches(open_positions, exit_price, session, db, exit_reason)
+            else:
+                # Partial exit — close oldest tranches first (FIFO)
+                n_to_close = max(1, round(len(open_positions) * exit_fraction))
+                to_close = open_positions[:n_to_close]
+                logger.info(
+                    "_handle_exit: partial exit (%.0f%%) — closing %d of %d tranches "
+                    "for whale %s token %s @ %.4f, %d remain open",
+                    exit_fraction * 100, n_to_close, len(open_positions),
+                    (exiting_whale_address or "?")[:10], whale_bet.token_id[:16], exit_price,
+                    len(open_positions) - n_to_close,
+                )
+                self._close_all_tranches(to_close, exit_price, session, db, exit_reason)
 
         db.commit()
         return open_positions[0]

@@ -230,14 +230,18 @@ def test_no_win_live_sport_within_guard_stays_open():
 
 
 def test_unresolved_no_price_stays_open():
-    """price <= 0.05 but oracle not settled (is_resolved=False) → stays OPEN."""
+    """price <= 0.05 but oracle not settled (is_resolved=False) and within oracle timeout → stays OPEN.
+
+    Live sports have an 8h oracle timeout. We use _past(5) to stay within that window
+    so the oracle-timeout fallback doesn't fire and the bet correctly waits for settlement.
+    """
     _clear_db()
     db = _new_db()
     bet = _make_open_bet(db, category="Soccer")
     bet_id = bet.id
     db.close()
 
-    _run_resolution_with_mock(price=0.02, end_dt=_past(10), is_resolved=False)
+    _run_resolution_with_mock(price=0.02, end_dt=_past(5), is_resolved=False)
 
     db = _new_db()
     resolved = db.query(CopiedBet).filter_by(id=bet_id).first()

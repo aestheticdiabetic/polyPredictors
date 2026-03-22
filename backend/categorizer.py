@@ -162,7 +162,7 @@ _SOCCER_TEAM_NAMES = {
     "HANNOVER",       # Hannover 96 (German 2. Bundesliga)
     "HUESCA",         # SD Huesca (Spanish football)
     "RACING CLUB",    # RC Lens, RC Strasbourg, Racing Club de Lens (French football)
-    "ANGERS",         # Angers SCO (French football)
+    "ANGERS SCO",     # Angers SCO (French football) — "ANGERS" alone is a substring of "RANGERS"
     "PUMAS",          # Pumas de la UNAM (Liga MX)
     "TIGRES",         # Tigres de la UANL (Liga MX)
     "CRUZEIRO",       # Cruzeiro EC (Brazilian football)

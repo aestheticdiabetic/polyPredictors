@@ -282,10 +282,10 @@ def test_two_whales_get_independent_open_positions_in_same_market():
 # 3. Same whale adding to a position records a signal, not a new bet
 # ---------------------------------------------------------------------------
 
-def test_same_whale_adding_to_position_creates_signal_not_new_bet():
+def test_same_whale_same_price_creates_signal_not_new_bet():
     """
-    When the SAME whale adds more to a position we already hold, an
-    AddToPositionSignal should be recorded and no new CopiedBet created.
+    When the SAME whale adds more capital at the SAME price (within 3 cents),
+    an AddToPositionSignal is recorded and no new CopiedBet is created.
     """
     from backend.bet_engine import BetEngine
 
@@ -295,12 +295,13 @@ def test_same_whale_adding_to_position_creates_signal_not_new_bet():
     session = _make_session(db, mode="SIMULATION", balance=200.0)
     whale = _make_whale(db, "0xadder", "Adder")
 
-    # Initial position
+    # Initial position at price 0.6
     _make_open_copied_bet(db, whale, session, market_id="mkt_add", token_id="tok_yes")
     initial_bet_count = db.query(CopiedBet).count()
 
-    # Same whale bets again in the same market (adding to position)
-    wb2 = _make_whale_bet(db, whale, market_id="mkt_add", token_id="tok_yes", tx_hash="tx_add_2")
+    # Same whale bets again at the same price (0.6) — should be AddToPositionSignal
+    wb2 = _make_whale_bet(db, whale, market_id="mkt_add", token_id="tok_yes",
+                          tx_hash="tx_add_2", price=0.6)
 
     engine = BetEngine(polymarket_client=None)
     result = engine.process_new_whale_bet(
@@ -309,18 +310,60 @@ def test_same_whale_adding_to_position_creates_signal_not_new_bet():
         live_price=0.6,
     )
 
-    # Should return the existing open position, not create a new bet
+    # No new CopiedBet should be created
     final_bet_count = db.query(CopiedBet).count()
     assert final_bet_count == initial_bet_count, (
-        f"No new CopiedBet should be created when whale adds to existing position. "
+        f"No new CopiedBet should be created for same-price add. "
         f"Before: {initial_bet_count}, after: {final_bet_count}"
     )
 
     # An AddToPositionSignal should have been created
     signals = db.query(AddToPositionSignal).all()
-    assert len(signals) == 1, (
-        f"Expected 1 AddToPositionSignal, got {len(signals)}"
+    assert len(signals) == 1, f"Expected 1 AddToPositionSignal, got {len(signals)}"
+    db.close()
+
+
+def test_same_whale_different_price_creates_independent_tranche():
+    """
+    When the SAME whale buys the same token at a DIFFERENT price (> 3 cents apart),
+    a new independent CopiedBet tranche is opened. This lets each entry level be
+    tracked and exited independently when the whale exits that specific position.
+    """
+    from backend.bet_engine import BetEngine
+
+    db = _new_db()
+    _clear_db()
+
+    session = _make_session(db, mode="SIMULATION", balance=200.0)
+    whale = _make_whale(db, "0xtranche", "Tranche")
+
+    # Initial position at price 0.6
+    _make_open_copied_bet(db, whale, session, market_id="mkt_tranche", token_id="tok_yes")
+    initial_bet_count = db.query(CopiedBet).count()
+
+    # Same whale bets at a different price (0.8 — 20 cents apart, > 3 cent tolerance)
+    wb2 = _make_whale_bet(db, whale, market_id="mkt_tranche", token_id="tok_yes",
+                          tx_hash="tx_tranche_2", price=0.8)
+
+    engine = BetEngine(polymarket_client=None)
+    result = engine.process_new_whale_bet(
+        wb2, session, db,
+        market_info=_make_market_info(),
+        live_price=0.8,
     )
+
+    # A new independent tranche CopiedBet should be created
+    final_bet_count = db.query(CopiedBet).count()
+    assert final_bet_count == initial_bet_count + 1, (
+        f"A new tranche should be created for different-price entry. "
+        f"Before: {initial_bet_count}, after: {final_bet_count}"
+    )
+    assert result is not None and result.status == "OPEN", (
+        f"New tranche should be OPEN, got {result.status if result else None}"
+    )
+    # No AddToPositionSignal should be created
+    signals = db.query(AddToPositionSignal).all()
+    assert len(signals) == 0, f"Expected no signal for different-price tranche, got {len(signals)}"
     db.close()
 
 
@@ -395,12 +438,12 @@ def test_different_whale_exit_does_not_close_other_whales_position():
 # 5. Stale OPEN bets from a previous session don't block the SAME whale
 # ---------------------------------------------------------------------------
 
-def test_stale_open_bets_from_previous_session_cause_add_to_position_for_same_whale():
+def test_stale_open_bets_from_previous_session_same_price_creates_signal():
     """
-    If previous SIMULATION sessions left OPEN bets (market never resolved),
-    the SAME whale signalling the same market should create an add-to-position
-    signal, not a new bet — this is correct behaviour regardless of which session
-    the original bet came from (mode-scoped but not session-scoped).
+    If previous SIMULATION sessions left OPEN bets, the SAME whale signalling
+    the same market at the SAME price in a new session should create an
+    AddToPositionSignal — not a new CopiedBet.  The position is mode-scoped,
+    not session-scoped, so stale same-price entries are treated as additions.
     """
     from backend.bet_engine import BetEngine
 
@@ -410,35 +453,34 @@ def test_stale_open_bets_from_previous_session_cause_add_to_position_for_same_wh
     # Previous session (stopped)
     old_session = _make_session(db, mode="SIMULATION", balance=200.0, is_active=False)
     whale = _make_whale(db, "0xstale", "StaleWhale")
-    # Stale open bet from the old session
+    # Stale open bet from the old session at price 0.6
     _make_open_copied_bet(db, whale, old_session, market_id="mkt_stale", token_id="tok_stale_yes")
 
     # New session starts
     new_session = _make_session(db, mode="SIMULATION", balance=200.0, is_active=True)
 
-    # Same whale signals the same market in the new session
+    # Same whale signals the same market at the same price (0.6)
     wb_new = _make_whale_bet(db, whale, market_id="mkt_stale", token_id="tok_stale_yes",
-                             tx_hash="tx_stale_new")
+                             tx_hash="tx_stale_new", price=0.6)
 
     engine = BetEngine(polymarket_client=None)
-    result = engine.process_new_whale_bet(
+    engine.process_new_whale_bet(
         wb_new, new_session, db,
         market_info=_make_market_info(),
         live_price=0.6,
     )
 
-    # Should record as add-to-position (returns the existing open bet)
-    # No new CopiedBet beyond the stale one
+    # Should record as add-to-position — no new CopiedBet
     copied_bets = db.query(CopiedBet).filter_by(
         market_id="mkt_stale", mode="SIMULATION"
     ).all()
     assert len(copied_bets) == 1, (
-        f"Same whale's stale position should absorb the new signal as add-to-position. "
+        f"Same price add across sessions should create AddToPositionSignal, not new bet. "
         f"Got {len(copied_bets)} CopiedBets."
     )
     signals = db.query(AddToPositionSignal).all()
     assert len(signals) == 1, (
-        f"Expected 1 AddToPositionSignal for the same-whale add. Got {len(signals)}"
+        f"Expected 1 AddToPositionSignal for same-price cross-session add. Got {len(signals)}"
     )
     db.close()
 

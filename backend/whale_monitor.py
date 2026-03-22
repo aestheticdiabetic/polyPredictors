@@ -537,29 +537,10 @@ class WhaleMonitor:
                             new_last_seen = ts
                         continue
 
-                    # Parse the exit price from the trade
-                    price_raw = trade.get("price") or trade.get("avgPrice") or open_pos.price_at_entry
-                    try:
-                        exit_price = float(price_raw)
-                    except (TypeError, ValueError):
-                        exit_price = open_pos.price_at_entry
-
-                    logger.info(
-                        "Background exit: whale %s exited %s @ %.4f — closing %d position(s)",
-                        address[:10], (market_id or token_id)[:16], exit_price, len(open_positions),
-                    )
-
-                    whale_alias = whale.alias or address[:10]
-                    exit_reason = f"Whale exited ({whale_alias} sold @ {exit_price:.3f})"
-
-                    # Close every open tranche for this token atomically
-                    # (single CLOB sell for the combined balance so the first
-                    # sell cannot consume tokens belonging to subsequent tranches)
-                    self._bet_engine._close_all_tranches(
-                        open_positions, exit_price, session, db, exit_reason
-                    )
-
-                    db.commit()
+                    # Route through _handle_exit for consistent partial/full exit
+                    # logic (fraction-based tranche selection, same path as main scanner)
+                    self._bet_engine._handle_exit(whale_bet, session, db)
+                    db.commit()  # safety net — _handle_exit commits internally
 
                 except Exception as exc:
                     logger.error("_handle_exit_trades error for %s: %s", address[:10], exc)
