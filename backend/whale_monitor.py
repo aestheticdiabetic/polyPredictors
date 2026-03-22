@@ -455,7 +455,7 @@ class WhaleMonitor:
     async def _poll_exits_async(self, addresses: list):
         """Fetch recent activity for all whales in parallel, then handle exits."""
         fetch_results = await asyncio.gather(
-            *[self._client.get_user_activity(addr, limit=20) for addr in addresses],
+            *[self._client.get_user_activity(addr, limit=100) for addr in addresses],
             return_exceptions=True,
         )
         for address, trades in zip(addresses, fetch_results):

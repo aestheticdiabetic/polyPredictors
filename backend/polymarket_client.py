@@ -67,19 +67,15 @@ class PolymarketClient:
         self,
         address: str,
         limit: int = 100,
+        max_pages: int = 10,
     ) -> list[dict]:
         """
         Fetch recent TRADE activity for a wallet address.
         Returns a list of trade dicts sorted by timestamp DESC.
+        Paginates automatically until fewer than `limit` results are returned
+        or `max_pages` pages have been fetched (default 10 → up to 1000 trades).
         """
         url = f"{settings.DATA_API_BASE}/activity"
-        params = {
-            "user": address,
-            "type": "TRADE",
-            "limit": limit,
-            "sortBy": "TIMESTAMP",
-            "sortDirection": "DESC",
-        }
         # Use synchronous requests (via asyncio.to_thread) rather than the shared
         # httpx.AsyncClient.  The VPN tunnel drops the body read mid-response even
         # after a clean 200 OK — an asyncio transport-level failure that cannot be
@@ -89,29 +85,51 @@ class PolymarketClient:
         import requests as _requests
 
         MAX_ATTEMPTS = 3
-        for attempt in range(MAX_ATTEMPTS):
-            try:
-                def _fetch():
-                    r = _requests.get(url, params=params, timeout=15)
-                    r.raise_for_status()
-                    return r.json()
+        all_trades: list[dict] = []
 
-                data = await _asyncio.to_thread(_fetch)
-                if isinstance(data, list):
-                    return data
-                return data.get("data", data.get("activities", []))
-            except Exception as exc:
-                if attempt < MAX_ATTEMPTS - 1:
-                    logger.warning(
-                        "get_user_activity attempt %d/%d failed for %s: %s — retrying",
-                        attempt + 1, MAX_ATTEMPTS, address[:10], exc,
-                    )
-                    await _asyncio.sleep(0.5 * (attempt + 1))
-                    continue
-                logger.error("get_user_activity error for %s after %d attempts: %s",
-                             address[:10], MAX_ATTEMPTS, exc)
-                return []
-        return []
+        for page in range(max_pages):
+            params = {
+                "user": address,
+                "type": "TRADE",
+                "limit": limit,
+                "offset": page * limit,
+                "sortBy": "TIMESTAMP",
+                "sortDirection": "DESC",
+            }
+            page_trades: list[dict] = []
+            for attempt in range(MAX_ATTEMPTS):
+                try:
+                    def _fetch(p=params):
+                        r = _requests.get(url, params=p, timeout=15)
+                        r.raise_for_status()
+                        return r.json()
+
+                    data = await _asyncio.to_thread(_fetch)
+                    if isinstance(data, list):
+                        page_trades = data
+                    else:
+                        page_trades = data.get("data", data.get("activities", []))
+                    break
+                except Exception as exc:
+                    if attempt < MAX_ATTEMPTS - 1:
+                        logger.warning(
+                            "get_user_activity page %d attempt %d/%d failed for %s: %s — retrying",
+                            page + 1, attempt + 1, MAX_ATTEMPTS, address[:10], exc,
+                        )
+                        await _asyncio.sleep(0.5 * (attempt + 1))
+                    else:
+                        logger.error(
+                            "get_user_activity page %d error for %s after %d attempts: %s",
+                            page + 1, address[:10], MAX_ATTEMPTS, exc,
+                        )
+
+            all_trades.extend(page_trades)
+
+            # Stop paginating if this page was a partial page (end of data)
+            if len(page_trades) < limit:
+                break
+
+        return all_trades
 
     async def get_user_positions(self, address: str) -> list[dict]:
         """Fetch open positions for a wallet address."""
