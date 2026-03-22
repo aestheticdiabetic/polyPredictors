@@ -137,6 +137,7 @@ class CopiedBet(Base):
     whale_bet_id = Column(Integer, ForeignKey("whale_bets.id"), nullable=False, index=True)
     whale_address = Column(String(64), nullable=False)
 
+    session_id = Column(Integer, ForeignKey("sessions.id"), nullable=True, index=True)
     mode = Column(String(20), nullable=False)  # SIMULATION / REAL
 
     # Market details
@@ -177,6 +178,7 @@ class CopiedBet(Base):
 
     # Relationships
     whale_bet = relationship("WhaleBet", back_populates="copied_bet")
+    session = relationship("MonitoringSession", foreign_keys=[session_id])
     add_to_position_signals = relationship(
         "AddToPositionSignal", back_populates="copied_bet", cascade="all, delete-orphan"
     )
@@ -335,23 +337,39 @@ def _migrate():
         ("copied_bets",           "close_reason",      "TEXT"),
         ("copied_bets",           "market_category",   "VARCHAR(50)"),
         ("copied_bets",           "bet_type",          "VARCHAR(50)"),
+        ("copied_bets",           "session_id",        "INTEGER REFERENCES sessions(id)"),
         ("whales",                "category_filters",  "TEXT"),
         ("add_to_position_signals", "suggested_add_usdc",  "FLOAT"),
         ("add_to_position_signals", "addition_count",      "INTEGER DEFAULT 1"),
         ("add_to_position_signals", "last_addition_at",    "DATETIME"),
     ]
+    sa = __import__("sqlalchemy")
     with engine.connect() as conn:
         for table, column, col_type in migrations:
             try:
-                conn.execute(
-                    __import__("sqlalchemy").text(
-                        f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"
-                    )
-                )
+                conn.execute(sa.text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
                 conn.commit()
             except Exception:
                 # Column already exists — safe to ignore
                 pass
+
+        # Back-fill session_id for existing bets: assign each bet to the session
+        # with matching mode that started most recently at or before the bet's opened_at.
+        try:
+            conn.execute(sa.text("""
+                UPDATE copied_bets
+                SET session_id = (
+                    SELECT s.id FROM sessions s
+                    WHERE s.mode = copied_bets.mode
+                      AND s.started_at <= COALESCE(copied_bets.opened_at, s.started_at)
+                    ORDER BY s.started_at DESC
+                    LIMIT 1
+                )
+                WHERE session_id IS NULL
+            """))
+            conn.commit()
+        except Exception:
+            pass
 
 
 def _seed_defaults():

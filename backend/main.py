@@ -407,7 +407,41 @@ async def get_latest_session(mode: str = Query("all"), db: DBSession = Depends(g
     query = db.query(MonitoringSession)
     query = _apply_session_mode_filter(query, mode)
     session = query.order_by(MonitoringSession.id.desc()).first()
-    return {"session": session.to_dict() if session else None}
+    if not session:
+        return {"session": None}
+
+    d = session.to_dict()
+
+    # Override the stored total_pnl_usdc, total_wins, total_losses, and total_bets_placed
+    # with values computed directly from the bet records for this session.
+    # The stored fields accumulate via in-memory writes and can drift from the true
+    # values if a background job incorrectly attributes a bet to the wrong session.
+    from sqlalchemy import func as _func
+    rows = (
+        db.query(CopiedBet.status, _func.count(CopiedBet.id), _func.sum(CopiedBet.pnl_usdc))
+        .filter(CopiedBet.session_id == session.id)
+        .group_by(CopiedBet.status)
+        .all()
+    )
+    wins = losses = placed = 0
+    pnl_total = 0.0
+    for status, cnt, pnl_sum in rows:
+        if status != "SKIPPED":
+            placed += cnt
+        if status == "CLOSED_WIN":
+            wins += cnt
+        elif status == "CLOSED_LOSS":
+            losses += cnt
+        if pnl_sum is not None:
+            pnl_total += pnl_sum
+    win_rate = round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0.0
+    d["total_bets_placed"] = placed
+    d["total_wins"] = wins
+    d["total_losses"] = losses
+    d["total_pnl_usdc"] = round(pnl_total, 2)
+    d["win_rate_pct"] = win_rate
+
+    return {"session": d}
 
 
 @app.get("/api/ledger")
@@ -495,6 +529,22 @@ async def ledger_stats(
     db: DBSession = Depends(get_db),
 ):
     """Aggregate stats across all (or mode-filtered) bets."""
+    # Determine the active (or most recent) session first so we can scope bets to it
+    m = mode.upper()
+    if m == "STANDARD":
+        session_q = db.query(MonitoringSession).filter(
+            MonitoringSession.mode.in_(["SIMULATION", "REAL"])
+        )
+    elif m in ("SIMULATION", "REAL", "HEDGE_SIM"):
+        session_q = db.query(MonitoringSession).filter(MonitoringSession.mode == m)
+    else:
+        session_q = db.query(MonitoringSession)
+
+    active = (
+        session_q.filter(MonitoringSession.is_active == True).first()  # noqa: E712
+        or session_q.order_by(MonitoringSession.id.desc()).first()
+    )
+
     query = db.query(CopiedBet)
     query = _apply_mode_filter(query, mode)
     bets = query.all()
@@ -515,23 +565,6 @@ async def ledger_stats(
     capital_at_risk = round(sum(b.size_usdc for b in open_bets if b.mode == "REAL"), 2)
     sim_capital_at_risk = round(sum(b.size_usdc for b in open_bets if b.mode in ("SIMULATION", "HEDGE_SIM")), 2)
 
-    # Session balance: scope to the relevant session type so cross-mode
-    # contamination is avoided (e.g. HEDGE_SIM active ≠ standard balance).
-    m = mode.upper()
-    if m == "STANDARD":
-        session_q = db.query(MonitoringSession).filter(
-            MonitoringSession.mode.in_(["SIMULATION", "REAL"])
-        )
-    elif m in ("SIMULATION", "REAL", "HEDGE_SIM"):
-        session_q = db.query(MonitoringSession).filter(MonitoringSession.mode == m)
-    else:
-        session_q = db.query(MonitoringSession)
-
-    # Prefer the active session; fall back to most recent if none running
-    active = (
-        session_q.filter(MonitoringSession.is_active == True).first()  # noqa: E712
-        or session_q.order_by(MonitoringSession.id.desc()).first()
-    )
     if active:
         balance = active.current_balance_usdc
     elif m == "REAL":

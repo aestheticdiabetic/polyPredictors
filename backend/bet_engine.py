@@ -72,6 +72,7 @@ class BetEngine:
         db: DBSession,
         market_info: Optional[dict] = None,
         live_price: Optional[float] = None,
+        taker_fee_bps: int = 1000,
     ) -> Optional[CopiedBet]:
         """
         Decide what to do with a newly detected whale bet and create
@@ -89,7 +90,7 @@ class BetEngine:
 
         # ---- CASE 1: Whale is exiting a position ----------------------
         if whale_bet.bet_type == "EXIT":
-            return self._handle_exit(whale_bet, session, db)
+            return self._handle_exit(whale_bet, session, db, live_exit_price=live_price)
 
         # ---- CASE 2: Whale is opening / adding to a position ----------
         # Two sub-cases:
@@ -308,11 +309,14 @@ class BetEngine:
             except Exception:
                 pass
 
-        # Price staleness guard — skip if odds have moved too far since the whale bet
+        # Price staleness guard — skip if odds have moved too far since the whale bet.
+        # REAL mode uses a tighter upward cap: buying above whale entry compounds
+        # with fees, so we tolerate less overpayment than downward moves.
         price_ok, price_reason = risk_calc.check_price_staleness(
             whale_price=whale_bet.price,
             live_price=live_price,
             max_drift=settings.MAX_PRICE_DRIFT_PCT,
+            max_upward_drift=settings.REAL_MAX_UPWARD_DRIFT if mode == "REAL" else None,
         )
         if not price_ok:
             return self._create_skipped_bet(
@@ -325,11 +329,33 @@ class BetEngine:
                 db=db,
             )
 
+        # REAL mode fee-viability gate — skip trades where fees eliminate all upside.
+        # E.g. buying at 0.85 with 10% fee leaves only 5% net upside; break-even
+        # requires the whale to win 93.5% of the time.
+        if mode == "REAL":
+            check_price = live_price if live_price is not None else whale_bet.price
+            viable, viability_reason = risk_calc.check_fee_viability(
+                entry_price=check_price,
+                fee_bps=taker_fee_bps,
+                max_entry_price=settings.REAL_MAX_ENTRY_PRICE,
+                min_net_upside=settings.REAL_MIN_NET_UPSIDE,
+            )
+            if not viable:
+                return self._create_skipped_bet(
+                    whale_bet=whale_bet,
+                    session=session,
+                    bet_size_usdc=bet_size_usdc,
+                    risk_factor=risk_factor,
+                    whale_avg=whale_avg,
+                    skip_reason=viability_reason,
+                    db=db,
+                )
+
         # Place or simulate
         entry_price = whale_bet.price
         try:
             if mode in ("SIMULATION", "HEDGE_SIM"):
-                shares, actual_price = self.simulate_buy(
+                shares, actual_price, actual_cost = self.simulate_buy(
                     session=session,
                     market_id=whale_bet.market_id,
                     token_id=whale_bet.token_id,
@@ -338,9 +364,11 @@ class BetEngine:
                     price=whale_bet.price,
                     size_usdc=bet_size_usdc,
                     db=db,
+                    live_price=live_price,
                 )
                 entry_price = actual_price
                 size_shares = shares
+                bet_size_usdc = actual_cost  # use fee-inclusive cost as DB cost basis
                 bet_status = "OPEN"
                 skip_reason_val = None
             else:
@@ -360,49 +388,53 @@ class BetEngine:
                 else:
                     import math as _math
 
-                    # Extract fill price first — needed for share calculation below.
-                    fill_price_raw = (
-                        order_resp.get("price")
-                        or order_resp.get("avgPrice")
-                        or order_resp.get("average_price")
-                    )
-                    fill_price = float(fill_price_raw) if fill_price_raw else float(whale_bet.price)
-                    entry_price = fill_price
+                    # Log the raw response so we can diagnose field names in prod.
+                    logger.info("REAL BUY response: %s", order_resp)
 
-                    # Determine actual shares received.
-                    #
-                    # Polymarket CLOB market-buy orders have maker=USDC, taker=shares.
-                    # The `size_matched` response field can be in EITHER unit depending
-                    # on how the CLOB processes the order:
-                    #   • If size_matched < size_usdc: it's reporting USDC (maker side)
-                    #     — shares must be derived as size_usdc / fill_price.
-                    #   • If size_matched >= size_usdc: it's already shares (taker side)
-                    #     — safe to use directly.
-                    # Since all token prices are < $1.00, shares > USDC always, so
-                    # size_matched < size_usdc is an unambiguous signal for the USDC case.
-                    raw_matched = order_resp.get("size_matched")
-                    if raw_matched is not None and float(raw_matched) > 0:
-                        raw_matched_f = float(raw_matched)
-                        if raw_matched_f < bet_size_usdc * 1.01:
-                            # size_matched is USDC (makerAmount) — convert to shares
-                            size_shares = _math.floor(
-                                bet_size_usdc / fill_price * 100
-                            ) / 100
-                            logger.warning(
-                                "REAL BUY: size_matched=%.4f interpreted as USDC "
-                                "(< size_usdc=%.2f × 1.01) — converting to shares "
-                                "via fill_price=%.4f → %.4f shares",
-                                raw_matched_f, bet_size_usdc, fill_price, size_shares,
-                            )
-                        else:
-                            # size_matched is shares (takerAmount)
-                            size_shares = _math.floor(raw_matched_f * 100) / 100
+                    # CLOB BUY response fields (confirmed via py-clob-client source):
+                    #   Submitter is the ORDER MAKER (maker=self.funder in builder).
+                    #   makingAmount = USDC the maker (us) provided (e.g. "0.7548")
+                    #   takingAmount = YES shares the taker provided to us (e.g. "1.02")
+                    # entry_price = makingAmount / takingAmount = USDC / shares
+                    # Legacy fields like price/avgPrice/size_matched are NOT present.
+                    taking_raw = order_resp.get("takingAmount")
+                    making_raw = order_resp.get("makingAmount")
+
+                    if taking_raw is not None and making_raw is not None:
+                        try:
+                            taking_f = float(taking_raw)
+                            making_f = float(making_raw)
+                            if making_f > 0 and taking_f > 0:
+                                size_shares = _math.floor(taking_f * 100) / 100
+                                actual_cost = round(making_f, 4)
+                                bet_size_usdc = actual_cost
+                                entry_price = round(making_f / taking_f, 6)
+                                logger.info(
+                                    "REAL BUY: makingAmount=%.4f (USDC) takingAmount=%.4f (shares)"
+                                    " → entry_price=%.4f actual_cost=$%.4f",
+                                    making_f, taking_f, entry_price, actual_cost,
+                                )
+                            else:
+                                # Zero amounts — fall back to whale price estimate
+                                entry_price = float(whale_bet.price)
+                                size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
+                                logger.warning(
+                                    "REAL BUY: takingAmount/makingAmount zero — "
+                                    "falling back to whale price %.4f", entry_price,
+                                )
+                        except (TypeError, ValueError) as _e:
+                            entry_price = float(whale_bet.price)
+                            size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
+                            logger.warning("REAL BUY: could not parse amounts (%s) — fallback", _e)
                     else:
-                        # size_matched absent — estimate from cost / fill_price
-                        size_shares = _math.floor(
-                            bet_size_usdc / fill_price * 100
-                        ) / 100
-                # Deduct from session balance (simulate_buy handles this for SIM)
+                        # Fields absent — fall back to whale price estimate
+                        entry_price = float(whale_bet.price)
+                        size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
+                        logger.warning(
+                            "REAL BUY: takingAmount/makingAmount absent in response %s"
+                            " — falling back to whale price %.4f", order_resp, entry_price,
+                        )
+                # Deduct actual cost from session balance.
                 session.current_balance_usdc = max(0.0, session.current_balance_usdc - bet_size_usdc)
                 db.add(session)
                 bet_status = "OPEN"
@@ -459,6 +491,7 @@ class BetEngine:
         copied_bet = CopiedBet(
             whale_bet_id=whale_bet.id,
             whale_address=whale_bet.whale.address,
+            session_id=session.id,
             mode=mode,
             market_id=whale_bet.market_id,
             token_id=whale_bet.token_id,
@@ -506,24 +539,48 @@ class BetEngine:
         price: float,
         size_usdc: float,
         db: DBSession,
-    ) -> tuple[float, float]:
+        live_price: Optional[float] = None,
+    ) -> tuple[float, float, float]:
         """
-        Simulate buying `size_usdc` worth of shares at `price`.
-        Deducts from session balance.
-        Returns (shares_bought, entry_price).
+        Simulate buying `size_usdc` worth of shares, mirroring real mode behaviour:
+          - Uses live_price as entry (falling back to whale price) — Gap 1 fix
+          - Floor-rounds shares to 2 dp to match CLOB fill rounding — Gap 3 fix
+          - When SIM_APPLY_FEES: fee baked into cost basis stored in DB — Gap 2 fix
+        Returns (shares_bought, entry_price, actual_cost).
+        actual_cost should be stored as CopiedBet.size_usdc so that P&L uses
+        the true cost basis (including fee) just like real mode does.
         """
-        # Clamp price to avoid zero division
-        effective_price = max(price, 0.001)
-        shares = size_usdc / effective_price
+        import math as _math
 
-        session.current_balance_usdc = max(0.0, session.current_balance_usdc - size_usdc)
+        # Gap 1: use live market price as entry, not the whale's historical price.
+        # Real mode always fills at the current market price (which has moved since
+        # the whale traded). Fall back to whale price only if live price unavailable.
+        effective_price = max(live_price if live_price is not None else price, 0.001)
+
+        # Gap 3: truncate shares to 2 dp, matching CLOB floor rounding in real mode.
+        raw_shares = size_usdc / effective_price
+        shares = _math.floor(raw_shares * 100) / 100
+
+        # Gap 2: when fee simulation is on, bake the fee into the cost basis so
+        # that pnl = proceeds - actual_cost is consistent with real mode, where
+        # actual_cost = takingAmount (which already includes the fee).
+        actual_cost = size_usdc
+        if settings.SIM_APPLY_FEES and settings.SIM_ASSUMED_FEE_BPS > 0:
+            fee_amount = size_usdc * (settings.SIM_ASSUMED_FEE_BPS / 10000)
+            actual_cost = size_usdc + fee_amount
+            logger.debug(
+                "SIM BUY (fee-adjusted): $%.4f position + $%.4f fee (%dbps) = $%.4f cost basis",
+                size_usdc, fee_amount, settings.SIM_ASSUMED_FEE_BPS, actual_cost,
+            )
+
+        session.current_balance_usdc = max(0.0, session.current_balance_usdc - actual_cost)
         db.add(session)
 
         logger.debug(
-            "SIM BUY: $%.2f @ %.4f = %.4f shares | balance -> $%.2f",
-            size_usdc, effective_price, shares, session.current_balance_usdc,
+            "SIM BUY: $%.2f (cost $%.2f) @ %.4f live (whale %.4f) = %.4f shares | balance -> $%.2f",
+            size_usdc, actual_cost, effective_price, price, shares, session.current_balance_usdc,
         )
-        return round(shares, 6), round(effective_price, 6)
+        return round(shares, 6), round(effective_price, 6), round(actual_cost, 4)
 
     def simulate_sell(
         self,
@@ -538,7 +595,18 @@ class BetEngine:
         Calculates P&L, updates session balance and CopiedBet record.
         Returns pnl_usdc.
         """
-        proceeds = copied_bet.size_shares * current_price
+        # Gap 4: apply sell-side taker fee when fee simulation is enabled.
+        # Real mode FOK sell orders also carry fee_rate_bps, so proceeds are reduced.
+        raw_proceeds = copied_bet.size_shares * current_price
+        if settings.SIM_APPLY_FEES and settings.SIM_ASSUMED_FEE_BPS > 0:
+            sell_fee = raw_proceeds * (settings.SIM_ASSUMED_FEE_BPS / 10000)
+            proceeds = raw_proceeds - sell_fee
+            logger.debug(
+                "SIM SELL (fee-adjusted): gross $%.4f - fee $%.4f (%dbps) = $%.4f net",
+                raw_proceeds, sell_fee, settings.SIM_ASSUMED_FEE_BPS, proceeds,
+            )
+        else:
+            proceeds = raw_proceeds
         pnl = proceeds - copied_bet.size_usdc
 
         # Update session balance
@@ -581,10 +649,10 @@ class BetEngine:
         logger.info("REAL BUY: token=%s size=$%.2f price=%.4f", token_id[:16], size_usdc, price)
         return self._client.place_market_buy(token_id, size_usdc)
 
-    def place_real_sell(self, token_id: str, size_shares: float) -> dict:
+    def place_real_sell(self, token_id: str, size_shares: float, whale_price: float = None) -> dict:
         """Place a real market sell via py-clob-client."""
-        logger.info("REAL SELL: token=%s shares=%.4f", token_id[:16], size_shares)
-        return self._client.place_market_sell(token_id, size_shares)
+        logger.info("REAL SELL: token=%s shares=%.4f whale_price=%s", token_id[:16], size_shares, whale_price)
+        return self._client.place_market_sell(token_id, size_shares, whale_price=whale_price)
 
     def _close_bet(
         self,
@@ -638,7 +706,18 @@ class BetEngine:
                 )
                 return 0.0
             try:
-                order_resp = self.place_real_sell(copied_bet.token_id, copied_bet.size_shares)
+                order_resp = self.place_real_sell(copied_bet.token_id, copied_bet.size_shares, whale_price=current_price)
+                logger.info("REAL SELL response: %s", order_resp)
+                sell_status = (order_resp.get("status") or "").lower()
+                if sell_status in ("cancelled", "canceled"):
+                    # FOK order was not filled (price moved between fetch and submit).
+                    # Leave the position OPEN so the next exit-poll retries the sell.
+                    logger.warning(
+                        "Real sell bet %d: FOK order cancelled (price moved) — "
+                        "position remains OPEN, will retry next poll",
+                        copied_bet.id,
+                    )
+                    return 0.0
                 if order_resp.get("status") == "no_position":
                     # CLOB says "not enough balance/allowance" — could be a size_shares
                     # mismatch (our DB estimate is slightly off from actual fill due to
@@ -653,7 +732,14 @@ class BetEngine:
                             copied_bet.id, copied_bet.size_shares, actual_shares,
                         )
                         try:
-                            retry_resp = self.place_real_sell(copied_bet.token_id, actual_shares)
+                            retry_resp = self.place_real_sell(copied_bet.token_id, actual_shares, whale_price=current_price)
+                            _retry_status = (retry_resp.get("status") or "").lower()
+                            if _retry_status in ("cancelled", "canceled"):
+                                logger.warning(
+                                    "Real sell bet %d retry: FOK canceled — position stays OPEN",
+                                    copied_bet.id,
+                                )
+                                return 0.0
                             if retry_resp.get("status") != "no_position":
                                 # Success — use actual shares for correct P&L.
                                 # Also update price_at_entry so the ledger shows the
@@ -760,7 +846,7 @@ class BetEngine:
         session: MonitoringSession,
         db: DBSession,
         exit_reason: str = "",
-    ) -> None:
+    ) -> bool:
         """Close multiple open positions for the same token atomically.
 
         SIMULATION/HEDGE_SIM: each position is closed independently (virtual).
@@ -768,20 +854,26 @@ class BetEngine:
         REAL, multiple positions: places ONE CLOB sell for the combined balance
         so that the first sell cannot consume tokens belonging to a later tranche,
         which would cause the second sell to return no_position → NEUTRAL.
+
+        Returns True if positions were successfully closed (or skipped — e.g.,
+        unfilled buys, resolved markets, simulation). Returns False if the CLOB
+        sell was attempted but failed (FOK cancelled, no_position, or exception)
+        so the caller can choose NOT to advance _last_seen and retry next poll.
         """
         if not open_positions:
-            return
+            return True
 
         mode = open_positions[0].mode
 
         if mode in ("SIMULATION", "HEDGE_SIM"):
             for pos in open_positions:
                 self.simulate_sell(pos, exit_price, session, db, exit_reason)
-            return
+            return True
 
         if len(open_positions) == 1:
             self._close_bet(open_positions[0], exit_price, session, db, exit_reason)
-            return
+            # _close_bet leaves position OPEN on FOK cancel; success sets CLOSED_*
+            return open_positions[0].status != "OPEN"
 
         # --- REAL mode: multiple tranches, single sell ---
         import math as _math
@@ -818,7 +910,7 @@ class BetEngine:
         db.add(session)
 
         if not filled:
-            return
+            return True
 
         # For resolved markets: no CLOB sell — let redemption handle USDC
         fill_price = exit_price
@@ -857,13 +949,21 @@ class BetEngine:
                         pos.close_reason = exit_reason
                     db.add(pos)
                 db.add(session)
-                return
+                return True
             else:
                 sell_shares = _math.floor(actual * 100) / 100
 
             # Single CLOB sell for total balance
             try:
-                order_resp = self.place_real_sell(token_id, sell_shares)
+                order_resp = self.place_real_sell(token_id, sell_shares, whale_price=exit_price)
+                logger.info("_close_all_tranches SELL response: %s", order_resp)
+                _sell_status = (order_resp.get("status") or "").lower()
+                if _sell_status in ("cancelled", "canceled"):
+                    logger.warning(
+                        "_close_all_tranches: FOK order cancelled for %s — positions NOT closed, will retry",
+                        token_id[:16],
+                    )
+                    return False  # leave positions OPEN for next exit poll
                 if order_resp.get("status") == "no_position":
                     logger.error(
                         "_close_all_tranches: CLOB no_position selling %.4f shares of %s "
@@ -871,7 +971,7 @@ class BetEngine:
                         sell_shares, token_id[:16],
                         actual if actual is not None else db_total_shares,
                     )
-                    return  # leave positions OPEN for next exit poll
+                    return False  # leave positions OPEN for next exit poll
                 raw = (
                     order_resp.get("price")
                     or order_resp.get("avgPrice")
@@ -884,7 +984,7 @@ class BetEngine:
                     "_close_all_tranches: sell failed for %s: %s — positions NOT closed",
                     token_id[:16], exc,
                 )
-                return
+                return False
         else:
             logger.info(
                 "_close_all_tranches: resolved price %.4f — skipping CLOB sell, redemption will settle",
@@ -952,6 +1052,8 @@ class BetEngine:
                 "_close_all_tranches: bet %d → %s pnl=$%.2f (%.0f%% weight, scale=%.3f, refund=$%.2f) | balance -> $%.2f",
                 pos.id, pos.status, pos_pnl, weight * 100, fill_scale, refund, session.current_balance_usdc,
             )
+
+        return True
 
     # ------------------------------------------------------------------
     # Resolution checker
@@ -1065,14 +1167,22 @@ class BetEngine:
                         hours_since_close = (now - mc).total_seconds() / 3600
                         ARCHIVE_TIMEOUT_H = 2.0
                         if hours_since_close > ARCHIVE_TIMEOUT_H:
-                            if bet.mode not in session_cache:
-                                session_cache[bet.mode] = (
-                                    db.query(MonitoringSession)
-                                    .filter_by(mode=bet.mode)
-                                    .order_by(MonitoringSession.id.desc())
-                                    .first()
-                                )
-                            session_for_archive = session_cache.get(bet.mode)
+                            # Use the session that owns this bet (session_id FK).
+                            # Fall back to latest-by-mode only for legacy bets without session_id.
+                            if bet.session_id:
+                                if bet.session_id not in session_cache:
+                                    session_cache[bet.session_id] = db.get(MonitoringSession, bet.session_id)
+                                session_for_archive = session_cache.get(bet.session_id)
+                            else:
+                                _archive_mode_key = f"archive_mode:{bet.mode}"
+                                if _archive_mode_key not in session_cache:
+                                    session_cache[_archive_mode_key] = (
+                                        db.query(MonitoringSession)
+                                        .filter_by(mode=bet.mode)
+                                        .order_by(MonitoringSession.id.desc())
+                                        .first()
+                                    )
+                                session_for_archive = session_cache.get(_archive_mode_key)
                             if session_for_archive:
                                 fallback_price = self._resolve_archived_bet_price(bet)
                                 logger.warning(
@@ -1090,15 +1200,22 @@ class BetEngine:
                 # Must be computed before any case that references it
                 is_live_sport = bet.market_category in _LIVE_SPORTS
 
-                # Resolve the session for this bet's mode (cached)
-                if bet.mode not in session_cache:
-                    session_cache[bet.mode] = (
-                        db.query(MonitoringSession)
-                        .filter_by(mode=bet.mode)
-                        .order_by(MonitoringSession.id.desc())
-                        .first()
-                    )
-                session = session_cache.get(bet.mode)
+                # Resolve the session that OWNS this bet via session_id.
+                # Fall back to latest-by-mode only for legacy bets with no session_id.
+                if bet.session_id:
+                    if bet.session_id not in session_cache:
+                        session_cache[bet.session_id] = db.get(MonitoringSession, bet.session_id)
+                    session = session_cache.get(bet.session_id)
+                else:
+                    fallback_key = f"mode:{bet.mode}"
+                    if fallback_key not in session_cache:
+                        session_cache[fallback_key] = (
+                            db.query(MonitoringSession)
+                            .filter_by(mode=bet.mode)
+                            .order_by(MonitoringSession.id.desc())
+                            .first()
+                        )
+                    session = session_cache.get(fallback_key)
                 if not session:
                     continue
 
@@ -1298,6 +1415,189 @@ class BetEngine:
         finally:
             db.close()
 
+    def check_orphan_positions(self):
+        """
+        Close OPEN REAL positions where the whale has already exited on-chain.
+
+        When a CLOB sell is cancelled (FOK) or otherwise fails, the exit
+        poll's last_seen timestamp is still advanced — so the exit signal
+        is consumed and never re-fires.  This job is the safety net: it
+        queries each whale's current on-chain positions via the Data API
+        and closes our position in two cases:
+
+        1. Whale no longer holds the token at all.
+        2. Whale holds the token BUT re-bought after we opened our position
+           (detected by the presence of a WhaleBet EXIT record for this token
+           with timestamp > bet.opened_at in our own DB).
+
+        Case 2 handles the scenario where the whale exited and immediately
+        re-entered — their current position appears active, but the exit we
+        needed to copy already fired and failed.
+
+        Runs on the same interval as check_resolution.
+        Only acts on REAL-mode bets (simulation needs no on-chain check).
+        """
+        import requests as _requests
+
+        if not settings.credentials_valid():
+            return
+
+        db = SessionLocal()
+        try:
+            open_real_bets = (
+                db.query(CopiedBet)
+                .filter(CopiedBet.status == "OPEN", CopiedBet.mode == "REAL")
+                .all()
+            )
+            if not open_real_bets:
+                return
+
+            # Group bets by whale address so we fetch each whale's positions once
+            by_whale: dict[str, list] = {}
+            for bet in open_real_bets:
+                if bet.whale_address:
+                    by_whale.setdefault(bet.whale_address, []).append(bet)
+
+            for whale_address, bets in by_whale.items():
+                # Look up the Whale row once — needed for WhaleBet JOIN
+                whale_obj = db.query(Whale).filter_by(address=whale_address).first()
+
+                try:
+                    resp = _requests.get(
+                        f"{settings.DATA_API_BASE}/positions",
+                        params={"user": whale_address},
+                        timeout=10,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    whale_positions = (
+                        data if isinstance(data, list)
+                        else data.get("data", data.get("positions", []))
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "check_orphan_positions: failed to fetch positions for whale %s: %s",
+                        whale_address[:10], exc,
+                    )
+                    continue
+
+                # Tokens the whale currently holds (size > 0)
+                whale_held = {
+                    str(p.get("asset", "")).strip()
+                    for p in whale_positions
+                    if float(p.get("size", 0) or 0) > 0
+                }
+
+                for bet in bets:
+                    needs_close = False
+
+                    if bet.token_id not in whale_held:
+                        # Case 1: whale no longer holds the token at all
+                        needs_close = True
+                    elif whale_obj is not None:
+                        # Case 2: whale holds the token — check for a recorded EXIT
+                        # trade in our DB that occurred after we opened this position.
+                        # If one exists, they exited (and we failed to copy it) then
+                        # re-bought, so our original position is still orphaned.
+                        exit_after_open = (
+                            db.query(WhaleBet)
+                            .filter(
+                                WhaleBet.whale_id == whale_obj.id,
+                                WhaleBet.token_id == bet.token_id,
+                                WhaleBet.bet_type == "EXIT",
+                                WhaleBet.timestamp > bet.opened_at,
+                            )
+                            .first()
+                        )
+                        if exit_after_open:
+                            logger.info(
+                                "check_orphan_positions: bet %d — whale re-bought token %s "
+                                "(EXIT recorded at %s, bet opened at %s) — treating as orphan",
+                                bet.id, bet.token_id[:16],
+                                exit_after_open.timestamp, bet.opened_at,
+                            )
+                            needs_close = True
+
+                    if not needs_close:
+                        continue
+
+                    # Verify we still hold shares before attempting a sell
+                    our_shares = self._get_actual_position_size(bet.token_id)
+                    if our_shares is None:
+                        continue  # Data API error — skip, try next cycle
+
+                    if bet.session_id:
+                        session = db.get(MonitoringSession, bet.session_id)
+                    else:
+                        session = (
+                            db.query(MonitoringSession)
+                            .filter_by(mode=bet.mode)
+                            .order_by(MonitoringSession.id.desc())
+                            .first()
+                        )
+                    if not session:
+                        continue
+
+                    # Fetch live price for both branches — used as the whale_price
+                    # hint to place_real_sell so the FOK executes near current BBO.
+                    current_price = bet.price_at_entry
+                    try:
+                        if self._client is not None:
+                            clob = self._client._get_clob_client()
+                            pr = clob.get_price(bet.token_id, "BUY")
+                            if isinstance(pr, dict) and pr.get("price"):
+                                current_price = float(pr["price"])
+                    except Exception:
+                        pass
+
+                    if our_shares == 0.0:
+                        # Data API returned 0 — could be lag or a glitch; don't
+                        # ghost-close without verifying via the CLOB.  Call
+                        # _close_bet() with the DB-recorded size_shares: it will
+                        # attempt a real sell and let the CLOB be the arbiter.
+                        #
+                        # Outcomes handled by _close_bet():
+                        #   size_shares == 0 in DB     → CLOSED_NEUTRAL (unfilled buy)
+                        #   CLOB "no_position"         → CLOSED_NEUTRAL (confirmed absent)
+                        #   FOK cancelled              → leaves OPEN, retried next cycle
+                        #   Sell succeeds              → CLOSED_WIN/LOSS with real P&L
+                        logger.info(
+                            "check_orphan_positions: bet %d — Data API shows 0 shares, "
+                            "attempting CLOB sell (size_shares=%.4f) before closing neutral",
+                            bet.id, bet.size_shares,
+                        )
+                        self._close_bet(
+                            copied_bet=bet,
+                            current_price=current_price,
+                            session=session,
+                            db=db,
+                            close_reason="Orphan: whale exited, no shares on-chain",
+                        )
+                        db.commit()
+                    else:
+                        # We hold shares the whale no longer holds — sell at market
+                        logger.info(
+                            "check_orphan_positions: bet %d — whale exited token %s, "
+                            "we hold %.4f shares — closing at market",
+                            bet.id, bet.token_id[:16], our_shares,
+                        )
+
+                        bet.size_shares = our_shares
+                        self._close_bet(
+                            copied_bet=bet,
+                            current_price=current_price,
+                            session=session,
+                            db=db,
+                            close_reason="Orphan: whale exited, delayed sell",
+                        )
+                        db.commit()
+
+        except Exception as exc:
+            logger.error("check_orphan_positions error: %s", exc)
+            db.rollback()
+        finally:
+            db.close()
+
     async def _fetch_resolution_data(
         self, token_ids: list
     ) -> list[tuple[Optional[float], Optional[datetime], bool]]:
@@ -1307,10 +1607,14 @@ class BetEngine:
         to avoid rate-limiting on the Gamma API.  Each failed request is retried
         once after a short back-off before giving up and returning (None, None, False).
         """
-        MAX_CONCURRENT = 4
-        RETRY_DELAY = 1.5  # seconds
+        MAX_CONCURRENT = 2   # keep VPN pressure low — was 4, caused ReadTimeouts
+        RETRY_DELAY = 2.0    # seconds
 
         sem = asyncio.Semaphore(MAX_CONCURRENT)
+
+        # Use the same proxy as the main client so all traffic goes through the
+        # configured VPN proxy (not raw socket through gluetun network interface).
+        proxy = settings.PROXY_URL or None
 
         async def _fetch_with_limit(tid: str, http: httpx.AsyncClient):
             async with sem:
@@ -1321,7 +1625,11 @@ class BetEngine:
                     result = await self._get_resolution_data_async(tid, http)
                 return result
 
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as http:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            follow_redirects=True,
+            proxy=proxy,
+        ) as http:
             return await asyncio.gather(
                 *[_fetch_with_limit(tid, http) for tid in token_ids]
             )
@@ -1535,7 +1843,8 @@ class BetEngine:
         whale_bet: WhaleBet,
         session: MonitoringSession,
         db: DBSession,
-    ) -> Optional[CopiedBet]:
+        live_exit_price: Optional[float] = None,
+    ) -> Optional[CopiedBet | bool]:
         """Whale is selling out of a position.
 
         - Single tranche: always close it.
@@ -1570,38 +1879,53 @@ class BetEngine:
         whale_alias = (whale_bet.whale.alias or whale_bet.whale.address[:10]) if whale_bet.whale else "?"
         exit_reason = f"Whale exited ({whale_alias} sold @ {exit_price:.3f})"
 
+        # For simulation, use the live price at exit time so the fill mirrors what
+        # real mode would get from the CLOB (which fills at the current best bid,
+        # not the whale's historical sell price). Fall back to whale price if unavailable.
+        mode = open_positions[0].mode if open_positions else session.mode
+        sim_exit_price = (
+            live_exit_price
+            if (live_exit_price is not None and mode in ("SIMULATION", "HEDGE_SIM"))
+            else exit_price
+        )
+
+        close_ok: bool
         if len(open_positions) == 1:
             # Single tranche — always close regardless of fraction
             logger.info(
-                "_handle_exit: closing 1 tranche for whale %s token %s @ %.4f",
-                (exiting_whale_address or "?")[:10], whale_bet.token_id[:16], exit_price,
+                "_handle_exit: closing 1 tranche for whale %s token %s @ %.4f (sim fill @ %.4f)",
+                (exiting_whale_address or "?")[:10], whale_bet.token_id[:16], exit_price, sim_exit_price,
             )
-            self._close_all_tranches(open_positions, exit_price, session, db, exit_reason)
+            close_ok = self._close_all_tranches(open_positions, sim_exit_price, session, db, exit_reason)
         else:
             # Multiple tranches — determine full vs partial exit
             exit_fraction = self._compute_exit_fraction(whale_bet, db)
             if exit_fraction >= _FULL_EXIT_THRESHOLD:
                 logger.info(
                     "_handle_exit: full exit (%.0f%%) — closing all %d tranches "
-                    "for whale %s token %s @ %.4f",
+                    "for whale %s token %s @ %.4f (sim fill @ %.4f)",
                     exit_fraction * 100, len(open_positions),
-                    (exiting_whale_address or "?")[:10], whale_bet.token_id[:16], exit_price,
+                    (exiting_whale_address or "?")[:10], whale_bet.token_id[:16], exit_price, sim_exit_price,
                 )
-                self._close_all_tranches(open_positions, exit_price, session, db, exit_reason)
+                close_ok = self._close_all_tranches(open_positions, sim_exit_price, session, db, exit_reason)
             else:
                 # Partial exit — close oldest tranches first (FIFO)
                 n_to_close = max(1, round(len(open_positions) * exit_fraction))
                 to_close = open_positions[:n_to_close]
                 logger.info(
                     "_handle_exit: partial exit (%.0f%%) — closing %d of %d tranches "
-                    "for whale %s token %s @ %.4f, %d remain open",
+                    "for whale %s token %s @ %.4f (sim fill @ %.4f), %d remain open",
                     exit_fraction * 100, n_to_close, len(open_positions),
-                    (exiting_whale_address or "?")[:10], whale_bet.token_id[:16], exit_price,
+                    (exiting_whale_address or "?")[:10], whale_bet.token_id[:16], exit_price, sim_exit_price,
                     len(open_positions) - n_to_close,
                 )
-                self._close_all_tranches(to_close, exit_price, session, db, exit_reason)
+                close_ok = self._close_all_tranches(to_close, sim_exit_price, session, db, exit_reason)
 
         db.commit()
+        if not close_ok:
+            # Sell failed (FOK cancelled / exception) — signal to caller that
+            # _last_seen should NOT be advanced so the exit is retried next poll.
+            return False
         return open_positions[0]
 
     def _handle_add_to_position(
@@ -1767,7 +2091,7 @@ class BetEngine:
 
             try:
                 if mode in ("SIMULATION", "HEDGE_SIM"):
-                    size_shares, actual_price = self.simulate_buy(
+                    size_shares, actual_price, actual_cost = self.simulate_buy(
                         session=session,
                         market_id=item.market_info.get("conditionId", ""),
                         token_id=item.token_id,
@@ -1776,7 +2100,9 @@ class BetEngine:
                         price=live_price if live_price is not None else item.whale_price,
                         size_usdc=item.bet_size_usdc,
                         db=db,
+                        live_price=live_price,
                     )
+                    item.bet_size_usdc = actual_cost  # update cost basis to fee-inclusive amount
                 else:
                     order_resp = self.place_real_buy(
                         token_id=item.token_id,
@@ -1839,6 +2165,7 @@ class BetEngine:
         copied_bet = CopiedBet(
             whale_bet_id=whale_bet.id,
             whale_address=whale_bet.whale.address,
+            session_id=session.id,
             mode=session.mode,
             market_id=whale_bet.market_id,
             token_id=whale_bet.token_id,

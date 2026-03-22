@@ -205,11 +205,52 @@ class RiskCalculator:
 
         return True, ""
 
+    def check_fee_viability(
+        self,
+        entry_price: float,
+        fee_bps: int,
+        max_entry_price: float,
+        min_net_upside: float,
+    ) -> tuple[bool, str]:
+        """
+        Guard against REAL mode entries where the taker fee eliminates all upside.
+
+        Logic:
+            net_upside = (1 - entry_price) - (fee_bps / 10000)
+            If entry_price >= max_entry_price  →  skip
+            If net_upside < min_net_upside     →  skip
+
+        Returns:
+            (True,  "")             if safe to proceed
+            (False, reason_string)  if the bet should be skipped
+        """
+        if entry_price >= max_entry_price:
+            return (
+                False,
+                f"Entry price {entry_price:.3f} >= REAL_MAX_ENTRY_PRICE {max_entry_price:.3f} "
+                f"(insufficient upside after fees)",
+            )
+        upside = 1.0 - entry_price
+        fee_cost = fee_bps / 10000
+        net_upside = upside - fee_cost
+        if net_upside < min_net_upside:
+            return (
+                False,
+                f"Net upside after {fee_bps}bps fee = {net_upside:.3f} "
+                f"< REAL_MIN_NET_UPSIDE {min_net_upside:.3f} (entry={entry_price:.3f})",
+            )
+        logger.debug(
+            "Fee viability OK: entry=%.4f fee=%dbps upside=%.4f net=%.4f >= min %.4f",
+            entry_price, fee_bps, upside, net_upside, min_net_upside,
+        )
+        return True, ""
+
     def check_price_staleness(
         self,
         whale_price: float,
         live_price: Optional[float],
         max_drift: float,
+        max_upward_drift: Optional[float] = None,
     ) -> tuple[bool, str]:
         """
         Guard against copying a bet whose odds have moved significantly since
@@ -237,6 +278,17 @@ class RiskCalculator:
             return True, ""
 
         drift = abs(live_price - whale_price)
+
+        # REAL mode: apply a tighter cap specifically on upward drift (overpaying
+        # vs whale entry compounds with fees to make the trade unprofitable).
+        if max_upward_drift is not None and live_price > whale_price:
+            upward = live_price - whale_price
+            if upward > max_upward_drift:
+                return (
+                    False,
+                    f"Price has risen from {whale_price:.3f} to {live_price:.3f} "
+                    f"(+{upward:.3f} > REAL_MAX_UPWARD_DRIFT {max_upward_drift:.3f})",
+                )
 
         if drift <= max_drift:
             logger.debug(

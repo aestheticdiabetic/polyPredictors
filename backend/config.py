@@ -21,10 +21,19 @@ class Settings:
 
     # Simulation settings
     SIM_STARTING_BALANCE: float = float(os.getenv("SIM_STARTING_BALANCE", "200.0"))
+
+    # If True, simulation deducts taker fees from buy cost to mirror real mode P&L.
+    # Default False preserves existing fee-free behaviour. Enable to see realistic
+    # projections of what real mode would have returned.
+    SIM_APPLY_FEES: bool = os.getenv("SIM_APPLY_FEES", "false").lower() == "true"
+
+    # Assumed taker fee (bps) for simulation when SIM_APPLY_FEES=True.
+    # Most Polymarket markets have 0% fee; set to 1000 to stress-test profitability.
+    SIM_ASSUMED_FEE_BPS: int = int(os.getenv("SIM_ASSUMED_FEE_BPS", "0"))
     MAX_BET_PCT: float = float(os.getenv("MAX_BET_PCT", "0.05"))
 
     # Monitoring settings
-    POLLING_INTERVAL_SECONDS: int = int(os.getenv("POLLING_INTERVAL_SECONDS", "30"))
+    POLLING_INTERVAL_SECONDS: int = int(os.getenv("POLLING_INTERVAL_SECONDS", "5"))
     MIN_MARKET_HOURS_TO_CLOSE: float = float(os.getenv("MIN_MARKET_HOURS_TO_CLOSE", "1.0"))
 
     # How often (in seconds) the permanent resolution checker runs.
@@ -41,6 +50,20 @@ class Settings:
     # placed their bet and when we copy it.  E.g. 0.05 means: if the whale bet at
     # 0.20 and the current price is now above 0.25 or below 0.15, skip the bet.
     MAX_PRICE_DRIFT_PCT: float = float(os.getenv("MAX_PRICE_DRIFT_PCT", "0.05"))
+
+    # REAL mode only: tighter cap on upward price drift (current > whale price).
+    # Buying above the whale's entry compounds with fees to make the trade
+    # unprofitable. Default 0.02 = 2 probability points. Set to the same value as
+    # MAX_PRICE_DRIFT_PCT to disable asymmetric behaviour.
+    REAL_MAX_UPWARD_DRIFT: float = float(os.getenv("REAL_MAX_UPWARD_DRIFT", "0.02"))
+
+    # REAL mode only: maximum entry price allowed. Bets above this price have too
+    # little remaining upside to cover the taker fee. Default 0.80.
+    REAL_MAX_ENTRY_PRICE: float = float(os.getenv("REAL_MAX_ENTRY_PRICE", "0.80"))
+
+    # REAL mode only: minimum net upside required after fees before entering a bet.
+    # Net upside = (1 - entry_price) - (fee_bps / 10000). Default 0.05 = 5%.
+    REAL_MIN_NET_UPSIDE: float = float(os.getenv("REAL_MIN_NET_UPSIDE", "0.05"))
 
     # Minimum USDC to place on any single bet.  Set lower (e.g. 0.02) when following
     # a whale that places many small tracker bets on long-shot outcomes.
@@ -65,6 +88,15 @@ class Settings:
     # so volume is used as the practical proxy for high-activity traders.
     # A trader averaging $5 per prediction needs $100,000 vol for ~20,000 predictions.
     MIN_WHALE_VOLUME_USDC: float = float(os.getenv("MIN_WHALE_VOLUME_USDC", "1000000"))
+
+    # Maximum number of FOK retry attempts before declaring a sell exhausted.
+    # Default 3. Increase if your markets are thin and orders frequently cancel.
+    SELL_MAX_FOK_RETRIES: int = int(os.getenv("SELL_MAX_FOK_RETRIES", "3"))
+
+    # After FOK retry exhaustion, accept a fill at the current best bid regardless
+    # of drift from the whale's exit price. Prevents positions staying open forever
+    # when the market is moving fast. Default False = leave OPEN for next poll.
+    SELL_ACCEPT_DEGRADED_FILL: bool = os.getenv("SELL_ACCEPT_DEGRADED_FILL", "false").lower() == "true"
 
     # Optional: HTTP proxy URL for routing traffic through VPN (e.g. gluetun)
     PROXY_URL: str = os.getenv("PROXY_URL", "")

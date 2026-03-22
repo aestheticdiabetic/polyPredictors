@@ -51,6 +51,11 @@ class WhaleMonitor:
             id="check_resolution_always",
         )
         self._resolution_scheduler.add_job(
+            func=self._check_orphan_positions_wrapper,
+            trigger=IntervalTrigger(seconds=settings.RESOLUTION_CHECK_INTERVAL_SECONDS),
+            id="check_orphan_positions_always",
+        )
+        self._resolution_scheduler.add_job(
             func=self.poll_exits_only,
             trigger=IntervalTrigger(seconds=settings.POLLING_INTERVAL_SECONDS),
             id="poll_exits_always",
@@ -167,12 +172,14 @@ class WhaleMonitor:
             replace_existing=True,
         )
 
-        # Hourly wallet balance sync — keeps session.current_balance_usdc aligned
-        # with the live wallet so bet sizing stays accurate over long sessions.
+        # Frequent wallet balance sync — keeps session.current_balance_usdc aligned
+        # with the live wallet so bet sizing stays accurate.  5-minute cadence
+        # ensures a failed/stuck sell that under-reports available USDC doesn't
+        # block new bets for longer than one poll cycle.
         if settings.credentials_valid():
             self._scheduler.add_job(
                 func=self._sync_real_balance,
-                trigger=IntervalTrigger(hours=1),
+                trigger=IntervalTrigger(minutes=5),
                 id="sync_real_balance",
                 replace_existing=True,
             )
@@ -342,16 +349,20 @@ class WhaleMonitor:
                 try:
                     whale_bet = await self._save_whale_bet(trade, whale, ts, db)
                     if whale_bet:
-                        # Fetch market metadata and live price once, reuse for all sessions
-                        market_result, price_result = await asyncio.gather(
+                        # Fetch market metadata, live price, and taker fee in parallel.
+                        # The fee is used by the REAL mode fee-viability gate before
+                        # placing any order, avoiding the error-driven retry path.
+                        market_result, price_result, fee_result = await asyncio.gather(
                             self._client.get_market(
                                 whale_bet.market_id, token_id=whale_bet.token_id
                             ),
                             self._client.get_best_price(whale_bet.token_id),
+                            self._client.get_taker_fee_async(whale_bet.token_id),
                             return_exceptions=True,
                         )
                         market_info = market_result if isinstance(market_result, dict) else {}
                         live_price = price_result if isinstance(price_result, float) else None
+                        taker_fee_bps = fee_result if isinstance(fee_result, int) else 1000
 
                         # Process the whale bet for every active session (supports
                         # simultaneous SIMULATION + HEDGE_SIM for side-by-side comparison)
@@ -362,6 +373,7 @@ class WhaleMonitor:
                                 db=db,
                                 market_info=market_info,
                                 live_price=live_price,
+                                taker_fee_bps=taker_fee_bps,
                             )
 
                     if new_last_seen is None or ts > new_last_seen:
@@ -537,17 +549,32 @@ class WhaleMonitor:
                             new_last_seen = ts
                         continue
 
+                    # Fetch current live price so simulation fills at market price
+                    # rather than the whale's historical sell price.
+                    live_exit_price = None
+                    if token_id:
+                        try:
+                            live_exit_price = await self._client.get_best_price(token_id)
+                        except Exception:
+                            pass
+
                     # Route through _handle_exit for consistent partial/full exit
                     # logic (fraction-based tranche selection, same path as main scanner)
-                    self._bet_engine._handle_exit(whale_bet, session, db)
+                    exit_result = self._bet_engine._handle_exit(whale_bet, session, db, live_exit_price=live_exit_price)
                     db.commit()  # safety net — _handle_exit commits internally
 
                 except Exception as exc:
                     logger.error("_handle_exit_trades error for %s: %s", address[:10], exc)
                     db.rollback()
+                    exit_result = None  # exception path — treat as "no position found"
 
-                if new_last_seen is None or ts > new_last_seen:
-                    new_last_seen = ts
+                # Only advance _last_seen when the exit was handled successfully
+                # (sell went through) or when we had no position to close (None).
+                # If _handle_exit returned False the CLOB sell failed — don't
+                # consume the signal so the next poll retries automatically.
+                if exit_result is not False:
+                    if new_last_seen is None or ts > new_last_seen:
+                        new_last_seen = ts
 
             with self._lock:
                 if new_last_seen:
@@ -705,9 +732,9 @@ class WhaleMonitor:
     def _sync_real_balance(self):
         """
         Re-fetch the live wallet balance from Polymarket and update any active
-        REAL session's current_balance_usdc.  Runs hourly so bet sizing stays
-        accurate even if small discrepancies accumulate (e.g. partial fills,
-        gas costs, manual trades outside the copier).
+        REAL session's current_balance_usdc.  Runs every 5 minutes so a failed
+        or stuck sell that under-reports available USDC doesn't block new bets
+        for an extended period (e.g. partial fills, gas costs, manual trades).
         """
         try:
             balance = asyncio.run(self._client.get_wallet_balance())
@@ -750,6 +777,12 @@ class WhaleMonitor:
             self._bet_engine.check_resolution()
         except Exception as exc:
             logger.error("check_resolution error: %s", exc)
+
+    def _check_orphan_positions_wrapper(self):
+        try:
+            self._bet_engine.check_orphan_positions()
+        except Exception as exc:
+            logger.error("check_orphan_positions error: %s", exc)
 
     def _auto_redemption_job(self):
         """Periodically redeem resolved positions on-chain. Runs in permanent scheduler."""

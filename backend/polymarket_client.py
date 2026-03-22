@@ -365,6 +365,44 @@ class PolymarketClient:
         price = await self.get_last_trade_price(token_id)
         return price
 
+    async def get_taker_fee_async(self, token_id: str) -> int:
+        """
+        Return the taker fee in basis points for a token, using the cache where
+        possible (populated by buy retries) and falling back to the Gamma market
+        data (which includes a feeRateBps field).  Returns 1000 on any error so
+        the fee-viability gate stays conservative.
+        """
+        if token_id in self._taker_fee_cache:
+            return self._taker_fee_cache[token_id]
+
+        # Re-use already-cached market data to avoid an extra round-trip.
+        # get_market stores Gamma results under key "token:{token_id}".
+        cache_key = f"token:{token_id}"
+        cached = self._market_cache.get(cache_key)
+        market = cached[0] if cached else None
+
+        if market is None:
+            # Market data not yet cached — fetch it now.
+            try:
+                market = await self.get_market(token_id=token_id)
+            except Exception as exc:
+                logger.debug("get_taker_fee_async market fetch failed for %s: %s", token_id, exc)
+
+        if market and isinstance(market, dict):
+            raw = market.get("feeRateBps")
+            if raw is not None:
+                try:
+                    fee_bps = int(raw)
+                    self._taker_fee_cache[token_id] = fee_bps
+                    logger.debug("get_taker_fee_async: token %s → %d bps (from Gamma)", token_id[:16], fee_bps)
+                    return fee_bps
+                except (ValueError, TypeError):
+                    pass
+
+        # Fall back to conservative default so the viability gate doesn't under-estimate fees.
+        logger.debug("get_taker_fee_async: no feeRateBps for %s — using 1000 bps default", token_id[:16])
+        return 1000
+
     # ------------------------------------------------------------------
     # Authenticated CLOB  (py-clob-client)
     # ------------------------------------------------------------------
@@ -490,80 +528,142 @@ class PolymarketClient:
             logger.error("place_market_buy error: %s", exc)
             raise
 
-    def place_market_sell(self, token_id: str, size_shares: float) -> dict:
+    def place_market_sell(self, token_id: str, size_shares: float, whale_price: float = None) -> dict:
         """
         Place a real market sell order via py-clob-client.
         size_shares: number of shares to sell (from DB record).
+        whale_price: the price at which the whale exited (used as the drift anchor).
 
         create_market_order only supports BUY, so we use create_order with
-        side="SELL" and the current best bid price to get immediate fill.
+        side="SELL" + OrderType.FOK so the order fills immediately or is
+        cancelled (never left as a live GTC order in the book).
 
-        No balance pre-check: get_balance_allowance(CONDITIONAL) is unreliable
-        for proxy wallets and returns 0 even for valid positions. Instead we
-        attempt the sell directly; the CLOB will reject with "not enough
-        balance/allowance" if tokens are genuinely absent, which the caller
-        catches and maps to no_position.
+        If a FOK is cancelled (price ticked between fetch and submit), we
+        re-fetch the best bid and retry up to MAX_FOK_RETRIES times as long
+        as the new price is within MAX_PRICE_DRIFT_PCT of the whale's exit price.
+        Once drift exceeds that threshold we return the cancelled response so
+        the caller can leave the position OPEN for the next exit poll.
         """
+        import math as _math
         import re
+        from py_clob_client.client import OrderType
         from py_clob_client.clob_types import OrderArgs
 
         client = self._get_clob_client()
 
-        # Fetch price and tick size
-        price_resp = client.get_price(token_id, "BUY")
-        price = float(price_resp.get("price", 0)) if isinstance(price_resp, dict) else 0.0
-        if not price:
-            raise ValueError(f"Cannot determine sell price for token {token_id[:16]}")
+        # tick size is stable; fetch once up-front
         tick_size = float(client.get_tick_size(token_id))
         tick_dp = len(str(tick_size).rstrip("0").split(".")[-1]) if "." in str(tick_size) else 0
-        price = round(max(tick_size, min(price, 1.0 - tick_size)), tick_dp)
+        floored_shares = _math.floor(size_shares * 100) / 100
 
-        def _attempt(fee_bps: int) -> dict:
-            # Floor to 2dp to match the CLOB's own round_down applied when filling
-            # the original buy.  Using round() can produce 2.46 when we only hold
-            # 2.45, causing a spurious "not enough balance" rejection.
-            import math as _math
-            floored = _math.floor(size_shares * 100) / 100
+        def _fetch_bid() -> float:
+            price_resp = client.get_price(token_id, "BUY")
+            raw = float(price_resp.get("price", 0)) if isinstance(price_resp, dict) else 0.0
+            if not raw:
+                raise ValueError(f"Cannot determine sell price for token {token_id[:16]}")
+            return round(max(tick_size, min(raw, 1.0 - tick_size)), tick_dp)
+
+        def _submit(price: float, fee_bps: int) -> dict:
             order_args = OrderArgs(
                 token_id=token_id,
                 price=price,
-                size=floored,
+                size=floored_shares,
                 side="SELL",
                 fee_rate_bps=fee_bps,
             )
             signed_order = client.create_order(order_args)
-            resp = client.post_order(signed_order)
+            # FOK: fill immediately in full or cancel — never leaves a live order.
+            resp = client.post_order(signed_order, OrderType.FOK)
             return resp if isinstance(resp, dict) else {"status": "ok", "response": str(resp)}
 
-        fee = self._taker_fee_cache.get(token_id, 0)
-        try:
-            return _attempt(fee)
-        except Exception as exc:
-            exc_str = str(exc)
-            # Fee mismatch — parse required fee and retry once
-            match = re.search(r"taker fee[:\s]+(\d+)", exc_str, re.IGNORECASE)
-            if match:
-                required_fee = int(match.group(1))
-                if required_fee != fee:
+        def _submit_with_fee_retry(price: float) -> dict:
+            """Submit at price, retrying once on fee-mismatch error."""
+            current_fee = self._taker_fee_cache.get(token_id, 0)
+            try:
+                return _submit(price, current_fee)
+            except Exception as exc:
+                exc_str = str(exc)
+                match = re.search(r"taker fee[:\s]+(\d+)", exc_str, re.IGNORECASE)
+                if match:
+                    required_fee = int(match.group(1))
+                    if required_fee != current_fee:
+                        logger.warning(
+                            "place_market_sell: fee mismatch for %s — retrying with fee_rate_bps=%d",
+                            token_id[:16], required_fee,
+                        )
+                        self._taker_fee_cache[token_id] = required_fee
+                        try:
+                            return _submit(price, required_fee)
+                        except Exception as retry_exc:
+                            logger.error("place_market_sell error: %s", retry_exc)
+                            raise
+                if "not enough balance" in exc_str.lower() or "allowance" in exc_str.lower():
                     logger.warning(
-                        "place_market_sell: fee mismatch for %s — retrying with fee_rate_bps=%d",
-                        token_id[:16], required_fee,
+                        "place_market_sell: no balance/allowance for token %s — marking as no-position",
+                        token_id[:16],
                     )
-                    self._taker_fee_cache[token_id] = required_fee
-                    try:
-                        return _attempt(required_fee)
-                    except Exception as retry_exc:
-                        logger.error("place_market_sell error: %s", retry_exc)
-                        raise
-            # No tokens held — CLOB rejects with "not enough balance/allowance"
-            if "not enough balance" in exc_str.lower() or "allowance" in exc_str.lower():
+                    return {"status": "no_position", "size_matched": 0}
+                logger.error("place_market_sell error: %s", exc)
+                raise
+
+        max_fok_retries = settings.SELL_MAX_FOK_RETRIES
+        initial_price = _fetch_bid()
+        # Drift anchor: whale's exit price when provided, else first bid we fetched.
+        # Using the whale's price means we retry as long as the market is still
+        # near where the whale sold — if the market has moved far from that level
+        # something unusual is happening and we back off.
+        drift_anchor = float(whale_price) if whale_price is not None else initial_price
+        resp = {"status": "cancelled"}
+
+        for attempt in range(max_fok_retries):
+            if attempt == 0:
+                current_price = initial_price
+            else:
+                current_price = _fetch_bid()
+                drift = abs(current_price - drift_anchor)
+                if drift > settings.MAX_PRICE_DRIFT_PCT:
+                    logger.warning(
+                        "place_market_sell: price drifted from whale exit %.4f to %.4f "
+                        "(drift=%.4f exceeds limit=%.4f) — aborting retries",
+                        drift_anchor, current_price, drift, settings.MAX_PRICE_DRIFT_PCT,
+                    )
+                    # If degraded-fill mode is on, skip the drift guard and fall through
+                    # to the degraded fill below rather than returning immediately.
+                    if not settings.SELL_ACCEPT_DEGRADED_FILL:
+                        return {"status": "cancelled", "price": current_price}
+                    break
+
+            resp = _submit_with_fee_retry(current_price)
+            sell_status = (resp.get("status") or "").lower()
+            if sell_status not in ("cancelled", "canceled"):
+                return resp  # filled (or no_position / error)
+
+            logger.warning(
+                "place_market_sell: FOK cancelled at %.4f (attempt %d/%d)%s",
+                current_price, attempt + 1, max_fok_retries,
+                " — retrying at new market price" if attempt < max_fok_retries - 1 else " — all retries exhausted",
+            )
+
+        # All standard retries exhausted. If SELL_ACCEPT_DEGRADED_FILL is enabled,
+        # make one final attempt at the current best bid with no drift check.
+        # This prevents positions getting permanently stuck open.
+        if settings.SELL_ACCEPT_DEGRADED_FILL:
+            try:
+                degraded_price = _fetch_bid()
                 logger.warning(
-                    "place_market_sell: no balance/allowance for token %s — marking as no-position",
-                    token_id[:16],
+                    "place_market_sell: all retries exhausted — degraded fill attempt at %.4f "
+                    "(drift from anchor %.4f = %.4f, drift guard bypassed)",
+                    degraded_price, drift_anchor, abs(degraded_price - drift_anchor),
                 )
-                return {"status": "no_position", "size_matched": 0}
-            logger.error("place_market_sell error: %s", exc)
-            raise
+                resp = _submit_with_fee_retry(degraded_price)
+                sell_status = (resp.get("status") or "").lower()
+                if sell_status not in ("cancelled", "canceled"):
+                    return resp
+                logger.warning("place_market_sell: degraded fill also cancelled at %.4f", degraded_price)
+            except Exception as exc:
+                logger.error("place_market_sell: degraded fill error: %s", exc)
+
+        return resp
 
     async def get_wallet_balance(self) -> Optional[float]:
         """Fetch USDC balance for the configured funder address via authenticated CLOB API."""
