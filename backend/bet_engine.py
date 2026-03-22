@@ -200,7 +200,10 @@ class BetEngine:
             )
         else:
             whale_avg = whale.avg_bet_size_usdc if whale else 0.0
-            risk_factor = risk_calc.calculate_risk_factor(whale_bet.size_usdc, whale_avg)
+            risk_factor = risk_calc.calculate_risk_factor(
+                whale_bet.size_usdc, whale_avg,
+                conviction_exponent=settings.CONVICTION_EXPONENT,
+            )
             bet_size_usdc = risk_calc.calculate_bet_size(
                 session_balance=session.current_balance_usdc,
                 risk_factor=risk_factor,
@@ -269,25 +272,6 @@ class BetEngine:
                 db=db,
             )
 
-        if bet_size_usdc < settings.MIN_BET_USDC:
-            if mode == "REAL":
-                # Polymarket CLOB requires orders > $1 — skip rather than inflate
-                return self._create_skipped_bet(
-                    whale_bet=whale_bet,
-                    session=session,
-                    bet_size_usdc=bet_size_usdc,
-                    risk_factor=risk_factor,
-                    whale_avg=whale_avg,
-                    skip_reason=f"Below $1 minimum (${bet_size_usdc:.2f})",
-                    db=db,
-                )
-            # Simulation: clamp up so ledger always shows a valid size
-            bet_size_usdc = settings.MIN_BET_USDC
-            logger.debug(
-                "Bet size below minimum — clamping to $%.2f for whale_bet %d",
-                settings.MIN_BET_USDC, whale_bet.id,
-            )
-
         # Category filter — skip if this whale has disabled this sport or bet type
         cat_sport, cat_bet_type = classify(whale_bet.question)
         if whale and whale.category_filters:
@@ -353,6 +337,8 @@ class BetEngine:
 
         # Place or simulate
         entry_price = whale_bet.price
+        _post_fill_pnl: Optional[float] = None
+        _post_fill_sell_price: Optional[float] = None
         try:
             if mode in ("SIMULATION", "HEDGE_SIM"):
                 shares, actual_price, actual_cost = self.simulate_buy(
@@ -414,6 +400,32 @@ class BetEngine:
                                     " → entry_price=%.4f actual_cost=$%.4f",
                                     making_f, taking_f, entry_price, actual_cost,
                                 )
+                                # Post-fill guard: CLOB slippage can push the actual fill
+                                # above REAL_MAX_ENTRY_PRICE checked pre-order. Sell back
+                                # immediately to avoid being trapped in a fee-dominant trade.
+                                if entry_price >= settings.REAL_MAX_ENTRY_PRICE:
+                                    logger.warning(
+                                        "REAL BUY: fill %.4f >= REAL_MAX_ENTRY_PRICE %.4f "
+                                        "— selling back immediately",
+                                        entry_price, settings.REAL_MAX_ENTRY_PRICE,
+                                    )
+                                    try:
+                                        _sell_r = self.place_real_sell(
+                                            token_id=whale_bet.token_id,
+                                            size_shares=size_shares,
+                                        )
+                                        _post_fill_sell_price = float(
+                                            _sell_r.get("price")
+                                            or _sell_r.get("avgPrice")
+                                            or _sell_r.get("average_price")
+                                            or entry_price * 0.97
+                                        )
+                                    except Exception as _se:
+                                        logger.error("Post-fill emergency sell failed: %s", _se)
+                                        _post_fill_sell_price = entry_price * 0.97
+                                    _post_fill_pnl = round(
+                                        size_shares * _post_fill_sell_price - actual_cost, 4
+                                    )
                             else:
                                 # Zero amounts — fall back to whale price estimate
                                 entry_price = float(whale_bet.price)
@@ -434,11 +446,24 @@ class BetEngine:
                             "REAL BUY: takingAmount/makingAmount absent in response %s"
                             " — falling back to whale price %.4f", order_resp, entry_price,
                         )
-                # Deduct actual cost from session balance.
+                # Deduct actual cost from session balance, then refund sell proceeds
+                # if we immediately sold back due to post-fill overpay.
                 session.current_balance_usdc = max(0.0, session.current_balance_usdc - bet_size_usdc)
+                if _post_fill_sell_price is not None:
+                    sell_proceeds = round(size_shares * _post_fill_sell_price, 4)
+                    session.current_balance_usdc = min(
+                        session.current_balance_usdc + sell_proceeds,
+                        session.starting_balance_usdc,
+                    )
+                    bet_status = "CLOSED_LOSS"
+                    skip_reason_val = (
+                        f"Post-fill overpay: fill {entry_price:.4f} >= "
+                        f"REAL_MAX_ENTRY_PRICE {settings.REAL_MAX_ENTRY_PRICE:.4f}"
+                    )
+                else:
+                    bet_status = "OPEN"
+                    skip_reason_val = None
                 db.add(session)
-                bet_status = "OPEN"
-                skip_reason_val = None
         except Exception as exc:
             logger.error("Failed to place bet for whale_bet %d: %s", whale_bet.id, exc)
             return self._create_skipped_bet(
@@ -515,6 +540,17 @@ class BetEngine:
 
         # Update session counters
         session.total_bets_placed += 1
+
+        # If we immediately sold back due to post-fill overpay, record the realised loss.
+        if _post_fill_pnl is not None:
+            copied_bet.pnl_usdc = _post_fill_pnl
+            copied_bet.resolution_price = _post_fill_sell_price
+            copied_bet.closed_at = datetime.utcnow()
+            copied_bet.close_reason = skip_reason_val
+            session.total_losses += 1
+            session.total_pnl_usdc = round(session.total_pnl_usdc + _post_fill_pnl, 4)
+            db.add(session)
+
         db.commit()
         db.refresh(copied_bet)
 
@@ -1877,7 +1913,6 @@ class BetEngine:
 
         exit_price = whale_bet.price
         whale_alias = (whale_bet.whale.alias or whale_bet.whale.address[:10]) if whale_bet.whale else "?"
-        exit_reason = f"Whale exited ({whale_alias} sold @ {exit_price:.3f})"
 
         # For simulation, use the live price at exit time so the fill mirrors what
         # real mode would get from the CLOB (which fills at the current best bid,
@@ -1888,6 +1923,8 @@ class BetEngine:
             if (live_exit_price is not None and mode in ("SIMULATION", "HEDGE_SIM"))
             else exit_price
         )
+
+        exit_reason = f"Whale exited ({whale_alias} sold @ {exit_price:.3f}, we sold @ {sim_exit_price:.3f})"
 
         close_ok: bool
         if len(open_positions) == 1:
@@ -1943,7 +1980,10 @@ class BetEngine:
         """
         whale = whale_bet.whale
         whale_avg = whale.avg_bet_size_usdc if whale else 0.0
-        risk_factor = risk_calc.calculate_risk_factor(whale_bet.size_usdc, whale_avg)
+        risk_factor = risk_calc.calculate_risk_factor(
+            whale_bet.size_usdc, whale_avg,
+            conviction_exponent=settings.CONVICTION_EXPONENT,
+        )
         suggested_add_usdc = risk_calc.calculate_bet_size(
             session_balance=session.current_balance_usdc,
             risk_factor=risk_factor,
@@ -2058,14 +2098,71 @@ class BetEngine:
                     self._drift_watchlist.pop(whale_bet_id, None)
                 continue
 
-            # 3. Fetch a live price, bypassing the 30 s cache
+            # 3. Check the whale hasn't exited this token since the buy signal was skipped.
+            #    If a SELL WhaleBet exists for the same token recorded after the original
+            #    buy, the whale is no longer in the position — entering now would create
+            #    an instant orphan that the orphan checker must clean up at a loss.
+            original_wb = db.get(WhaleBet, whale_bet_id)
+            if original_wb:
+                later_sell = (
+                    db.query(WhaleBet)
+                    .filter(
+                        WhaleBet.whale_id == original_wb.whale_id,
+                        WhaleBet.token_id == item.token_id,
+                        WhaleBet.side == "SELL",
+                        WhaleBet.timestamp > original_wb.timestamp,
+                    )
+                    .first()
+                )
+                if later_sell:
+                    logger.info(
+                        "Drift watchlist: whale_bet=%d aborted — whale exited token %s...%s "
+                        "at %s (after buy at %s) — removing",
+                        whale_bet_id, item.token_id[:10], item.token_id[-6:],
+                        later_sell.timestamp, original_wb.timestamp,
+                    )
+                    with self._drift_lock:
+                        self._drift_watchlist.pop(whale_bet_id, None)
+                    continue
+
+            # 4. Add-to-position guard: skip if we already hold an OPEN position at a
+            #    similar price for this token/whale. The drift-skipped entry would
+            #    create a duplicate tranche rather than a meaningful new position.
+            _SAME_PRICE_TOLERANCE = 0.03
+            if original_wb:
+                whale_addr = original_wb.whale.address if original_wb.whale else None
+                if whale_addr:
+                    _existing = (
+                        db.query(CopiedBet)
+                        .filter(
+                            CopiedBet.whale_address == whale_addr,
+                            CopiedBet.token_id == item.token_id,
+                            CopiedBet.status == "OPEN",
+                            CopiedBet.mode == session.mode,
+                        )
+                        .all()
+                    )
+                    if _existing:
+                        _closest = min(_existing, key=lambda p: abs(item.whale_price - p.price_at_entry))
+                        if abs(item.whale_price - _closest.price_at_entry) <= _SAME_PRICE_TOLERANCE:
+                            logger.info(
+                                "Drift watchlist: whale_bet=%d — open position already exists "
+                                "at %.3f (retry price %.3f within %.2f tolerance) — removing",
+                                whale_bet_id, _closest.price_at_entry,
+                                item.whale_price, _SAME_PRICE_TOLERANCE,
+                            )
+                            with self._drift_lock:
+                                self._drift_watchlist.pop(whale_bet_id, None)
+                            continue
+
+            # 5. Fetch a live price, bypassing the 30 s cache
             try:
                 live_price = await self._client.get_best_price(item.token_id, force_refresh=True)
             except Exception as exc:
                 logger.debug("Drift watchlist: price fetch failed for whale_bet=%d: %s", whale_bet_id, exc)
                 continue
 
-            # 4. Re-check drift only — all other guards already passed
+            # 6. Re-check drift only — all other guards already passed
             price_ok, price_reason = risk_calc.check_price_staleness(
                 whale_price=item.whale_price,
                 live_price=live_price,
@@ -2078,17 +2175,8 @@ class BetEngine:
                 )
                 continue
 
-            # 5. Price is back in range — check minimum before executing
+            # 7. Price is back in range — execute
             mode = session.mode
-            if mode == "REAL" and item.bet_size_usdc < settings.MIN_BET_USDC:
-                logger.info(
-                    "Drift watchlist: whale_bet=%d skipped — size $%.2f below $1 minimum",
-                    whale_bet_id, item.bet_size_usdc,
-                )
-                with self._drift_lock:
-                    self._drift_watchlist.pop(whale_bet_id, None)
-                continue
-
             try:
                 if mode in ("SIMULATION", "HEDGE_SIM"):
                     size_shares, actual_price, actual_cost = self.simulate_buy(
@@ -2125,7 +2213,7 @@ class BetEngine:
                     self._drift_watchlist.pop(whale_bet_id, None)
                 continue
 
-            # 6. Upgrade the existing SKIPPED record to OPEN in-place
+            # 8. Upgrade the existing SKIPPED record to OPEN in-place
             copied_bet = db.get(CopiedBet, item.copied_bet_id)
             if copied_bet is None:
                 logger.warning("Drift watchlist: CopiedBet %d not found — removing", item.copied_bet_id)

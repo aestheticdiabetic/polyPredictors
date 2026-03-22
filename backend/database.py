@@ -165,6 +165,7 @@ class CopiedBet(Base):
 
     # Resolution
     pnl_usdc = Column(Float, nullable=True)
+    gas_fees_usdc = Column(Float, nullable=True)   # gas cost allocated to this position
     resolution_price = Column(Float, nullable=True)
 
     # Categorisation
@@ -204,6 +205,8 @@ class CopiedBet(Base):
             "skip_reason": self.skip_reason,
             "close_reason": self.close_reason,
             "pnl_usdc": round(self.pnl_usdc, 2) if self.pnl_usdc is not None else None,
+            "gas_fees_usdc": round(self.gas_fees_usdc, 4) if self.gas_fees_usdc is not None else None,
+            "net_pnl_usdc": round(self.pnl_usdc - (self.gas_fees_usdc or 0.0), 2) if self.pnl_usdc is not None else None,
             "resolution_price": round(self.resolution_price, 4) if self.resolution_price is not None else None,
             "market_category": self.market_category,
             "bet_type": self.bet_type,
@@ -276,6 +279,7 @@ class MonitoringSession(Base):
     total_wins = Column(Integer, default=0, nullable=False)
     total_losses = Column(Integer, default=0, nullable=False)
     total_pnl_usdc = Column(Float, default=0.0, nullable=False)
+    total_gas_fees_usdc = Column(Float, default=0.0, nullable=False)
 
     def to_dict(self) -> dict:
         win_rate = (self.total_wins / self.total_bets_placed * 100) if self.total_bets_placed > 0 else 0
@@ -297,6 +301,8 @@ class MonitoringSession(Base):
             "total_losses": self.total_losses,
             "win_rate_pct": round(win_rate, 1),
             "total_pnl_usdc": round(self.total_pnl_usdc, 2),
+            "total_gas_fees_usdc": round(self.total_gas_fees_usdc or 0.0, 4),
+            "net_pnl_usdc": round((self.total_pnl_usdc or 0.0) - (self.total_gas_fees_usdc or 0.0), 2),
             "duration_seconds": duration_seconds,
         }
 
@@ -342,6 +348,8 @@ def _migrate():
         ("add_to_position_signals", "suggested_add_usdc",  "FLOAT"),
         ("add_to_position_signals", "addition_count",      "INTEGER DEFAULT 1"),
         ("add_to_position_signals", "last_addition_at",    "DATETIME"),
+        ("sessions",               "total_gas_fees_usdc", "FLOAT DEFAULT 0.0"),
+        ("copied_bets",            "gas_fees_usdc",       "FLOAT"),
     ]
     sa = __import__("sqlalchemy")
     with engine.connect() as conn:

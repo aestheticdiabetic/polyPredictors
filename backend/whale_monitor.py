@@ -70,6 +70,23 @@ class WhaleMonitor:
                 "Auto-redemption job registered (every %ds)",
                 settings.REDEMPTION_CHECK_INTERVAL_SECONDS,
             )
+
+        if settings.CHAIN_EXIT_ENABLED:
+            from backend.whale_chain_monitor import WhaleChainMonitor
+            self._chain_monitor = WhaleChainMonitor(self._bet_engine, self)
+            self._resolution_scheduler.add_job(
+                func=self._chain_monitor.poll,
+                trigger=IntervalTrigger(seconds=settings.CHAIN_EXIT_POLL_INTERVAL_SECONDS),
+                id="chain_exit_monitor",
+                replace_existing=True,
+                max_instances=2,
+            )
+            logger.info(
+                "On-chain exit monitor registered (every %ds) — "
+                "activity-API exit polling suppressed",
+                settings.CHAIN_EXIT_POLL_INTERVAL_SECONDS,
+            )
+
         self._resolution_scheduler.start()
         logger.info(
             "Permanent background scheduler started "
@@ -410,9 +427,13 @@ class WhaleMonitor:
 
         Skipped when the main scanner is active — it already handles exits
         as part of full trade processing.
+        Skipped when on-chain monitoring is active — chain monitor handles exits
+        with block-number deduplication and no _last_seen signal-loss risk.
         """
         if self._running:
             return  # main scanner covers this
+        if settings.CHAIN_EXIT_ENABLED:
+            return  # chain monitor covers this
 
         db = SessionLocal()
         try:
@@ -787,14 +808,64 @@ class WhaleMonitor:
     def _auto_redemption_job(self):
         """Periodically redeem resolved positions on-chain. Runs in permanent scheduler."""
         from backend.redemption import check_and_redeem
+        from backend.database import CopiedBet, MonitoringSession, SessionLocal
         try:
             result = asyncio.run(check_and_redeem())
             redeemed = result.get("redeemed", 0)
-            if redeemed > 0:
+            total_gas_matic = result.get("total_gas_matic", 0.0)
+            if redeemed > 0 or total_gas_matic > 0:
                 total = result.get("total_value", 0.0)
+                total_gas_usdc = round(total_gas_matic * settings.MATIC_USD_PRICE, 6)
                 logger.info(
-                    "Auto-redeemed %d position(s) for $%.2f", redeemed, total
+                    "Auto-redeemed %d position(s) for $%.2f (gas=%.6f MATIC ≈ $%.4f)",
+                    redeemed, total, total_gas_matic, total_gas_usdc,
                 )
+                if total_gas_usdc > 0:
+                    db = SessionLocal()
+                    try:
+                        # Allocate gas per-bet: distribute each position's gas cost
+                        # proportionally across all closed tranches for that market_id.
+                        for pos_info in result.get("redeemed_positions", []):
+                            condition_id = pos_info.get("condition_id", "")
+                            pos_gas_usdc = round(pos_info.get("gas_matic", 0.0) * settings.MATIC_USD_PRICE, 6)
+                            if not condition_id or pos_gas_usdc <= 0:
+                                continue
+                            tranches = (
+                                db.query(CopiedBet)
+                                .filter(
+                                    CopiedBet.market_id == condition_id,
+                                    CopiedBet.mode == "REAL",
+                                    CopiedBet.status.in_(["CLOSED_WIN", "CLOSED_LOSS", "CLOSED_NEUTRAL"]),
+                                    CopiedBet.gas_fees_usdc == None,  # noqa: E711 — SQLAlchemy IS NULL
+                                )
+                                .all()
+                            )
+                            if not tranches:
+                                continue
+                            total_size = sum(t.size_usdc for t in tranches) or 1.0
+                            for tranche in tranches:
+                                share = tranche.size_usdc / total_size
+                                tranche.gas_fees_usdc = round(pos_gas_usdc * share, 6)
+                                db.add(tranche)
+
+                        # Accumulate on session totals
+                        session = (
+                            db.query(MonitoringSession)
+                            .filter_by(mode="REAL", is_active=True)
+                            .order_by(MonitoringSession.id.desc())
+                            .first()
+                        )
+                        if session:
+                            session.total_gas_fees_usdc = round(
+                                (session.total_gas_fees_usdc or 0.0) + total_gas_usdc, 6
+                            )
+                            db.add(session)
+                        db.commit()
+                    except Exception as db_exc:
+                        logger.error("Failed to record gas fees: %s", db_exc)
+                        db.rollback()
+                    finally:
+                        db.close()
         except Exception as exc:
             logger.error("Auto-redemption job error: %s", exc)
 

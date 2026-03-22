@@ -26,13 +26,24 @@ class RiskCalculator:
         self,
         whale_bet_usdc: float,
         whale_avg_bet_usdc: float,
+        conviction_exponent: float = 1.0,
     ) -> float:
         """
         Compute risk factor as ratio of current bet to whale's average bet.
 
-        Formula:  risk_factor = whale_bet_usdc / whale_avg_bet_usdc
+        When conviction_exponent == 1.0 (default): linear scaling, identical to
+        previous behaviour — clamped to [MIN_RISK_FACTOR, MAX_RISK_FACTOR].
 
-        Clamped to [MIN_RISK_FACTOR, MAX_RISK_FACTOR].
+        When conviction_exponent > 1.0: convex curve applied to above-average
+        conviction (conviction >= 1.0).  This rewards high-conviction bets
+        disproportionately while keeping the below-average range linear.
+
+            conviction = whale_bet / whale_avg
+            if conviction >= 1.0:
+                risk_factor = min(conviction ** exponent, MAX_RISK_FACTOR)
+            else:
+                risk_factor = max(conviction, MIN_RISK_FACTOR)
+
         If whale average is zero or unknown, returns 1.0 (neutral).
         """
         if whale_avg_bet_usdc <= 0:
@@ -42,16 +53,22 @@ class RiskCalculator:
             )
             return 1.0
 
-        raw = whale_bet_usdc / whale_avg_bet_usdc
-        clamped = max(_MIN_RISK_FACTOR, min(_MAX_RISK_FACTOR, raw))
+        conviction = whale_bet_usdc / whale_avg_bet_usdc
+
+        if conviction >= 1.0:
+            raw = min(conviction ** conviction_exponent, _MAX_RISK_FACTOR)
+        else:
+            raw = max(conviction, _MIN_RISK_FACTOR)
+
         logger.debug(
-            "Risk factor: %.2f / %.2f = %.3f -> clamped %.3f",
+            "Risk factor: %.2f / %.2f = conviction %.3f -> rf %.3f (exponent=%.2f)",
             whale_bet_usdc,
             whale_avg_bet_usdc,
+            conviction,
             raw,
-            clamped,
+            conviction_exponent,
         )
-        return clamped
+        return raw
 
     def calculate_bet_size(
         self,

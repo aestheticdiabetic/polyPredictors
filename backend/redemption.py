@@ -13,6 +13,24 @@ USDC_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 
+ORDER_FILLED_ABI = [
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True,  "name": "orderHash",        "type": "bytes32"},
+            {"indexed": True,  "name": "maker",             "type": "address"},
+            {"indexed": True,  "name": "taker",             "type": "address"},
+            {"indexed": False, "name": "makerAssetId",      "type": "uint256"},
+            {"indexed": False, "name": "takerAssetId",      "type": "uint256"},
+            {"indexed": False, "name": "makerAmountFilled", "type": "uint256"},
+            {"indexed": False, "name": "takerAmountFilled", "type": "uint256"},
+            {"indexed": False, "name": "fee",               "type": "uint256"},
+        ],
+        "name": "OrderFilled",
+        "type": "event",
+    }
+]
+
 REDEEM_ABI = [
     {
         "inputs": [
@@ -62,8 +80,9 @@ async def redeem_position(position: dict) -> dict:
         exchange_addr = NEG_RISK_CTF_EXCHANGE if neg_risk else CTF_EXCHANGE
 
         w3 = Web3(Web3.HTTPProvider(settings.POLYGON_RPC_URL))
-        wallet = Web3.to_checksum_address(settings.POLY_FUNDER_ADDRESS)
         private_key = settings.POLY_PRIVATE_KEY
+        account = w3.eth.account.from_key(private_key)
+        wallet = account.address
 
         exchange = w3.eth.contract(
             address=Web3.to_checksum_address(exchange_addr),
@@ -92,11 +111,12 @@ async def redeem_position(position: dict) -> dict:
 
         if receipt["status"] == 1:
             value = float(position.get("currentValue", 0))
+            gas_matic = receipt["gasUsed"] * int(gas_price * 1.1) / 1e18
             log.info(
-                "Redeemed position conditionId=%s tx=%s value=$%.2f",
-                condition_id[:16], tx_hash.hex()[:16], value,
+                "Redeemed position conditionId=%s tx=%s value=$%.2f gas=%.6f MATIC",
+                condition_id[:16], tx_hash.hex()[:16], value, gas_matic,
             )
-            return {"success": True, "tx_hash": tx_hash.hex(), "value": value}
+            return {"success": True, "tx_hash": tx_hash.hex(), "value": value, "gas_matic": gas_matic}
         else:
             return {"error": "Transaction failed", "tx_hash": tx_hash.hex()}
 
@@ -111,7 +131,9 @@ async def check_and_redeem() -> dict:
         return {"skipped": True, "reason": "no_credentials"}
 
     try:
-        positions = await get_redeemable_positions(settings.POLY_FUNDER_ADDRESS)
+        from web3 import Web3
+        wallet_address = Web3().eth.account.from_key(settings.POLY_PRIVATE_KEY).address
+        positions = await get_redeemable_positions(wallet_address)
         if not positions:
             return {"redeemed": 0, "failed": 0, "total_value": 0.0}
 
@@ -120,17 +142,31 @@ async def check_and_redeem() -> dict:
         redeemed = 0
         failed = 0
         total_value = 0.0
+        total_gas_matic = 0.0
+        redeemed_positions: list[dict] = []
 
         for position in positions:
             result = await redeem_position(position)
             if result.get("success"):
                 redeemed += 1
                 total_value += result.get("value", 0.0)
+                gas_matic = result.get("gas_matic", 0.0)
+                total_gas_matic += gas_matic
+                redeemed_positions.append({
+                    "condition_id": position.get("conditionId", ""),
+                    "gas_matic": gas_matic,
+                })
             else:
                 failed += 1
                 log.error("Failed to redeem position: %s", result.get("error"))
 
-        return {"redeemed": redeemed, "failed": failed, "total_value": total_value}
+        return {
+            "redeemed": redeemed,
+            "failed": failed,
+            "total_value": total_value,
+            "total_gas_matic": total_gas_matic,
+            "redeemed_positions": redeemed_positions,
+        }
 
     except Exception as e:
         log.error("check_and_redeem error: %s", e)

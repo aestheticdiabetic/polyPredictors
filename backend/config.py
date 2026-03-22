@@ -69,6 +69,11 @@ class Settings:
     # a whale that places many small tracker bets on long-shot outcomes.
     MIN_BET_USDC: float = float(os.getenv("MIN_BET_USDC", "1.0"))
 
+    # Exponent applied to conviction ratios >= 1.0 when computing the risk factor.
+    # 1.0 = linear (original behaviour). 1.5 = convex curve that rewards high
+    # conviction bets disproportionately (e.g. 2x avg → 2.83x factor vs 2.0x before).
+    CONVICTION_EXPONENT: float = float(os.getenv("CONVICTION_EXPONENT", "1.5"))
+
     # Drift-skip retry watchlist — for near-expiry markets that were skipped due to
     # price drift, re-check the price this often (seconds) and for this long (seconds).
     # Lower DRIFT_RETRY_INTERVAL = more responsive; higher DRIFT_RETRY_WINDOW = more
@@ -82,6 +87,18 @@ class Settings:
 
     # Polygon RPC URL used for on-chain redemption transactions.
     POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+
+    # On-chain exit monitoring via Polygon eth_getLogs (CTF Exchange OrderFilled events).
+    # When true, replaces activity-API exit polling with block-native detection.
+    # Requires a reliable POLYGON_RPC_URL — default public RPC may have rate limits.
+    CHAIN_EXIT_ENABLED: bool = os.getenv("CHAIN_EXIT_ENABLED", "false").lower() == "true"
+
+    # Poll interval for on-chain exit monitoring. Polygon blocks confirm every ~2s,
+    # so 2s gives ~4s worst-case detection latency (poll wait + block time).
+    CHAIN_EXIT_POLL_INTERVAL_SECONDS: int = int(os.getenv("CHAIN_EXIT_POLL_INTERVAL_SECONDS", "2"))
+
+    # Blocks to look back on first start (Polygon ~2s/block → 150 blocks ≈ 5 min).
+    CHAIN_EXIT_LOOKBACK_BLOCKS: int = int(os.getenv("CHAIN_EXIT_LOOKBACK_BLOCKS", "150"))
 
     # Minimum USDC trading volume a leaderboard trader must have to appear in the
     # Discover Whales modal.  The Polymarket API does not expose a prediction count,
@@ -97,6 +114,11 @@ class Settings:
     # of drift from the whale's exit price. Prevents positions staying open forever
     # when the market is moving fast. Default False = leave OPEN for next poll.
     SELL_ACCEPT_DEGRADED_FILL: bool = os.getenv("SELL_ACCEPT_DEGRADED_FILL", "false").lower() == "true"
+
+    # MATIC/USD conversion rate used to convert Polygon gas fees to USDC for P&L tracking.
+    # Update when MATIC price drifts significantly. Gas costs are small (< $0.05/tx)
+    # so a stale rate has minimal impact on overall P&L accuracy.
+    MATIC_USD_PRICE: float = float(os.getenv("MATIC_USD_PRICE", "0.35"))
 
     # Optional: HTTP proxy URL for routing traffic through VPN (e.g. gluetun)
     PROXY_URL: str = os.getenv("PROXY_URL", "")
