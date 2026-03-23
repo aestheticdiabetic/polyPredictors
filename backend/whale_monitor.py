@@ -5,13 +5,14 @@ on a fixed interval without conflicting with FastAPI's event loop.
 """
 
 import asyncio
+import contextlib
 import logging
 import threading
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from sqlalchemy.exc import IntegrityError
 
 from backend.config import settings
 from backend.database import (
@@ -35,9 +36,7 @@ class WhaleMonitor:
         self._bet_engine = bet_engine
         self._client = polymarket_client
 
-        self._scheduler = BackgroundScheduler(
-            job_defaults={"max_instances": 1, "coalesce": True}
-        )
+        self._scheduler = BackgroundScheduler(job_defaults={"max_instances": 1, "coalesce": True})
         self._lock = threading.Lock()
 
         # Permanent resolution scheduler — runs regardless of session state so
@@ -73,6 +72,7 @@ class WhaleMonitor:
 
         if settings.CHAIN_EXIT_ENABLED:
             from backend.whale_chain_monitor import WhaleChainMonitor
+
             self._chain_monitor = WhaleChainMonitor(self._bet_engine, self)
             self._resolution_scheduler.add_job(
                 func=self._chain_monitor.poll,
@@ -89,8 +89,7 @@ class WhaleMonitor:
 
         self._resolution_scheduler.start()
         logger.info(
-            "Permanent background scheduler started "
-            "(resolution every %ds, exit polling every %ds)",
+            "Permanent background scheduler started (resolution every %ds, exit polling every %ds)",
             settings.RESOLUTION_CHECK_INTERVAL_SECONDS,
             settings.POLLING_INTERVAL_SECONDS,
         )
@@ -98,7 +97,7 @@ class WhaleMonitor:
         # { whale_address: datetime } - last seen trade timestamp per whale
         self._last_seen: dict[str, datetime] = {}
 
-        self._session_id: Optional[int] = None
+        self._session_id: int | None = None
         self._running = False
 
         # Load last-seen timestamps from DB on init
@@ -126,11 +125,12 @@ class WhaleMonitor:
                 if latest and latest.timestamp:
                     ts = latest.timestamp
                     if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=timezone.utc)
+                        ts = ts.replace(tzinfo=UTC)
                     self._last_seen[whale.address] = ts
                     logger.debug(
                         "Initialized last_seen for %s: %s",
-                        whale.address[:10], ts.isoformat(),
+                        whale.address[:10],
+                        ts.isoformat(),
                     )
         except Exception as exc:
             logger.error("_init_last_seen error: %s", exc)
@@ -147,7 +147,9 @@ class WhaleMonitor:
         """
         with self._lock:
             if self._running:
-                logger.debug("Monitor already running — new session will be picked up automatically")
+                logger.debug(
+                    "Monitor already running — new session will be picked up automatically"
+                )
                 return
             self._running = True
 
@@ -189,6 +191,21 @@ class WhaleMonitor:
             replace_existing=True,
         )
 
+        # Price pre-fetching — keeps CLOB prices fresh for all open-position tokens
+        # so the price cache is never more than PRICE_PREFETCH_INTERVAL_SECONDS stale
+        # when a new whale trade fires.
+        if settings.PRICE_PREFETCH_INTERVAL_SECONDS > 0:
+            self._scheduler.add_job(
+                func=self._run_price_prefetch,
+                trigger=IntervalTrigger(seconds=settings.PRICE_PREFETCH_INTERVAL_SECONDS),
+                id="price_prefetch",
+                replace_existing=True,
+            )
+            logger.info(
+                "Price pre-fetch job registered (every %ds)",
+                settings.PRICE_PREFETCH_INTERVAL_SECONDS,
+            )
+
         # Frequent wallet balance sync — keeps session.current_balance_usdc aligned
         # with the live wallet so bet sizing stays accurate.  5-minute cadence
         # ensures a failed/stuck sell that under-reports available USDC doesn't
@@ -215,11 +232,15 @@ class WhaleMonitor:
 
         logger.info("Stopping whale monitor")
 
-        for job_id in ("poll_whales", "refresh_risk_profiles", "drift_retry", "sync_real_balance"):
-            try:
+        for job_id in (
+            "poll_whales",
+            "refresh_risk_profiles",
+            "drift_retry",
+            "sync_real_balance",
+            "price_prefetch",
+        ):
+            with contextlib.suppress(Exception):
                 self._scheduler.remove_job(job_id)
-            except Exception:
-                pass
 
         logger.info("Whale monitor stopped (resolution checker still running)")
 
@@ -253,6 +274,40 @@ class WhaleMonitor:
         finally:
             db.close()
 
+    def _run_price_prefetch(self):
+        """
+        Sync wrapper for _prefetch_prices.
+        Runs every PRICE_PREFETCH_INTERVAL_SECONDS to keep CLOB prices fresh
+        for all tokens in open positions. No-ops if there are no open positions.
+        """
+        asyncio.run(self._prefetch_prices())
+
+    async def _prefetch_prices(self):
+        """
+        Fetch fresh BUY prices for every distinct token_id that has an open
+        CopiedBet. Results are stored in the client's price cache so that
+        check_whale_activity finds an up-to-date price immediately on the
+        next poll tick rather than waiting for a live HTTP fetch.
+        """
+        db = SessionLocal()
+        try:
+            rows = db.query(CopiedBet.token_id).filter_by(status="OPEN").distinct().all()
+            token_ids = [r[0] for r in rows if r[0]]
+        except Exception as exc:
+            logger.error("_prefetch_prices: DB error: %s", exc)
+            return
+        finally:
+            db.close()
+
+        if not token_ids:
+            return
+
+        await asyncio.gather(
+            *[self._client.get_best_price(tid, force_refresh=True) for tid in token_ids],
+            return_exceptions=True,
+        )
+        logger.debug("Price pre-fetch: refreshed %d token(s)", len(token_ids))
+
     def poll_whales(self):
         """
         Called on each scheduler tick.
@@ -265,10 +320,7 @@ class WhaleMonitor:
         # Fix #3a: query only the address column — no need for full ORM objects
         db = SessionLocal()
         try:
-            addresses = [
-                row[0]
-                for row in db.query(Whale.address).filter_by(is_active=True).all()
-            ]
+            addresses = [row[0] for row in db.query(Whale.address).filter_by(is_active=True).all()]
         except Exception as exc:
             logger.error("poll_whales: failed to load whales: %s", exc)
             return
@@ -293,18 +345,16 @@ class WhaleMonitor:
             return_exceptions=True,
         )
 
-        for address, trades in zip(addresses, fetch_results):
+        for address, trades in zip(addresses, fetch_results, strict=False):
             if isinstance(trades, Exception):
-                logger.error(
-                    "Error fetching activity for whale %s: %s", address[:10], trades
-                )
+                logger.error("Error fetching activity for whale %s: %s", address[:10], trades)
                 continue
             try:
                 await self.check_whale_activity(address, trades or [])
             except Exception as exc:
                 logger.error("Error processing whale %s: %s", address[:10], exc)
 
-    async def check_whale_activity(self, address: str, trades: list = None):
+    async def check_whale_activity(self, address: str, trades: list | None = None):
         """
         Process new trades for a whale.  When called from _poll_all_async the
         trades list is already fetched (parallel); passing None triggers a
@@ -319,7 +369,7 @@ class WhaleMonitor:
             return
 
         last_seen = self._last_seen.get(address)
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(UTC)
         max_age_seconds = settings.MAX_TRADE_AGE_HOURS * 3600
         new_trades = []
 
@@ -345,7 +395,8 @@ class WhaleMonitor:
         new_trades.sort(key=lambda x: x[0])
         logger.info(
             "Found %d new trades for whale %s",
-            len(new_trades), address[:10],
+            len(new_trades),
+            address[:10],
         )
 
         db = SessionLocal()
@@ -364,23 +415,39 @@ class WhaleMonitor:
 
             for ts, trade in new_trades:
                 try:
+                    # Extract identifiers from raw trade dict — available before DB flush.
+                    # We fetch market data NOW so the DB write lock window stays minimal:
+                    # previously the API calls ran *after* db.flush() (which takes a
+                    # SQLite RESERVED lock), causing "database is locked" on concurrent
+                    # writes (e.g. stop_session) if any API call was slow.
+                    trade_market_id = (
+                        trade.get("conditionId")
+                        or trade.get("market")
+                        or trade.get("marketId")
+                        or ""
+                    )
+                    trade_token_id = (
+                        trade.get("asset")
+                        or trade.get("tokenId")
+                        or trade.get("outcome_token_id")
+                        or ""
+                    )
+
+                    # Fetch market metadata, live price, and taker fee in parallel
+                    # BEFORE the DB flush so no lock is held during network I/O.
+                    market_result, price_result, fee_result = await asyncio.gather(
+                        self._client.get_market(trade_market_id, token_id=trade_token_id),
+                        self._client.get_best_price(trade_token_id, force_refresh=True),
+                        self._client.get_taker_fee_async(trade_token_id),
+                        return_exceptions=True,
+                    )
+                    market_info = market_result if isinstance(market_result, dict) else {}
+                    live_price = price_result if isinstance(price_result, float) else None
+                    taker_fee_bps = fee_result if isinstance(fee_result, int) else 1000
+
+                    # Now save to DB (flush takes RESERVED lock — network already done).
                     whale_bet = await self._save_whale_bet(trade, whale, ts, db)
                     if whale_bet:
-                        # Fetch market metadata, live price, and taker fee in parallel.
-                        # The fee is used by the REAL mode fee-viability gate before
-                        # placing any order, avoiding the error-driven retry path.
-                        market_result, price_result, fee_result = await asyncio.gather(
-                            self._client.get_market(
-                                whale_bet.market_id, token_id=whale_bet.token_id
-                            ),
-                            self._client.get_best_price(whale_bet.token_id),
-                            self._client.get_taker_fee_async(whale_bet.token_id),
-                            return_exceptions=True,
-                        )
-                        market_info = market_result if isinstance(market_result, dict) else {}
-                        live_price = price_result if isinstance(price_result, float) else None
-                        taker_fee_bps = fee_result if isinstance(fee_result, int) else 1000
-
                         # Process the whale bet for every active session (supports
                         # simultaneous SIMULATION + HEDGE_SIM for side-by-side comparison)
                         for session in active_sessions:
@@ -396,9 +463,7 @@ class WhaleMonitor:
                     if new_last_seen is None or ts > new_last_seen:
                         new_last_seen = ts
                 except Exception as exc:
-                    logger.error(
-                        "Error processing trade for %s: %s", address[:10], exc
-                    )
+                    logger.error("Error processing trade for %s: %s", address[:10], exc)
                     db.rollback()
 
             # Update whale stats
@@ -437,10 +502,7 @@ class WhaleMonitor:
 
         db = SessionLocal()
         try:
-            addresses = [
-                row[0]
-                for row in db.query(Whale.address).filter_by(is_active=True).all()
-            ]
+            addresses = [row[0] for row in db.query(Whale.address).filter_by(is_active=True).all()]
         except Exception as exc:
             logger.error("poll_exits_only: failed to load whales: %s", exc)
             return
@@ -458,7 +520,7 @@ class WhaleMonitor:
             *[self._client.get_user_activity(addr, limit=100) for addr in addresses],
             return_exceptions=True,
         )
-        for address, trades in zip(addresses, fetch_results):
+        for address, trades in zip(addresses, fetch_results, strict=False):
             if isinstance(trades, Exception):
                 logger.debug("poll_exits_only fetch error for %s: %s", address[:10], trades)
                 continue
@@ -473,7 +535,7 @@ class WhaleMonitor:
         Only acts if we actually hold a position in the exited market.
         """
         last_seen = self._last_seen.get(address)
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(UTC)
         max_age_seconds = settings.MAX_TRADE_AGE_HOURS * 3600
 
         new_exits = []
@@ -496,7 +558,8 @@ class WhaleMonitor:
         new_exits.sort(key=lambda x: x[0])
         logger.info(
             "Background exit poll: %d new EXIT trade(s) from whale %s",
-            len(new_exits), address[:10],
+            len(new_exits),
+            address[:10],
         )
 
         db = SessionLocal()
@@ -529,16 +592,14 @@ class WhaleMonitor:
                     if token_id:
                         open_positions = (
                             db.query(CopiedBet)
-                            .filter_by(status="OPEN", token_id=token_id,
-                                       whale_address=address)
+                            .filter_by(status="OPEN", token_id=token_id, whale_address=address)
                             .order_by(CopiedBet.opened_at.asc())
                             .all()
                         )
                     if not open_positions and market_id:
                         open_positions = (
                             db.query(CopiedBet)
-                            .filter_by(status="OPEN", market_id=market_id,
-                                       whale_address=address)
+                            .filter_by(status="OPEN", market_id=market_id, whale_address=address)
                             .order_by(CopiedBet.opened_at.asc())
                             .all()
                         )
@@ -574,14 +635,16 @@ class WhaleMonitor:
                     # rather than the whale's historical sell price.
                     live_exit_price = None
                     if token_id:
-                        try:
-                            live_exit_price = await self._client.get_best_price(token_id)
-                        except Exception:
-                            pass
+                        with contextlib.suppress(Exception):
+                            live_exit_price = await self._client.get_best_price(
+                                token_id, side="SELL"
+                            )
 
                     # Route through _handle_exit for consistent partial/full exit
                     # logic (fraction-based tranche selection, same path as main scanner)
-                    exit_result = self._bet_engine._handle_exit(whale_bet, session, db, live_exit_price=live_exit_price)
+                    exit_result = self._bet_engine._handle_exit(
+                        whale_bet, session, db, live_exit_price=live_exit_price
+                    )
                     db.commit()  # safety net — _handle_exit commits internally
 
                 except Exception as exc:
@@ -593,9 +656,8 @@ class WhaleMonitor:
                 # (sell went through) or when we had no position to close (None).
                 # If _handle_exit returned False the CLOB sell failed — don't
                 # consume the signal so the next poll retries automatically.
-                if exit_result is not False:
-                    if new_last_seen is None or ts > new_last_seen:
-                        new_last_seen = ts
+                if exit_result is not False and (new_last_seen is None or ts > new_last_seen):
+                    new_last_seen = ts
 
             with self._lock:
                 if new_last_seen:
@@ -607,20 +669,19 @@ class WhaleMonitor:
         finally:
             db.close()
 
-    async def _save_whale_bet(
-        self, trade: dict, whale: Whale, ts: datetime, db
-    ) -> Optional[WhaleBet]:
+    async def _save_whale_bet(self, trade: dict, whale: Whale, ts: datetime, db) -> WhaleBet | None:
         """
         Parse a raw trade dict and persist a WhaleBet record.
         Returns None if the trade is a duplicate or cannot be parsed.
         """
         tx_hash = trade.get("transactionHash") or trade.get("id") or trade.get("orderId", "")
+        # Normalise: strip 0x prefix so activity-API hashes (no prefix) and
+        # chain-monitor hashes (0x-prefixed HexBytes.hex()) always match.
+        if tx_hash and tx_hash.startswith("0x"):
+            tx_hash = tx_hash[2:]
 
-        # Dedup by tx_hash
-        if tx_hash:
-            existing = db.query(WhaleBet).filter_by(tx_hash=tx_hash).first()
-            if existing:
-                return None
+        # Dedup by tx_hash — rely on the UNIQUE index rather than a racy SELECT-first.
+        # IntegrityError is raised if a concurrent scanner already inserted the same hash.
 
         # Parse fields - Polymarket Data API field names
         side = (trade.get("side") or trade.get("type") or "BUY").upper()
@@ -649,11 +710,7 @@ class WhaleMonitor:
         except (TypeError, ValueError):
             size_usdc = 0.0
 
-        size_shares_raw = (
-            trade.get("shares")
-            or trade.get("size")
-            or trade.get("contractsFilled")
-        )
+        size_shares_raw = trade.get("shares") or trade.get("size") or trade.get("contractsFilled")
         try:
             size_shares = float(size_shares_raw) if size_shares_raw is not None else 0.0
         except (TypeError, ValueError):
@@ -663,24 +720,9 @@ class WhaleMonitor:
             size_shares = size_usdc / max(price, 0.001)
 
         # Market identifiers
-        market_id = (
-            trade.get("conditionId")
-            or trade.get("market")
-            or trade.get("marketId")
-            or ""
-        )
-        token_id = (
-            trade.get("asset")
-            or trade.get("tokenId")
-            or trade.get("outcome_token_id")
-            or ""
-        )
-        question = (
-            trade.get("title")
-            or trade.get("question")
-            or trade.get("market_question")
-            or ""
-        )
+        market_id = trade.get("conditionId") or trade.get("market") or trade.get("marketId") or ""
+        token_id = trade.get("asset") or trade.get("tokenId") or trade.get("outcome_token_id") or ""
+        question = trade.get("title") or trade.get("question") or trade.get("market_question") or ""
 
         # Determine bet type
         bet_type = "EXIT" if side == "SELL" else "OPEN"
@@ -700,7 +742,12 @@ class WhaleMonitor:
             bet_type=bet_type,
         )
         db.add(whale_bet)
-        db.flush()  # Get ID without committing
+        try:
+            db.flush()  # Get ID without committing
+        except IntegrityError:
+            db.rollback()
+            logger.debug("Duplicate tx_hash %s — skipping", tx_hash)
+            return None
         return whale_bet
 
     # ------------------------------------------------------------------
@@ -730,12 +777,15 @@ class WhaleMonitor:
                         whale.risk_profile_calculated_at = datetime.utcnow()
                         logger.debug(
                             "Updated avg bet for %s: $%.2f (%d bets)",
-                            whale.address[:10], avg, len(recent_bets),
+                            whale.address[:10],
+                            avg,
+                            len(recent_bets),
                         )
                 except Exception as exc:
                     logger.error(
                         "refresh_risk_profiles error for %s: %s",
-                        whale.address[:10], exc,
+                        whale.address[:10],
+                        exc,
                     )
 
             db.commit()
@@ -781,7 +831,8 @@ class WhaleMonitor:
                 db.commit()
                 logger.info(
                     "Balance sync: REAL session balance $%.2f → $%.2f (live wallet)",
-                    old, balance,
+                    old,
+                    balance,
                 )
         except Exception as exc:
             logger.error("_sync_real_balance: DB error: %s", exc)
@@ -807,8 +858,9 @@ class WhaleMonitor:
 
     def _auto_redemption_job(self):
         """Periodically redeem resolved positions on-chain. Runs in permanent scheduler."""
-        from backend.redemption import check_and_redeem
         from backend.database import CopiedBet, MonitoringSession, SessionLocal
+        from backend.redemption import check_and_redeem
+
         try:
             result = asyncio.run(check_and_redeem())
             redeemed = result.get("redeemed", 0)
@@ -818,7 +870,10 @@ class WhaleMonitor:
                 total_gas_usdc = round(total_gas_matic * settings.MATIC_USD_PRICE, 6)
                 logger.info(
                     "Auto-redeemed %d position(s) for $%.2f (gas=%.6f MATIC ≈ $%.4f)",
-                    redeemed, total, total_gas_matic, total_gas_usdc,
+                    redeemed,
+                    total,
+                    total_gas_matic,
+                    total_gas_usdc,
                 )
                 if total_gas_usdc > 0:
                     db = SessionLocal()
@@ -827,7 +882,9 @@ class WhaleMonitor:
                         # proportionally across all closed tranches for that market_id.
                         for pos_info in result.get("redeemed_positions", []):
                             condition_id = pos_info.get("condition_id", "")
-                            pos_gas_usdc = round(pos_info.get("gas_matic", 0.0) * settings.MATIC_USD_PRICE, 6)
+                            pos_gas_usdc = round(
+                                pos_info.get("gas_matic", 0.0) * settings.MATIC_USD_PRICE, 6
+                            )
                             if not condition_id or pos_gas_usdc <= 0:
                                 continue
                             tranches = (
@@ -835,7 +892,9 @@ class WhaleMonitor:
                                 .filter(
                                     CopiedBet.market_id == condition_id,
                                     CopiedBet.mode == "REAL",
-                                    CopiedBet.status.in_(["CLOSED_WIN", "CLOSED_LOSS", "CLOSED_NEUTRAL"]),
+                                    CopiedBet.status.in_(
+                                        ["CLOSED_WIN", "CLOSED_LOSS", "CLOSED_NEUTRAL"]
+                                    ),
                                     CopiedBet.gas_fees_usdc == None,  # noqa: E711 — SQLAlchemy IS NULL
                                 )
                                 .all()
@@ -874,7 +933,7 @@ class WhaleMonitor:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _parse_trade_timestamp(trade: dict) -> Optional[datetime]:
+    def _parse_trade_timestamp(trade: dict) -> datetime | None:
         """Parse timestamp from a trade dict, returning a UTC-aware datetime."""
         raw = (
             trade.get("timestamp")
@@ -890,7 +949,7 @@ class WhaleMonitor:
             if raw > 1e12:
                 raw = raw / 1000.0
             try:
-                return datetime.fromtimestamp(raw, tz=timezone.utc)
+                return datetime.fromtimestamp(raw, tz=UTC)
             except Exception:
                 return None
 
@@ -899,7 +958,7 @@ class WhaleMonitor:
             try:
                 dt = datetime.fromisoformat(raw)
                 if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
+                    dt = dt.replace(tzinfo=UTC)
                 return dt
             except (ValueError, TypeError):
                 return None

@@ -6,20 +6,19 @@ All API routes are defined here.
 import json
 import logging
 import logging.handlers
-import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.requests import Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.requests import Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session as DBSession
 
+from backend.bet_engine import BetEngine
 from backend.config import settings
 from backend.database import (
     AddToPositionSignal,
@@ -27,11 +26,9 @@ from backend.database import (
     MonitoringSession,
     SessionLocal,
     Whale,
-    WhaleBet,
     get_db,
     init_db,
 )
-from backend.bet_engine import BetEngine
 from backend.polymarket_client import PolymarketClient
 from backend.whale_monitor import WhaleMonitor
 
@@ -111,7 +108,7 @@ templates = Jinja2Templates(directory=str(_root / "frontend" / "templates"))
 # ---------------------------------------------------------------------------
 class SessionStartRequest(BaseModel):
     mode: str = "SIMULATION"  # SIMULATION | REAL
-    runtime_hours: Optional[float] = None  # None = manual stop
+    runtime_hours: float | None = None  # None = manual stop
 
 
 class WhaleAddRequest(BaseModel):
@@ -214,8 +211,9 @@ async def start_session(body: SessionStartRequest, db: DBSession = Depends(get_d
 
     # Auto-stop this mode after runtime_hours if specified
     if body.runtime_hours:
-        from apscheduler.triggers.date import DateTrigger
         from datetime import timedelta
+
+        from apscheduler.triggers.date import DateTrigger
 
         stop_at = datetime.utcnow() + timedelta(hours=body.runtime_hours)
         try:
@@ -235,7 +233,7 @@ async def start_session(body: SessionStartRequest, db: DBSession = Depends(get_d
 
 @app.post("/api/session/stop")
 async def stop_session(
-    mode: Optional[str] = Query(None),
+    mode: str | None = Query(None),
     db: DBSession = Depends(get_db),
 ):
     """Stop monitoring session(s).
@@ -347,6 +345,19 @@ async def toggle_whale(address: str, db: DBSession = Depends(get_db)):
     return {"whale": whale.to_dict()}
 
 
+@app.patch("/api/whales/{address}/arb-mode")
+async def toggle_arb_mode(address: str, db: DBSession = Depends(get_db)):
+    """Toggle a whale's arb mode (price-extremity sizing vs conviction sizing)."""
+    address = address.strip().lower()
+    whale = db.query(Whale).filter_by(address=address).first()
+    if not whale:
+        raise HTTPException(status_code=404, detail="Whale not found")
+
+    whale.arb_mode = not whale.arb_mode
+    db.commit()
+    return {"whale": whale.to_dict()}
+
+
 @app.get("/api/whales/{address}/history")
 async def whale_history(address: str, limit: int = Query(50, ge=1, le=200)):
     """Fetch a whale's recent activity from Polymarket API."""
@@ -451,8 +462,8 @@ async def get_ledger(
     mode: str = Query("all"),
     status: str = Query("all"),
     sort: str = Query("default"),  # "default" = newest first; "close_asc" = soonest close first
-    since: Optional[str] = Query(None),   # ISO datetime — filter opened_at >= since
-    until: Optional[str] = Query(None),   # ISO datetime — filter opened_at <= until
+    since: str | None = Query(None),   # ISO datetime — filter opened_at >= since
+    until: str | None = Query(None),   # ISO datetime — filter opened_at <= until
     db: DBSession = Depends(get_db),
 ):
     """Paginated bet ledger with optional filters."""
@@ -675,6 +686,7 @@ async def stats_by_whale_category(mode: str = Query("all"), db: DBSession = Depe
     whales = db.query(Whale).all()
     alias_map = {w.address: (w.alias or w.address) for w in whales}
     filters_map = {w.address: w.category_filters for w in whales}
+    arb_mode_map = {w.address: bool(w.arb_mode) for w in whales}
 
     # {address: {"by_sport": {sport: bucket}, "by_bet_type": {bet_type: bucket}}}
     data: dict = defaultdict(lambda: {
@@ -726,6 +738,7 @@ async def stats_by_whale_category(mode: str = Query("all"), db: DBSession = Depe
             "whale_address": address,
             "whale_alias": alias_map.get(address, address),
             "category_filters": parsed_filters,
+            "arb_mode": arb_mode_map.get(address, False),
             "by_sport": _summarise(d["by_sport"]),
             "by_bet_type": _summarise(d["by_bet_type"]),
         })

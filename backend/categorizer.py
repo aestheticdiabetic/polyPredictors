@@ -8,7 +8,6 @@ Classifies a bet's market question into:
 """
 
 import re
-from typing import Tuple
 
 # ---------------------------------------------------------------------------
 # Bet-type detection
@@ -114,7 +113,7 @@ _NHL_TEAMS = {
     "BLUE JACKETS", "MAPLE LEAFS", "CANADIENS", "SENATORS", "JETS",
     "FLAMES", "OILERS", "CANUCKS", "GOLDEN KNIGHTS", "KRAKEN",
     "BRUINS", "SABRES", "RED WINGS", "PANTHERS", "LIGHTNING",
-    "HURRICANES", "BLUE JACKETS", "CAPITALS", "PENGUINS", "FLYERS",
+    "HURRICANES", "CAPITALS", "PENGUINS", "FLYERS",
     "DEVILS", "ISLANDERS", "NY RANGERS", "BLACKHAWKS", "PREDATORS",
     "BLUES", "WILD", "AVALANCHE", "STARS", "COYOTES", "DUCKS", "SHARKS",
 }
@@ -254,6 +253,6 @@ def classify_sport(question: str) -> str:
     return "Other"
 
 
-def classify(question: str) -> Tuple[str, str]:
+def classify(question: str) -> tuple[str, str]:
     """Return (sport, bet_type) for a given market question."""
     return classify_sport(question), classify_bet_type(question)

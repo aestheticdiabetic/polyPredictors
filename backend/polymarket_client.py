@@ -5,7 +5,6 @@ All methods are async using httpx.
 
 import logging
 import time
-from typing import Any, Optional
 
 import httpx
 
@@ -82,6 +81,7 @@ class PolymarketClient:
         # retried on the same AsyncClient.  Synchronous requests uses plain OS
         # sockets with no asyncio transport layer, which reconnect automatically.
         import asyncio as _asyncio
+
         import requests as _requests
 
         MAX_ATTEMPTS = 3
@@ -179,7 +179,7 @@ class PolymarketClient:
 
     async def get_market(
         self, condition_id: str, token_id: str = None
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """
         Fetch market details from Gamma API.
 
@@ -261,7 +261,7 @@ class PolymarketClient:
             logger.debug("get_market token fallback transient error for %s: %s", token_id, exc)
             return None
 
-    async def get_last_trade_price(self, token_id: str) -> Optional[float]:
+    async def get_last_trade_price(self, token_id: str) -> float | None:
         """
         Retrieve the last trade price for a token from Gamma API market data.
         Uses _market_cache (keyed "token:{token_id}") to avoid re-fetching data
@@ -301,7 +301,7 @@ class PolymarketClient:
                 return float(outcomes[idx])
         return None
 
-    async def resolve_proxy_wallet(self, address: str) -> Optional[dict]:
+    async def resolve_proxy_wallet(self, address: str) -> dict | None:
         """
         Resolve a wallet address to its public profile via Gamma API.
         Returns dict with name, pseudonym, proxyWallet, etc.
@@ -322,7 +322,7 @@ class PolymarketClient:
 
     async def get_market_price(
         self, token_id: str, side: str = "BUY", force_refresh: bool = False
-    ) -> Optional[float]:
+    ) -> float | None:
         """
         Get current best price for a token from the CLOB.
         side: 'BUY' or 'SELL'
@@ -359,7 +359,7 @@ class PolymarketClient:
             logger.debug("get_market_price error for %s: %s", token_id, exc)
             return None
 
-    async def get_order_book(self, token_id: str) -> Optional[dict]:
+    async def get_order_book(self, token_id: str) -> dict | None:
         """Fetch the full order book for a token."""
         url = f"{settings.CLOB_HOST}/book"
         params = {"token_id": token_id}
@@ -371,13 +371,20 @@ class PolymarketClient:
             logger.debug("get_order_book error for %s: %s", token_id, exc)
             return None
 
-    async def get_best_price(self, token_id: str, force_refresh: bool = False) -> Optional[float]:
+    async def get_best_price(
+        self, token_id: str, force_refresh: bool = False, side: str = "BUY"
+    ) -> float | None:
         """
         Get the best available price by checking both CLOB and Gamma.
         Returns None if no price can be determined.
+        side: 'BUY' for entry (ASK price), 'SELL' for exit (BID price — what we receive).
         force_refresh: bypass the 30 s price cache (used by drift retry loop).
         """
-        price = await self.get_market_price(token_id, "BUY", force_refresh=force_refresh)
+        price = await self.get_market_price(token_id, side, force_refresh=force_refresh)
+        # CLOB returned 0.0 — could be a stale cache entry or a transient empty book.
+        # Retry once with a forced fresh fetch before accepting the zero.
+        if price == 0.0 and not force_refresh:
+            price = await self.get_market_price(token_id, side, force_refresh=True)
         if price is not None:
             return price
         price = await self.get_last_trade_price(token_id)
@@ -456,8 +463,13 @@ class PolymarketClient:
             # (4–6dp depending on tick size). The Polymarket API rejects market buy
             # orders whose taker amount has more than 2 decimal places.
             import types
+
             from py_clob_client.order_builder.helpers import (
-                round_down, round_normal, round_up, decimal_places, to_token_decimals,
+                decimal_places,
+                round_down,
+                round_normal,
+                round_up,
+                to_token_decimals,
             )
 
             def _fixed_get_market_order_amounts(self_builder, amount, price, round_config):
@@ -506,6 +518,7 @@ class PolymarketClient:
         cache it, and retry once.
         """
         import re
+
         from py_clob_client.clob_types import MarketOrderArgs
 
         client = self._get_clob_client()
@@ -564,6 +577,7 @@ class PolymarketClient:
         """
         import math as _math
         import re
+
         from py_clob_client.client import OrderType
         from py_clob_client.clob_types import OrderArgs
 
@@ -683,7 +697,7 @@ class PolymarketClient:
 
         return resp
 
-    async def get_wallet_balance(self) -> Optional[float]:
+    async def get_wallet_balance(self) -> float | None:
         """Fetch USDC balance for the configured funder address via authenticated CLOB API."""
         if not settings.credentials_valid():
             return None

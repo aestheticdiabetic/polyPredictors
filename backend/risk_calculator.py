@@ -4,8 +4,7 @@ Determines bet sizing based on whale's relative bet size vs their average.
 """
 
 import logging
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 from backend.config import settings
 
@@ -56,7 +55,7 @@ class RiskCalculator:
         conviction = whale_bet_usdc / whale_avg_bet_usdc
 
         if conviction >= 1.0:
-            raw = min(conviction ** conviction_exponent, _MAX_RISK_FACTOR)
+            raw = min(conviction**conviction_exponent, _MAX_RISK_FACTOR)
         else:
             raw = max(conviction, _MIN_RISK_FACTOR)
 
@@ -93,6 +92,20 @@ class RiskCalculator:
         hard_cap = base_bet * _MAX_RISK_FACTOR  # absolute ceiling
 
         result = min(bet_size, hard_cap)
+
+        # For low-conviction signals (rf < 1.0), never inflate to the MIN_BET floor.
+        # The floor exists to meet exchange minimums; applying it to below-average
+        # whale bets would place a 5-10x oversized position vs what the model recommends.
+        # Return 0.0 to signal "skip this bet" to the caller.
+        if result < settings.MIN_BET_USDC and risk_factor < 1.0:
+            logger.debug(
+                "Bet size below minimum for rf=%.3f — returning 0.0 to skip (raw=%.2f < min=%.2f)",
+                risk_factor,
+                result,
+                settings.MIN_BET_USDC,
+            )
+            return 0.0
+
         result = max(settings.MIN_BET_USDC, result)
 
         # Never bet more than the full balance
@@ -114,8 +127,8 @@ class RiskCalculator:
         self,
         market_info: dict,
         min_hours_to_close: float = 1.0,
-        whale_price: Optional[float] = None,
-        live_price: Optional[float] = None,
+        whale_price: float | None = None,
+        live_price: float | None = None,
     ) -> tuple[bool, str]:
         """
         Decide whether to place a bet given market metadata.
@@ -124,7 +137,7 @@ class RiskCalculator:
         - Market is still open and active (not resolved / closed)
         - Time-to-close rules:
             * < 1 minute remaining → always skip (hard floor)
-            * 1 min – min_hours_to_close remaining → skip UNLESS live price is
+            * 1 min - min_hours_to_close remaining → skip UNLESS live price is
               within 2% of the whale's entry price (price still representative)
             * >= min_hours_to_close remaining → allow through
 
@@ -166,21 +179,23 @@ class RiskCalculator:
                 logger.debug(
                     "Market has no endDate but live_price=%.4f — allowing through "
                     "(market is demonstrably active, id=%s)",
-                    live_price, market_info.get("id", "unknown"),
+                    live_price,
+                    market_info.get("id", "unknown"),
                 )
                 return True, ""
             logger.warning(
                 "Market has no endDate field — skipping to avoid betting on a "
-                "closed market (id=%s)", market_info.get("id", "unknown")
+                "closed market (id=%s)",
+                market_info.get("id", "unknown"),
             )
             return False, "Market end date unknown — skipping"
 
         try:
             end_dt = datetime.fromisoformat(end_date_str.rstrip("Z"))
             if end_dt.tzinfo is None:
-                end_dt = end_dt.replace(tzinfo=timezone.utc)
+                end_dt = end_dt.replace(tzinfo=UTC)
 
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             hours_remaining = (end_dt - now).total_seconds() / 3600.0
 
             if hours_remaining < 0:
@@ -258,30 +273,29 @@ class RiskCalculator:
             )
         logger.debug(
             "Fee viability OK: entry=%.4f fee=%dbps upside=%.4f net=%.4f >= min %.4f",
-            entry_price, fee_bps, upside, net_upside, min_net_upside,
+            entry_price,
+            fee_bps,
+            upside,
+            net_upside,
+            min_net_upside,
         )
         return True, ""
 
     def check_price_staleness(
         self,
         whale_price: float,
-        live_price: Optional[float],
-        max_drift: float,
-        max_upward_drift: Optional[float] = None,
+        live_price: float | None,
+        max_upward_drift: float,
+        max_downward_drift: float,
     ) -> tuple[bool, str]:
         """
         Guard against copying a bet whose odds have moved significantly since
-        the whale placed it.
+        the whale placed it.  Uses asymmetric thresholds:
 
-        Logic:
-            drift = |live_price - whale_price|
-            If drift > max_drift  →  skip
-
-        A drift in either direction is treated as a skip signal:
-          - Price went UP   (e.g. 0.20 → 0.30): we'd be paying too much per share,
-            reducing or eliminating the expected edge.
-          - Price went DOWN (e.g. 0.20 → 0.10): the market has moved against the
-            whale's thesis, which is a warning sign.
+          - Price UP   (live > whale): we'd overpay relative to the whale, which
+            compounds with fees to erode edge.  Capped tightly (default 0.02).
+          - Price DOWN (live < whale): we'd pay less than the whale — favourable.
+            Allowed a wider band (default 0.10) before treating as a stale signal.
 
         If live_price is None (fetch failed) the bet is allowed through — we
         prefer not to block on network uncertainty.
@@ -294,32 +308,78 @@ class RiskCalculator:
             logger.debug("Live price unavailable — skipping staleness check")
             return True, ""
 
-        drift = abs(live_price - whale_price)
-
-        # REAL mode: apply a tighter cap specifically on upward drift (overpaying
-        # vs whale entry compounds with fees to make the trade unprofitable).
-        if max_upward_drift is not None and live_price > whale_price:
+        if live_price > whale_price:
             upward = live_price - whale_price
             if upward > max_upward_drift:
                 return (
                     False,
                     f"Price has risen from {whale_price:.3f} to {live_price:.3f} "
-                    f"(+{upward:.3f} > REAL_MAX_UPWARD_DRIFT {max_upward_drift:.3f})",
+                    f"(+{upward:.3f} > MAX_UPWARD_DRIFT {max_upward_drift:.3f})",
+                )
+        else:
+            downward = whale_price - live_price
+            if downward > max_downward_drift:
+                return (
+                    False,
+                    f"Price has fallen from {whale_price:.3f} to {live_price:.3f} "
+                    f"(-{downward:.3f} > MAX_DOWNWARD_DRIFT {max_downward_drift:.3f})",
                 )
 
-        if drift <= max_drift:
-            logger.debug(
-                "Price OK: whale=%.4f live=%.4f drift=%.4f <= max %.4f",
-                whale_price, live_price, drift, max_drift,
-            )
-            return True, ""
-
-        direction = "risen" if live_price > whale_price else "fallen"
-        return (
-            False,
-            f"Odds have {direction} from {whale_price:.3f} to {live_price:.3f} "
-            f"(drift {drift:.3f} > max {max_drift:.3f})",
+        logger.debug(
+            "Price OK: whale=%.4f live=%.4f (upward_max=%.4f downward_max=%.4f)",
+            whale_price,
+            live_price,
+            max_upward_drift,
+            max_downward_drift,
         )
+        return True, ""
+
+    def calculate_arb_bet_size(
+        self,
+        session_balance: float,
+        whale_bet_usdc: float,
+        whale_avg_bet_usdc: float,
+    ) -> float:
+        """
+        Bet sizing for arb-mode whales: portfolio-fraction approach.
+
+        Arb whales hold ~ARB_CONCURRENT_POSITIONS open at a time, using their
+        full capital. We mirror that by dividing our wallet equally across N
+        positions, then scaling by the whale's relative bet size so larger
+        arb positions get more allocation.
+
+            base = session_balance / ARB_CONCURRENT_POSITIONS
+            rel  = whale_bet_usdc / whale_avg_bet_usdc   (1.0 if avg unknown)
+            bet  = base * rel
+
+        Always places a bet (no skip for low rf) — arb requires capturing both
+        sides of a position regardless of price proximity to fair odds.
+        Hard floor: MIN_BET_USDC. Hard cap: session_balance.
+        """
+        if session_balance <= 0:
+            return 0.0
+
+        n = max(1, settings.ARB_CONCURRENT_POSITIONS)
+        base = session_balance / n
+
+        rel = whale_bet_usdc / whale_avg_bet_usdc if whale_avg_bet_usdc > 0 else 1.0
+
+        result = base * rel
+        result = min(result, session_balance)
+        result = max(result, settings.MIN_BET_USDC)
+
+        logger.debug(
+            "Arb bet size: balance=%.2f N=%d base=%.2f "
+            "whale_bet=%.2f whale_avg=%.2f rel=%.3f -> %.2f",
+            session_balance,
+            n,
+            base,
+            whale_bet_usdc,
+            whale_avg_bet_usdc,
+            rel,
+            result,
+        )
+        return round(result, 2)
 
     # ------------------------------------------------------------------
     # Convenience helpers

@@ -5,16 +5,15 @@ position closing, and resolution checking.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 import httpx
-
 from sqlalchemy.orm import Session as DBSession
 
 from backend.categorizer import classify
@@ -37,7 +36,8 @@ risk_calc = RiskCalculator()
 @dataclass
 class _WatchItem:
     """Tracks a drift-skipped bet on a near-expiry market for fast retry."""
-    copied_bet_id: int        # existing SKIPPED CopiedBet to upgrade on success
+
+    copied_bet_id: int  # existing SKIPPED CopiedBet to upgrade on success
     whale_bet_id: int
     session_id: int
     token_id: str
@@ -46,7 +46,7 @@ class _WatchItem:
     bet_size_usdc: float
     risk_factor: float
     whale_avg: float
-    expires_at: float         # time.monotonic() deadline
+    expires_at: float  # time.monotonic() deadline
 
 
 class BetEngine:
@@ -60,6 +60,10 @@ class BetEngine:
         # Guards _drift_watchlist against concurrent access from poll_whales
         # and drift_retry scheduler jobs running in different threads.
         self._drift_lock = threading.Lock()
+        # Serialises the balance-read → bet-size → deduct cycle so that
+        # concurrent scanner threads (chain monitor + activity poller + drift
+        # retry) cannot both read the same committed balance and over-commit.
+        self._placement_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -70,10 +74,10 @@ class BetEngine:
         whale_bet: WhaleBet,
         session: MonitoringSession,
         db: DBSession,
-        market_info: Optional[dict] = None,
-        live_price: Optional[float] = None,
+        market_info: dict | None = None,
+        live_price: float | None = None,
         taker_fee_bps: int = 1000,
-    ) -> Optional[CopiedBet]:
+    ) -> CopiedBet | None:
         """
         Decide what to do with a newly detected whale bet and create
         the corresponding CopiedBet record.
@@ -87,6 +91,29 @@ class BetEngine:
         """
         whale = whale_bet.whale
         mode = session.mode
+        market_info = market_info or {}
+
+        # Backfill missing WhaleBet metadata from market_info when the activity
+        # API omitted conditionId / question (common for some trade types).
+        # Persists to DB so downstream display and exit matching work correctly.
+        if market_info:
+            if not whale_bet.market_id:
+                whale_bet.market_id = (
+                    market_info.get("conditionId") or market_info.get("condition_id") or ""
+                )
+            if not whale_bet.question:
+                whale_bet.question = market_info.get("question") or market_info.get("title") or ""
+            if not whale_bet.outcome:
+                for tok in market_info.get("tokens") or []:
+                    if str(tok.get("token_id", "")) == whale_bet.token_id:
+                        whale_bet.outcome = (tok.get("outcome") or "Yes").upper()
+                        break
+            if whale_bet.market_id or whale_bet.question:
+                try:
+                    db.add(whale_bet)
+                    db.flush()
+                except Exception:
+                    pass
 
         # ---- CASE 1: Whale is exiting a position ----------------------
         if whale_bet.bet_type == "EXIT":
@@ -119,7 +146,10 @@ class BetEngine:
                 )
                 logger.info(
                     "Hedge detected for whale %s in market %s: hold %s, new signal %s — skipping",
-                    whale_address[:10], whale_bet.market_id[:16], existing_outcome, new_outcome,
+                    whale_address[:10],
+                    whale_bet.market_id[:16],
+                    existing_outcome,
+                    new_outcome,
                 )
                 whale_avg = whale.avg_bet_size_usdc if whale else 0.0
                 risk_factor = risk_calc.calculate_risk_factor(whale_bet.size_usdc, whale_avg)
@@ -129,8 +159,13 @@ class BetEngine:
                     max_bet_pct=settings.MAX_BET_PCT,
                 )
                 return self._create_skipped_bet(
-                    whale_bet=whale_bet, session=session, bet_size_usdc=bet_size_usdc,
-                    risk_factor=risk_factor, whale_avg=whale_avg, skip_reason=skip_reason, db=db,
+                    whale_bet=whale_bet,
+                    session=session,
+                    bet_size_usdc=bet_size_usdc,
+                    risk_factor=risk_factor,
+                    whale_avg=whale_avg,
+                    skip_reason=skip_reason,
+                    db=db,
                 )
 
         # ---- SAME-PRICE ADD-TO-POSITION GUARD ---------------------------------
@@ -160,406 +195,472 @@ class BetEngine:
                     logger.info(
                         "Add-to-position: whale %s bought %s @ %.3f within %.2f of "
                         "existing entry %.3f — recording signal, no new tranche",
-                        whale_address[:10], whale_bet.token_id[:16],
-                        whale_bet.price, _SAME_PRICE_TOLERANCE, closest.price_at_entry,
+                        whale_address[:10],
+                        whale_bet.token_id[:16],
+                        whale_bet.price,
+                        _SAME_PRICE_TOLERANCE,
+                        closest.price_at_entry,
                     )
                     return self._handle_add_to_position(whale_bet, closest, session, db)
                 logger.info(
                     "New price tranche: whale %s bought %s @ %.3f "
                     "(diff=%.3f from existing %.3f > %.2f tolerance) — opening new tranche",
-                    whale_address[:10], whale_bet.token_id[:16],
-                    whale_bet.price, price_diff, closest.price_at_entry, _SAME_PRICE_TOLERANCE,
+                    whale_address[:10],
+                    whale_bet.token_id[:16],
+                    whale_bet.price,
+                    price_diff,
+                    closest.price_at_entry,
+                    _SAME_PRICE_TOLERANCE,
                 )
 
         # ---- CASE 3: Fresh position / new price tranche -------------------
 
-        # Risk calculations
-        # For the first WHALE_CALIBRATION_BETS placed bets for this whale we don't
-        # yet have a reliable average, so use the minimum as a tracker bet.  Once
-        # we have enough history the normal risk-factor sizing kicks in.
-        _CALIBRATION_THRESHOLD = 15
-        whale_address = whale.address if whale else None
-        placed_count = (
-            db.query(CopiedBet)
-            .filter(
-                CopiedBet.whale_address == whale_address,
-                CopiedBet.mode == session.mode,
-                CopiedBet.status != "SKIPPED",
-            )
-            .count()
-            if whale_address else 0
-        )
-
-        if placed_count < _CALIBRATION_THRESHOLD:
-            bet_size_usdc = settings.MIN_BET_USDC
-            risk_factor = 0.0  # sentinel — no risk data yet
-            whale_avg = 0.0
-            logger.info(
-                "Calibration mode: whale %s has %d/%d placed bets — using minimum $%.2f",
-                (whale_address or "?")[:10], placed_count, _CALIBRATION_THRESHOLD, settings.MIN_BET_USDC,
-            )
-        else:
-            whale_avg = whale.avg_bet_size_usdc if whale else 0.0
-            risk_factor = risk_calc.calculate_risk_factor(
-                whale_bet.size_usdc, whale_avg,
-                conviction_exponent=settings.CONVICTION_EXPONENT,
-            )
-            bet_size_usdc = risk_calc.calculate_bet_size(
-                session_balance=session.current_balance_usdc,
-                risk_factor=risk_factor,
-                max_bet_pct=settings.MAX_BET_PCT,
-            )
-
-        # Market guard
-        # If Gamma couldn't return market metadata but the CLOB has a live price,
-        # the market is demonstrably still active (CLOB order books only exist for
-        # open markets).  In that case bypass the metadata check entirely — we don't
-        # want to miss the initial bet just because the Gamma API had a transient
-        # failure or negatively cached a bad condition_id format.  Price staleness
-        # is still validated below via check_price_staleness.
-        effective_market_info = market_info or {}
-        if not effective_market_info and live_price is not None:
-            ok, skip_reason = True, ""
-        else:
-            ok, skip_reason = risk_calc.should_place_bet(
-                effective_market_info,
-                min_hours_to_close=settings.MIN_MARKET_HOURS_TO_CLOSE,
-                whale_price=whale_bet.price,
-                live_price=live_price,
-            )
-        if not ok:
-            # If the market is already closed/resolved, drop silently — no ledger entry.
-            # Policy skips (balance, price drift, etc.) still get a SKIPPED record.
-            if self._is_closed_market_skip(effective_market_info, skip_reason):
-                logger.debug(
-                    "Dropping whale_bet %d silently — market already closed: %s",
-                    whale_bet.id, skip_reason,
+        with self._placement_lock:
+            # Re-read session balance now that we hold the lock —
+            # another thread may have committed a deduction since
+            # this thread first loaded the session object.
+            db.refresh(session)
+            # Risk calculations
+            # For the first WHALE_CALIBRATION_BETS placed bets for this whale we don't
+            # yet have a reliable average, so use the minimum as a tracker bet.  Once
+            # we have enough history the normal risk-factor sizing kicks in.
+            _CALIBRATION_THRESHOLD = 15
+            whale_address = whale.address if whale else None
+            placed_count = (
+                db.query(CopiedBet)
+                .filter(
+                    CopiedBet.whale_address == whale_address,
+                    CopiedBet.mode == session.mode,
+                    CopiedBet.status != "SKIPPED",
                 )
-                return None
-            skipped = self._create_skipped_bet(
-                whale_bet=whale_bet,
-                session=session,
-                bet_size_usdc=bet_size_usdc,
-                risk_factor=risk_factor,
-                whale_avg=whale_avg,
-                skip_reason=skip_reason,
-                db=db,
+                .count()
+                if whale_address
+                else 0
             )
-            # Near-expiry drift skip → add to watchlist for fast retry.
-            # The retry loop checks price every DRIFT_RETRY_INTERVAL_SECONDS and
-            # upgrades this SKIPPED record to OPEN if price comes back within range.
-            if "price drift" in skip_reason and "> 2%" in skip_reason:
-                self._add_to_drift_watchlist(
-                    copied_bet_id=skipped.id,
+    
+            if whale and whale.arb_mode:
+                # Arb mode bypasses calibration: portfolio-fraction sizing works from
+                # bet 1 and never skips — capturing both sides of every arb is mandatory.
+                whale_avg = whale.avg_bet_size_usdc if whale else 0.0
+                rel = whale_bet.size_usdc / whale_avg if whale_avg > 0 else 1.0
+                risk_factor = rel  # logged as relative size, not conviction
+                bet_size_usdc = risk_calc.calculate_arb_bet_size(
+                    session_balance=session.current_balance_usdc,
+                    whale_bet_usdc=whale_bet.size_usdc,
+                    whale_avg_bet_usdc=whale_avg,
+                )
+                logger.info(
+                    "Arb mode: whale %s price=%.4f whale_bet=$%.2f avg=$%.2f rel=%.3f bet=$%.2f",
+                    whale.address[:10],
+                    whale_bet.price,
+                    whale_bet.size_usdc,
+                    whale_avg,
+                    rel,
+                    bet_size_usdc,
+                )
+            elif placed_count < _CALIBRATION_THRESHOLD:
+                bet_size_usdc = settings.MIN_BET_USDC
+                risk_factor = 0.0  # sentinel — no risk data yet
+                whale_avg = 0.0
+                logger.info(
+                    "Calibration mode: whale %s has %d/%d placed bets — using minimum $%.2f",
+                    (whale_address or "?")[:10],
+                    placed_count,
+                    _CALIBRATION_THRESHOLD,
+                    settings.MIN_BET_USDC,
+                )
+            else:
+                whale_avg = whale.avg_bet_size_usdc if whale else 0.0
+                risk_factor = risk_calc.calculate_risk_factor(
+                    whale_bet.size_usdc,
+                    whale_avg,
+                    conviction_exponent=settings.CONVICTION_EXPONENT,
+                )
+                bet_size_usdc = risk_calc.calculate_bet_size(
+                    session_balance=session.current_balance_usdc,
+                    risk_factor=risk_factor,
+                    max_bet_pct=settings.MAX_BET_PCT,
+                )
+    
+            # Fix: risk_calculator returns 0.0 when rf < 1.0 and raw size < MIN_BET_USDC
+            # to avoid inflating a low-conviction signal to an oversized position.
+            if bet_size_usdc == 0.0:
+                return self._create_skipped_bet(
                     whale_bet=whale_bet,
                     session=session,
-                    market_info=market_info or {},
+                    bet_size_usdc=0.0,
+                    risk_factor=risk_factor,
+                    whale_avg=whale_avg,
+                    skip_reason="Low-conviction signal below minimum bet size — skipping to avoid MIN_BET inflation",
+                    db=db,
+                )
+    
+            # Market guard
+            # If Gamma couldn't return market metadata but the CLOB has a live price,
+            # the market is demonstrably still active (CLOB order books only exist for
+            # open markets).  In that case bypass the metadata check entirely — we don't
+            # want to miss the initial bet just because the Gamma API had a transient
+            # failure or negatively cached a bad condition_id format.  Price staleness
+            # is still validated below via check_price_staleness.
+            effective_market_info = market_info or {}
+            if not effective_market_info and live_price is not None:
+                ok, skip_reason = True, ""
+            else:
+                ok, skip_reason = risk_calc.should_place_bet(
+                    effective_market_info,
+                    min_hours_to_close=settings.MIN_MARKET_HOURS_TO_CLOSE,
+                    whale_price=whale_bet.price,
+                    live_price=live_price,
+                )
+            if not ok:
+                # If the market is already closed/resolved, drop silently — no ledger entry.
+                # Policy skips (balance, price drift, etc.) still get a SKIPPED record.
+                if self._is_closed_market_skip(effective_market_info, skip_reason):
+                    logger.debug(
+                        "Dropping whale_bet %d silently — market already closed: %s",
+                        whale_bet.id,
+                        skip_reason,
+                    )
+                    return None
+                skipped = self._create_skipped_bet(
+                    whale_bet=whale_bet,
+                    session=session,
                     bet_size_usdc=bet_size_usdc,
                     risk_factor=risk_factor,
                     whale_avg=whale_avg,
+                    skip_reason=skip_reason,
+                    db=db,
                 )
-            return skipped
-
-        # Balance check
-        if session.current_balance_usdc < 1.0:
-            return self._create_skipped_bet(
-                whale_bet=whale_bet,
-                session=session,
-                bet_size_usdc=0.0,
-                risk_factor=risk_factor,
-                whale_avg=whale_avg,
-                skip_reason="Insufficient balance",
-                db=db,
-            )
-
-        # Category filter — skip if this whale has disabled this sport or bet type
-        cat_sport, cat_bet_type = classify(whale_bet.question)
-        if whale and whale.category_filters:
-            import json as _json
-            try:
-                filters = _json.loads(whale.category_filters)
-                disabled_sports = filters.get("disabled_sports", [])
-                disabled_bet_types = filters.get("disabled_bet_types", [])
-                if cat_sport in disabled_sports or cat_bet_type in disabled_bet_types:
-                    return self._create_skipped_bet(
+                # Near-expiry drift skip → add to watchlist for fast retry.
+                # The retry loop checks price every DRIFT_RETRY_INTERVAL_SECONDS and
+                # upgrades this SKIPPED record to OPEN if price comes back within range.
+                if "price drift" in skip_reason and "> 2%" in skip_reason:
+                    self._add_to_drift_watchlist(
+                        copied_bet_id=skipped.id,
                         whale_bet=whale_bet,
                         session=session,
+                        market_info=market_info or {},
                         bet_size_usdc=bet_size_usdc,
                         risk_factor=risk_factor,
                         whale_avg=whale_avg,
-                        skip_reason=f"Category filtered: {cat_sport} / {cat_bet_type}",
-                        db=db,
                     )
-            except Exception:
-                pass
-
-        # Price staleness guard — skip if odds have moved too far since the whale bet.
-        # REAL mode uses a tighter upward cap: buying above whale entry compounds
-        # with fees, so we tolerate less overpayment than downward moves.
-        price_ok, price_reason = risk_calc.check_price_staleness(
-            whale_price=whale_bet.price,
-            live_price=live_price,
-            max_drift=settings.MAX_PRICE_DRIFT_PCT,
-            max_upward_drift=settings.REAL_MAX_UPWARD_DRIFT if mode == "REAL" else None,
-        )
-        if not price_ok:
-            return self._create_skipped_bet(
-                whale_bet=whale_bet,
-                session=session,
-                bet_size_usdc=bet_size_usdc,
-                risk_factor=risk_factor,
-                whale_avg=whale_avg,
-                skip_reason=price_reason,
-                db=db,
+                return skipped
+    
+            # Balance check
+            if session.current_balance_usdc < 1.0:
+                return self._create_skipped_bet(
+                    whale_bet=whale_bet,
+                    session=session,
+                    bet_size_usdc=0.0,
+                    risk_factor=risk_factor,
+                    whale_avg=whale_avg,
+                    skip_reason="Insufficient balance",
+                    db=db,
+                )
+    
+            # Category filter — skip if this whale has disabled this sport or bet type
+            cat_sport, cat_bet_type = classify(whale_bet.question)
+            if whale and whale.category_filters:
+                import json as _json
+    
+                try:
+                    filters = _json.loads(whale.category_filters)
+                    disabled_sports = filters.get("disabled_sports", [])
+                    disabled_bet_types = filters.get("disabled_bet_types", [])
+                    if cat_sport in disabled_sports or cat_bet_type in disabled_bet_types:
+                        return self._create_skipped_bet(
+                            whale_bet=whale_bet,
+                            session=session,
+                            bet_size_usdc=bet_size_usdc,
+                            risk_factor=risk_factor,
+                            whale_avg=whale_avg,
+                            skip_reason=f"Category filtered: {cat_sport} / {cat_bet_type}",
+                            db=db,
+                        )
+                except Exception:
+                    pass
+    
+            # Price staleness guard — skip if odds have moved too far since the whale bet.
+            # REAL mode uses a tighter upward cap: buying above whale entry compounds
+            # with fees, so we tolerate less overpayment than downward moves.
+            price_ok, price_reason = risk_calc.check_price_staleness(
+                whale_price=whale_bet.price,
+                live_price=live_price,
+                max_upward_drift=settings.MAX_UPWARD_DRIFT_PCT,
+                max_downward_drift=settings.MAX_DOWNWARD_DRIFT_PCT,
             )
-
-        # REAL mode fee-viability gate — skip trades where fees eliminate all upside.
-        # E.g. buying at 0.85 with 10% fee leaves only 5% net upside; break-even
-        # requires the whale to win 93.5% of the time.
-        if mode == "REAL":
-            check_price = live_price if live_price is not None else whale_bet.price
-            viable, viability_reason = risk_calc.check_fee_viability(
-                entry_price=check_price,
-                fee_bps=taker_fee_bps,
-                max_entry_price=settings.REAL_MAX_ENTRY_PRICE,
-                min_net_upside=settings.REAL_MIN_NET_UPSIDE,
-            )
-            if not viable:
+            if not price_ok:
                 return self._create_skipped_bet(
                     whale_bet=whale_bet,
                     session=session,
                     bet_size_usdc=bet_size_usdc,
                     risk_factor=risk_factor,
                     whale_avg=whale_avg,
-                    skip_reason=viability_reason,
+                    skip_reason=price_reason,
                     db=db,
                 )
-
-        # Place or simulate
-        entry_price = whale_bet.price
-        _post_fill_pnl: Optional[float] = None
-        _post_fill_sell_price: Optional[float] = None
-        try:
-            if mode in ("SIMULATION", "HEDGE_SIM"):
-                shares, actual_price, actual_cost = self.simulate_buy(
-                    session=session,
-                    market_id=whale_bet.market_id,
-                    token_id=whale_bet.token_id,
-                    question=whale_bet.question,
-                    outcome=whale_bet.outcome,
-                    price=whale_bet.price,
-                    size_usdc=bet_size_usdc,
-                    db=db,
-                    live_price=live_price,
+    
+            # REAL mode fee-viability gate — skip trades where fees eliminate all upside.
+            # E.g. buying at 0.85 with 10% fee leaves only 5% net upside; break-even
+            # requires the whale to win 93.5% of the time.
+            if mode == "REAL":
+                check_price = live_price if live_price is not None else whale_bet.price
+                viable, viability_reason = risk_calc.check_fee_viability(
+                    entry_price=check_price,
+                    fee_bps=taker_fee_bps,
+                    max_entry_price=settings.REAL_MAX_ENTRY_PRICE,
+                    min_net_upside=settings.REAL_MIN_NET_UPSIDE,
                 )
-                entry_price = actual_price
-                size_shares = shares
-                bet_size_usdc = actual_cost  # use fee-inclusive cost as DB cost basis
-                bet_status = "OPEN"
-                skip_reason_val = None
-            else:
-                order_resp = self.place_real_buy(
-                    token_id=whale_bet.token_id,
-                    size_usdc=bet_size_usdc,
-                    price=whale_bet.price,
-                )
-                # Detect FOK/unmatched cancellations — no tokens were actually received
-                order_status_raw = str(order_resp.get("status", "")).upper()
-                if order_status_raw in ("UNMATCHED", "CANCELLED", "CANCELED"):
-                    size_shares = 0.0
-                    logger.warning(
-                        "REAL BUY status=%s for token %s — order not filled, recording size_shares=0",
-                        order_status_raw, whale_bet.token_id[:16],
+                if not viable:
+                    return self._create_skipped_bet(
+                        whale_bet=whale_bet,
+                        session=session,
+                        bet_size_usdc=bet_size_usdc,
+                        risk_factor=risk_factor,
+                        whale_avg=whale_avg,
+                        skip_reason=viability_reason,
+                        db=db,
                     )
-                else:
-                    import math as _math
-
-                    # Log the raw response so we can diagnose field names in prod.
-                    logger.info("REAL BUY response: %s", order_resp)
-
-                    # CLOB BUY response fields (confirmed via py-clob-client source):
-                    #   Submitter is the ORDER MAKER (maker=self.funder in builder).
-                    #   makingAmount = USDC the maker (us) provided (e.g. "0.7548")
-                    #   takingAmount = YES shares the taker provided to us (e.g. "1.02")
-                    # entry_price = makingAmount / takingAmount = USDC / shares
-                    # Legacy fields like price/avgPrice/size_matched are NOT present.
-                    taking_raw = order_resp.get("takingAmount")
-                    making_raw = order_resp.get("makingAmount")
-
-                    if taking_raw is not None and making_raw is not None:
-                        try:
-                            taking_f = float(taking_raw)
-                            making_f = float(making_raw)
-                            if making_f > 0 and taking_f > 0:
-                                size_shares = _math.floor(taking_f * 100) / 100
-                                actual_cost = round(making_f, 4)
-                                bet_size_usdc = actual_cost
-                                entry_price = round(making_f / taking_f, 6)
-                                logger.info(
-                                    "REAL BUY: makingAmount=%.4f (USDC) takingAmount=%.4f (shares)"
-                                    " → entry_price=%.4f actual_cost=$%.4f",
-                                    making_f, taking_f, entry_price, actual_cost,
-                                )
-                                # Post-fill guard: CLOB slippage can push the actual fill
-                                # above REAL_MAX_ENTRY_PRICE checked pre-order. Sell back
-                                # immediately to avoid being trapped in a fee-dominant trade.
-                                if entry_price >= settings.REAL_MAX_ENTRY_PRICE:
-                                    logger.warning(
-                                        "REAL BUY: fill %.4f >= REAL_MAX_ENTRY_PRICE %.4f "
-                                        "— selling back immediately",
-                                        entry_price, settings.REAL_MAX_ENTRY_PRICE,
-                                    )
-                                    try:
-                                        _sell_r = self.place_real_sell(
-                                            token_id=whale_bet.token_id,
-                                            size_shares=size_shares,
-                                        )
-                                        _post_fill_sell_price = float(
-                                            _sell_r.get("price")
-                                            or _sell_r.get("avgPrice")
-                                            or _sell_r.get("average_price")
-                                            or entry_price * 0.97
-                                        )
-                                    except Exception as _se:
-                                        logger.error("Post-fill emergency sell failed: %s", _se)
-                                        _post_fill_sell_price = entry_price * 0.97
-                                    _post_fill_pnl = round(
-                                        size_shares * _post_fill_sell_price - actual_cost, 4
-                                    )
-                            else:
-                                # Zero amounts — fall back to whale price estimate
-                                entry_price = float(whale_bet.price)
-                                size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
-                                logger.warning(
-                                    "REAL BUY: takingAmount/makingAmount zero — "
-                                    "falling back to whale price %.4f", entry_price,
-                                )
-                        except (TypeError, ValueError) as _e:
-                            entry_price = float(whale_bet.price)
-                            size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
-                            logger.warning("REAL BUY: could not parse amounts (%s) — fallback", _e)
-                    else:
-                        # Fields absent — fall back to whale price estimate
-                        entry_price = float(whale_bet.price)
-                        size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
-                        logger.warning(
-                            "REAL BUY: takingAmount/makingAmount absent in response %s"
-                            " — falling back to whale price %.4f", order_resp, entry_price,
-                        )
-                # Deduct actual cost from session balance, then refund sell proceeds
-                # if we immediately sold back due to post-fill overpay.
-                session.current_balance_usdc = max(0.0, session.current_balance_usdc - bet_size_usdc)
-                if _post_fill_sell_price is not None:
-                    sell_proceeds = round(size_shares * _post_fill_sell_price, 4)
-                    session.current_balance_usdc = min(
-                        session.current_balance_usdc + sell_proceeds,
-                        session.starting_balance_usdc,
+    
+            # Place or simulate
+            entry_price = whale_bet.price
+            _post_fill_pnl: float | None = None
+            _post_fill_sell_price: float | None = None
+            try:
+                if mode in ("SIMULATION", "HEDGE_SIM"):
+                    shares, actual_price, actual_cost = self.simulate_buy(
+                        session=session,
+                        market_id=whale_bet.market_id,
+                        token_id=whale_bet.token_id,
+                        question=whale_bet.question,
+                        outcome=whale_bet.outcome,
+                        price=whale_bet.price,
+                        size_usdc=bet_size_usdc,
+                        db=db,
+                        live_price=live_price,
                     )
-                    bet_status = "CLOSED_LOSS"
-                    skip_reason_val = (
-                        f"Post-fill overpay: fill {entry_price:.4f} >= "
-                        f"REAL_MAX_ENTRY_PRICE {settings.REAL_MAX_ENTRY_PRICE:.4f}"
-                    )
-                else:
+                    entry_price = actual_price
+                    size_shares = shares
+                    bet_size_usdc = actual_cost  # use fee-inclusive cost as DB cost basis
                     bet_status = "OPEN"
                     skip_reason_val = None
-                db.add(session)
-        except Exception as exc:
-            logger.error("Failed to place bet for whale_bet %d: %s", whale_bet.id, exc)
-            return self._create_skipped_bet(
-                whale_bet=whale_bet,
-                session=session,
-                bet_size_usdc=bet_size_usdc,
+                else:
+                    order_resp = self.place_real_buy(
+                        token_id=whale_bet.token_id,
+                        size_usdc=bet_size_usdc,
+                        price=whale_bet.price,
+                    )
+                    # Detect FOK/unmatched cancellations — no tokens were actually received
+                    order_status_raw = str(order_resp.get("status", "")).upper()
+                    if order_status_raw in ("UNMATCHED", "CANCELLED", "CANCELED"):
+                        size_shares = 0.0
+                        logger.warning(
+                            "REAL BUY status=%s for token %s — order not filled, recording size_shares=0",
+                            order_status_raw,
+                            whale_bet.token_id[:16],
+                        )
+                    else:
+                        import math as _math
+    
+                        # Log the raw response so we can diagnose field names in prod.
+                        logger.info("REAL BUY response: %s", order_resp)
+    
+                        # CLOB BUY response fields (confirmed via py-clob-client source):
+                        #   Submitter is the ORDER MAKER (maker=self.funder in builder).
+                        #   makingAmount = USDC the maker (us) provided (e.g. "0.7548")
+                        #   takingAmount = YES shares the taker provided to us (e.g. "1.02")
+                        # entry_price = makingAmount / takingAmount = USDC / shares
+                        # Legacy fields like price/avgPrice/size_matched are NOT present.
+                        taking_raw = order_resp.get("takingAmount")
+                        making_raw = order_resp.get("makingAmount")
+    
+                        if taking_raw is not None and making_raw is not None:
+                            try:
+                                taking_f = float(taking_raw)
+                                making_f = float(making_raw)
+                                if making_f > 0 and taking_f > 0:
+                                    size_shares = _math.floor(taking_f * 100) / 100
+                                    actual_cost = round(making_f, 4)
+                                    bet_size_usdc = actual_cost
+                                    entry_price = round(making_f / taking_f, 6)
+                                    logger.info(
+                                        "REAL BUY: makingAmount=%.4f (USDC) takingAmount=%.4f (shares)"
+                                        " → entry_price=%.4f actual_cost=$%.4f",
+                                        making_f,
+                                        taking_f,
+                                        entry_price,
+                                        actual_cost,
+                                    )
+                                    # Post-fill guard: CLOB slippage can push the actual fill
+                                    # above REAL_MAX_ENTRY_PRICE checked pre-order. Sell back
+                                    # immediately to avoid being trapped in a fee-dominant trade.
+                                    if entry_price >= settings.REAL_MAX_ENTRY_PRICE:
+                                        logger.warning(
+                                            "REAL BUY: fill %.4f >= REAL_MAX_ENTRY_PRICE %.4f "
+                                            "— selling back immediately",
+                                            entry_price,
+                                            settings.REAL_MAX_ENTRY_PRICE,
+                                        )
+                                        try:
+                                            _sell_r = self.place_real_sell(
+                                                token_id=whale_bet.token_id,
+                                                size_shares=size_shares,
+                                            )
+                                            _post_fill_sell_price = float(
+                                                _sell_r.get("price")
+                                                or _sell_r.get("avgPrice")
+                                                or _sell_r.get("average_price")
+                                                or entry_price * 0.97
+                                            )
+                                        except Exception as _se:
+                                            logger.error("Post-fill emergency sell failed: %s", _se)
+                                            _post_fill_sell_price = entry_price * 0.97
+                                        _post_fill_pnl = round(
+                                            size_shares * _post_fill_sell_price - actual_cost, 4
+                                        )
+                                else:
+                                    # Zero amounts — fall back to whale price estimate
+                                    entry_price = float(whale_bet.price)
+                                    size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
+                                    logger.warning(
+                                        "REAL BUY: takingAmount/makingAmount zero — "
+                                        "falling back to whale price %.4f",
+                                        entry_price,
+                                    )
+                            except (TypeError, ValueError) as _e:
+                                entry_price = float(whale_bet.price)
+                                size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
+                                logger.warning("REAL BUY: could not parse amounts (%s) — fallback", _e)
+                        else:
+                            # Fields absent — fall back to whale price estimate
+                            entry_price = float(whale_bet.price)
+                            size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
+                            logger.warning(
+                                "REAL BUY: takingAmount/makingAmount absent in response %s"
+                                " — falling back to whale price %.4f",
+                                order_resp,
+                                entry_price,
+                            )
+                    # Deduct actual cost from session balance, then refund sell proceeds
+                    # if we immediately sold back due to post-fill overpay.
+                    session.current_balance_usdc = max(
+                        0.0, session.current_balance_usdc - bet_size_usdc
+                    )
+                    if _post_fill_sell_price is not None:
+                        sell_proceeds = round(size_shares * _post_fill_sell_price, 4)
+                        session.current_balance_usdc = min(
+                            session.current_balance_usdc + sell_proceeds,
+                            session.starting_balance_usdc,
+                        )
+                        bet_status = "CLOSED_LOSS"
+                        skip_reason_val = (
+                            f"Post-fill overpay: fill {entry_price:.4f} >= "
+                            f"REAL_MAX_ENTRY_PRICE {settings.REAL_MAX_ENTRY_PRICE:.4f}"
+                        )
+                    else:
+                        bet_status = "OPEN"
+                        skip_reason_val = None
+                    db.add(session)
+            except Exception as exc:
+                logger.error("Failed to place bet for whale_bet %d: %s", whale_bet.id, exc)
+                return self._create_skipped_bet(
+                    whale_bet=whale_bet,
+                    session=session,
+                    bet_size_usdc=bet_size_usdc,
+                    risk_factor=risk_factor,
+                    whale_avg=whale_avg,
+                    skip_reason=f"Order failed: {exc}",
+                    db=db,
+                )
+    
+            # Parse market close date from market_info for ledger display.
+            # Prefer gameStartTime (actual tip-off / kick-off) over endDate (trading
+            # cutoff) when it is available and later, so the countdown reflects the
+            # real event time rather than Polymarket's arbitrary betting deadline.
+            market_close_at = None
+            if market_info:
+                end_str = (
+                    market_info.get("endDate")
+                    or market_info.get("endDateIso")
+                    or market_info.get("end_date_iso")
+                    or market_info.get("end_date")
+                )
+                if end_str:
+                    try:
+                        dt = datetime.fromisoformat(end_str.rstrip("Z"))
+                        if dt.tzinfo is not None:
+                            dt = dt.replace(tzinfo=None)  # store as naive UTC
+                        market_close_at = dt
+                    except (ValueError, TypeError):
+                        pass
+    
+                # Override with gameStartTime when available and later than endDate
+                game_start_str = market_info.get("gameStartTime")
+                if game_start_str:
+                    try:
+                        gst = datetime.fromisoformat(str(game_start_str).rstrip("Z"))
+                        if gst.tzinfo is not None:
+                            gst = gst.replace(tzinfo=None)
+                        if market_close_at is None or gst > market_close_at:
+                            market_close_at = gst
+                    except (ValueError, TypeError):
+                        pass
+    
+            # Classify market category and bet type
+            market_category, bet_type_cat = classify(whale_bet.question)
+    
+            # Persist CopiedBet
+            copied_bet = CopiedBet(
+                whale_bet_id=whale_bet.id,
+                whale_address=whale_bet.whale.address,
+                session_id=session.id,
+                mode=mode,
+                market_id=whale_bet.market_id,
+                token_id=whale_bet.token_id,
+                question=whale_bet.question,
+                side=whale_bet.side,
+                outcome=whale_bet.outcome,
+                price_at_entry=entry_price,
+                size_usdc=bet_size_usdc,
+                size_shares=size_shares,
                 risk_factor=risk_factor,
-                whale_avg=whale_avg,
-                skip_reason=f"Order failed: {exc}",
-                db=db,
+                whale_bet_usdc=whale_bet.size_usdc,
+                whale_avg_bet_usdc=whale_avg,
+                status=bet_status,
+                skip_reason=skip_reason_val,
+                market_category=market_category,
+                bet_type=bet_type_cat,
+                opened_at=datetime.utcnow(),
+                market_close_at=market_close_at,
             )
-
-        # Parse market close date from market_info for ledger display.
-        # Prefer gameStartTime (actual tip-off / kick-off) over endDate (trading
-        # cutoff) when it is available and later, so the countdown reflects the
-        # real event time rather than Polymarket's arbitrary betting deadline.
-        market_close_at = None
-        if market_info:
-            end_str = (
-                market_info.get("endDate")
-                or market_info.get("endDateIso")
-                or market_info.get("end_date_iso")
-                or market_info.get("end_date")
+            db.add(copied_bet)
+    
+            # Update session counters
+            session.total_bets_placed += 1
+    
+            # If we immediately sold back due to post-fill overpay, record the realised loss.
+            if _post_fill_pnl is not None:
+                copied_bet.pnl_usdc = _post_fill_pnl
+                copied_bet.resolution_price = _post_fill_sell_price
+                copied_bet.closed_at = datetime.utcnow()
+                copied_bet.close_reason = skip_reason_val
+                session.total_losses += 1
+                session.total_pnl_usdc = round(session.total_pnl_usdc + _post_fill_pnl, 4)
+                db.add(session)
+    
+            db.commit()
+            db.refresh(copied_bet)
+    
+            logger.info(
+                "Placed %s bet: %s %s @ %.3f for $%.2f (rf=%.2f)",
+                mode,
+                whale_bet.outcome,
+                whale_bet.market_id[:16],
+                entry_price,
+                bet_size_usdc,
+                risk_factor,
             )
-            if end_str:
-                try:
-                    dt = datetime.fromisoformat(end_str.rstrip("Z"))
-                    if dt.tzinfo is not None:
-                        dt = dt.replace(tzinfo=None)  # store as naive UTC
-                    market_close_at = dt
-                except (ValueError, TypeError):
-                    pass
-
-            # Override with gameStartTime when available and later than endDate
-            game_start_str = market_info.get("gameStartTime")
-            if game_start_str:
-                try:
-                    gst = datetime.fromisoformat(str(game_start_str).rstrip("Z"))
-                    if gst.tzinfo is not None:
-                        gst = gst.replace(tzinfo=None)
-                    if market_close_at is None or gst > market_close_at:
-                        market_close_at = gst
-                except (ValueError, TypeError):
-                    pass
-
-        # Classify market category and bet type
-        market_category, bet_type_cat = classify(whale_bet.question)
-
-        # Persist CopiedBet
-        copied_bet = CopiedBet(
-            whale_bet_id=whale_bet.id,
-            whale_address=whale_bet.whale.address,
-            session_id=session.id,
-            mode=mode,
-            market_id=whale_bet.market_id,
-            token_id=whale_bet.token_id,
-            question=whale_bet.question,
-            side=whale_bet.side,
-            outcome=whale_bet.outcome,
-            price_at_entry=entry_price,
-            size_usdc=bet_size_usdc,
-            size_shares=size_shares,
-            risk_factor=risk_factor,
-            whale_bet_usdc=whale_bet.size_usdc,
-            whale_avg_bet_usdc=whale_avg,
-            status=bet_status,
-            skip_reason=skip_reason_val,
-            market_category=market_category,
-            bet_type=bet_type_cat,
-            opened_at=datetime.utcnow(),
-            market_close_at=market_close_at,
-        )
-        db.add(copied_bet)
-
-        # Update session counters
-        session.total_bets_placed += 1
-
-        # If we immediately sold back due to post-fill overpay, record the realised loss.
-        if _post_fill_pnl is not None:
-            copied_bet.pnl_usdc = _post_fill_pnl
-            copied_bet.resolution_price = _post_fill_sell_price
-            copied_bet.closed_at = datetime.utcnow()
-            copied_bet.close_reason = skip_reason_val
-            session.total_losses += 1
-            session.total_pnl_usdc = round(session.total_pnl_usdc + _post_fill_pnl, 4)
-            db.add(session)
-
-        db.commit()
-        db.refresh(copied_bet)
-
-        logger.info(
-            "Placed %s bet: %s %s @ %.3f for $%.2f (rf=%.2f)",
-            mode, whale_bet.outcome, whale_bet.market_id[:16],
-            entry_price, bet_size_usdc, risk_factor,
-        )
-        return copied_bet
+            return copied_bet
 
     # ------------------------------------------------------------------
     # Simulation helpers
@@ -575,7 +676,7 @@ class BetEngine:
         price: float,
         size_usdc: float,
         db: DBSession,
-        live_price: Optional[float] = None,
+        live_price: float | None = None,
     ) -> tuple[float, float, float]:
         """
         Simulate buying `size_usdc` worth of shares, mirroring real mode behaviour:
@@ -606,7 +707,10 @@ class BetEngine:
             actual_cost = size_usdc + fee_amount
             logger.debug(
                 "SIM BUY (fee-adjusted): $%.4f position + $%.4f fee (%dbps) = $%.4f cost basis",
-                size_usdc, fee_amount, settings.SIM_ASSUMED_FEE_BPS, actual_cost,
+                size_usdc,
+                fee_amount,
+                settings.SIM_ASSUMED_FEE_BPS,
+                actual_cost,
             )
 
         session.current_balance_usdc = max(0.0, session.current_balance_usdc - actual_cost)
@@ -614,7 +718,12 @@ class BetEngine:
 
         logger.debug(
             "SIM BUY: $%.2f (cost $%.2f) @ %.4f live (whale %.4f) = %.4f shares | balance -> $%.2f",
-            size_usdc, actual_cost, effective_price, price, shares, session.current_balance_usdc,
+            size_usdc,
+            actual_cost,
+            effective_price,
+            price,
+            shares,
+            session.current_balance_usdc,
         )
         return round(shares, 6), round(effective_price, 6), round(actual_cost, 4)
 
@@ -639,7 +748,10 @@ class BetEngine:
             proceeds = raw_proceeds - sell_fee
             logger.debug(
                 "SIM SELL (fee-adjusted): gross $%.4f - fee $%.4f (%dbps) = $%.4f net",
-                raw_proceeds, sell_fee, settings.SIM_ASSUMED_FEE_BPS, proceeds,
+                raw_proceeds,
+                sell_fee,
+                settings.SIM_ASSUMED_FEE_BPS,
+                proceeds,
             )
         else:
             proceeds = raw_proceeds
@@ -669,7 +781,10 @@ class BetEngine:
 
         logger.info(
             "SIM SELL: %.4f shares @ %.4f = $%.2f (pnl $%.2f) | balance -> $%.2f",
-            copied_bet.size_shares, current_price, proceeds, pnl,
+            copied_bet.size_shares,
+            current_price,
+            proceeds,
+            pnl,
             session.current_balance_usdc,
         )
         return round(pnl, 2)
@@ -678,16 +793,21 @@ class BetEngine:
     # Real mode helpers
     # ------------------------------------------------------------------
 
-    def place_real_buy(
-        self, token_id: str, size_usdc: float, price: float
-    ) -> dict:
+    def place_real_buy(self, token_id: str, size_usdc: float, price: float) -> dict:
         """Place a real market buy via py-clob-client."""
         logger.info("REAL BUY: token=%s size=$%.2f price=%.4f", token_id[:16], size_usdc, price)
         return self._client.place_market_buy(token_id, size_usdc)
 
-    def place_real_sell(self, token_id: str, size_shares: float, whale_price: float = None) -> dict:
+    def place_real_sell(
+        self, token_id: str, size_shares: float, whale_price: float | None = None
+    ) -> dict:
         """Place a real market sell via py-clob-client."""
-        logger.info("REAL SELL: token=%s shares=%.4f whale_price=%s", token_id[:16], size_shares, whale_price)
+        logger.info(
+            "REAL SELL: token=%s shares=%.4f whale_price=%s",
+            token_id[:16],
+            size_shares,
+            whale_price,
+        )
         return self._client.place_market_sell(token_id, size_shares, whale_price=whale_price)
 
     def _close_bet(
@@ -717,7 +837,8 @@ class BetEngine:
         if current_price >= 0.98 or current_price <= 0.02:
             logger.info(
                 "REAL close bet %d at oracle price %.4f (resolved — skipping CLOB sell, redemption will settle)",
-                copied_bet.id, current_price,
+                copied_bet.id,
+                current_price,
             )
         else:
             # Short-circuit: if size_shares==0 the buy was never filled — skip the API call
@@ -738,11 +859,15 @@ class BetEngine:
                 db.add(session)
                 logger.info(
                     "REAL unfilled-buy neutral close: bet %d refunded $%.2f | balance -> $%.2f",
-                    copied_bet.id, copied_bet.size_usdc, session.current_balance_usdc,
+                    copied_bet.id,
+                    copied_bet.size_usdc,
+                    session.current_balance_usdc,
                 )
                 return 0.0
             try:
-                order_resp = self.place_real_sell(copied_bet.token_id, copied_bet.size_shares, whale_price=current_price)
+                order_resp = self.place_real_sell(
+                    copied_bet.token_id, copied_bet.size_shares, whale_price=current_price
+                )
                 logger.info("REAL SELL response: %s", order_resp)
                 sell_status = (order_resp.get("status") or "").lower()
                 if sell_status in ("cancelled", "canceled"):
@@ -765,10 +890,14 @@ class BetEngine:
                         logger.warning(
                             "Real sell bet %d: CLOB rejected size_shares=%.4f but Data API "
                             "shows %.4f shares on-chain — retrying sell with actual balance",
-                            copied_bet.id, copied_bet.size_shares, actual_shares,
+                            copied_bet.id,
+                            copied_bet.size_shares,
+                            actual_shares,
                         )
                         try:
-                            retry_resp = self.place_real_sell(copied_bet.token_id, actual_shares, whale_price=current_price)
+                            retry_resp = self.place_real_sell(
+                                copied_bet.token_id, actual_shares, whale_price=current_price
+                            )
                             _retry_status = (retry_resp.get("status") or "").lower()
                             if _retry_status in ("cancelled", "canceled"):
                                 logger.warning(
@@ -799,7 +928,8 @@ class BetEngine:
                                 logger.info(
                                     "Real sell bet %d: retry with %.4f shares succeeded "
                                     "(effective entry price updated to %.4f)",
-                                    copied_bet.id, actual_shares,
+                                    copied_bet.id,
+                                    actual_shares,
                                     copied_bet.price_at_entry,
                                 )
                             else:
@@ -813,7 +943,8 @@ class BetEngine:
                         except Exception as retry_exc:
                             logger.error(
                                 "Real sell bet %d retry error: %s — position NOT closed",
-                                copied_bet.id, retry_exc,
+                                copied_bet.id,
+                                retry_exc,
                             )
                             return 0.0
                     else:
@@ -822,7 +953,8 @@ class BetEngine:
                         logger.warning(
                             "Real sell bet %d: no on-chain position confirmed by Data API "
                             "(size_shares=%.4f) — closing as neutral",
-                            copied_bet.id, copied_bet.size_shares,
+                            copied_bet.id,
+                            copied_bet.size_shares,
                         )
                         fill_price = copied_bet.price_at_entry  # proceeds ≈ size_usdc → pnl ≈ 0
                 else:
@@ -836,7 +968,8 @@ class BetEngine:
             except Exception as exc:
                 logger.error(
                     "Real sell failed for bet %d: %s — position NOT closed, will retry",
-                    copied_bet.id, exc,
+                    copied_bet.id,
+                    exc,
                 )
                 return 0.0
 
@@ -866,7 +999,11 @@ class BetEngine:
 
         logger.info(
             "REAL SELL (resolution): bet %d %.4f shares @ %.4f = $%.2f pnl=$%.2f | balance -> $%.2f",
-            copied_bet.id, copied_bet.size_shares, fill_price, proceeds, pnl,
+            copied_bet.id,
+            copied_bet.size_shares,
+            fill_price,
+            proceeds,
+            pnl,
             session.current_balance_usdc,
         )
         return round(pnl, 2)
@@ -913,16 +1050,22 @@ class BetEngine:
 
         # --- REAL mode: multiple tranches, single sell ---
         import math as _math
+
         token_id = open_positions[0].token_id
 
         logger.info(
             "_close_all_tranches: REAL closing %d tranches for %s @ %.4f",
-            len(open_positions), token_id[:16], exit_price,
+            len(open_positions),
+            token_id[:16],
+            exit_price,
         )
         for pos in open_positions:
             logger.info(
                 "  tranche bet %d: entry=%.4f size_usdc=%.2f size_shares=%.4f",
-                pos.id, pos.price_at_entry, pos.size_usdc, pos.size_shares,
+                pos.id,
+                pos.price_at_entry,
+                pos.size_usdc,
+                pos.size_shares,
             )
 
         # Separate unfilled buys (size_shares==0) — close as NEUTRAL with refund
@@ -941,7 +1084,8 @@ class BetEngine:
             db.add(pos)
             logger.warning(
                 "_close_all_tranches: bet %d refunded $%.2f (buy was never filled)",
-                pos.id, pos.size_usdc,
+                pos.id,
+                pos.size_usdc,
             )
         db.add(session)
 
@@ -960,7 +1104,8 @@ class BetEngine:
             actual = self._get_actual_position_size(token_id)
             logger.info(
                 "_close_all_tranches: Data API actual balance = %s (DB total = %.4f)",
-                f"{actual:.4f}" if actual is not None else "ERROR", db_total_shares,
+                f"{actual:.4f}" if actual is not None else "ERROR",
+                db_total_shares,
             )
 
             if actual is None:
@@ -968,7 +1113,8 @@ class BetEngine:
                 sell_shares = _math.floor(db_total_shares * 100) / 100
                 logger.warning(
                     "_close_all_tranches: Data API error — using DB total %.4f (floored: %.4f)",
-                    db_total_shares, sell_shares,
+                    db_total_shares,
+                    sell_shares,
                 )
             elif actual == 0.0:
                 # Confirmed no position on chain — close all as NEUTRAL
@@ -1004,7 +1150,8 @@ class BetEngine:
                     logger.error(
                         "_close_all_tranches: CLOB no_position selling %.4f shares of %s "
                         "(Data API showed %.4f) — positions NOT closed, will retry",
-                        sell_shares, token_id[:16],
+                        sell_shares,
+                        token_id[:16],
                         actual if actual is not None else db_total_shares,
                     )
                     return False  # leave positions OPEN for next exit poll
@@ -1018,7 +1165,8 @@ class BetEngine:
             except Exception as exc:
                 logger.error(
                     "_close_all_tranches: sell failed for %s: %s — positions NOT closed",
-                    token_id[:16], exc,
+                    token_id[:16],
+                    exc,
                 )
                 return False
         else:
@@ -1059,12 +1207,14 @@ class BetEngine:
 
         for pos in filled:
             weight = (pos.size_usdc / total_invested) if total_invested > 0 else (1.0 / len(filled))
-            pos_proceeds = total_proceeds * weight          # from the CLOB sell
-            refund = pos.size_usdc * (1.0 - fill_scale)    # unfilled portion back to balance
-            effective_cost = pos.size_usdc * fill_scale     # what we actually paid for real tokens
+            pos_proceeds = total_proceeds * weight  # from the CLOB sell
+            refund = pos.size_usdc * (1.0 - fill_scale)  # unfilled portion back to balance
+            effective_cost = pos.size_usdc * fill_scale  # what we actually paid for real tokens
             pos_pnl = round(pos_proceeds - effective_cost, 2)
 
-            session.current_balance_usdc = max(0.0, session.current_balance_usdc + pos_proceeds + refund)
+            session.current_balance_usdc = max(
+                0.0, session.current_balance_usdc + pos_proceeds + refund
+            )
             session.total_pnl_usdc = round((session.total_pnl_usdc or 0.0) + pos_pnl, 2)
 
             if pos_pnl > 0.01:
@@ -1086,7 +1236,13 @@ class BetEngine:
 
             logger.info(
                 "_close_all_tranches: bet %d → %s pnl=$%.2f (%.0f%% weight, scale=%.3f, refund=$%.2f) | balance -> $%.2f",
-                pos.id, pos.status, pos_pnl, weight * 100, fill_scale, refund, session.current_balance_usdc,
+                pos.id,
+                pos.status,
+                pos_pnl,
+                weight * 100,
+                fill_scale,
+                refund,
+                session.current_balance_usdc,
             )
 
         return True
@@ -1110,6 +1266,7 @@ class BetEngine:
                 # Use Data API /positions — get_balance_allowance(CONDITIONAL)
                 # always returns 0 for proxy wallets so is unreliable here.
                 import requests as _requests
+
                 resp = _requests.get(
                     f"{settings.DATA_API_BASE}/positions",
                     params={"user": settings.POLY_FUNDER_ADDRESS},
@@ -1117,7 +1274,9 @@ class BetEngine:
                 )
                 resp.raise_for_status()
                 data = resp.json()
-                positions = data if isinstance(data, list) else data.get("data", data.get("positions", []))
+                positions = (
+                    data if isinstance(data, list) else data.get("data", data.get("positions", []))
+                )
                 pos = next((p for p in positions if str(p.get("asset", "")) == bet.token_id), None)
                 if pos is not None:
                     size = float(pos.get("size", 0))
@@ -1125,19 +1284,24 @@ class BetEngine:
                         logger.info(
                             "Archive resolve: bet %d token %s Data API size=%.4f "
                             "→ closing at 1.0 (redemption will settle)",
-                            bet.id, bet.token_id[:16], size,
+                            bet.id,
+                            bet.token_id[:16],
+                            size,
                         )
                         return 1.0
                 logger.info(
                     "Archive resolve: bet %d token %s Data API size=0 or not found "
                     "→ closing at entry price %.4f (lost or already redeemed)",
-                    bet.id, bet.token_id[:16], bet.price_at_entry,
+                    bet.id,
+                    bet.token_id[:16],
+                    bet.price_at_entry,
                 )
             except Exception as exc:
                 logger.warning(
                     "Archive resolve: Data API position check failed for bet %d: %s "
                     "— using entry price",
-                    bet.id, exc,
+                    bet.id,
+                    exc,
                 )
         return bet.price_at_entry
 
@@ -1169,25 +1333,36 @@ class BetEngine:
             )
 
             # Cache sessions by mode so we only query once per mode
-            session_cache: dict[str, Optional[MonitoringSession]] = {}
+            session_cache: dict[str, MonitoringSession | None] = {}
 
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             min_hours = settings.MIN_MARKET_HOURS_TO_CLOSE
 
             _LIVE_SPORTS = {
-                "Soccer", "Basketball", "Tennis", "eSports",
-                "American Football", "Baseball", "Hockey",
+                "Soccer",
+                "Basketball",
+                "Tennis",
+                "eSports",
+                "American Football",
+                "Baseball",
+                "Hockey",
             }
 
             # Whales whose bets should never be exited early via near-expiry
             # price thresholds — they hold positions to full oracle resolution.
+            # Arb-mode whales are included automatically: they bet at extreme prices
+            # for oracle settlement, not for a mid-market cashout.
             _NO_NEAR_EXPIRY_ALIASES = {"Crpyto", "Crpyto(lowball)"}
             _no_near_expiry_addresses: set[str] = {
                 w.address
-                for w in db.query(Whale).filter(Whale.alias.in_(_NO_NEAR_EXPIRY_ALIASES)).all()
+                for w in db.query(Whale)
+                .filter(
+                    Whale.alias.in_(_NO_NEAR_EXPIRY_ALIASES) | (Whale.arb_mode == True)  # noqa: E712
+                )
+                .all()
             }
 
-            for bet, (price, end_dt, is_resolved) in zip(open_bets, resolution_data):
+            for bet, (price, end_dt, is_resolved) in zip(open_bets, resolution_data, strict=False):
                 if price is None:
                     # Archive-timeout fallback: Polymarket removes resolved markets
                     # from the Gamma API index within a few hours of settlement.
@@ -1196,7 +1371,7 @@ class BetEngine:
                     # avoid positions being stuck OPEN indefinitely.
                     if bet.market_close_at is not None:
                         mc = (
-                            bet.market_close_at.replace(tzinfo=timezone.utc)
+                            bet.market_close_at.replace(tzinfo=UTC)
                             if bet.market_close_at.tzinfo is None
                             else bet.market_close_at
                         )
@@ -1207,7 +1382,9 @@ class BetEngine:
                             # Fall back to latest-by-mode only for legacy bets without session_id.
                             if bet.session_id:
                                 if bet.session_id not in session_cache:
-                                    session_cache[bet.session_id] = db.get(MonitoringSession, bet.session_id)
+                                    session_cache[bet.session_id] = db.get(
+                                        MonitoringSession, bet.session_id
+                                    )
                                 session_for_archive = session_cache.get(bet.session_id)
                             else:
                                 _archive_mode_key = f"archive_mode:{bet.mode}"
@@ -1224,11 +1401,15 @@ class BetEngine:
                                 logger.warning(
                                     "Archive timeout: bet %d no Gamma data %.1fh after "
                                     "market close — force-closing at %.4f",
-                                    bet.id, hours_since_close, fallback_price,
+                                    bet.id,
+                                    hours_since_close,
+                                    fallback_price,
                                 )
                                 self._close_bet(
-                                    copied_bet=bet, current_price=fallback_price,
-                                    session=session_for_archive, db=db,
+                                    copied_bet=bet,
+                                    current_price=fallback_price,
+                                    session=session_for_archive,
+                                    db=db,
                                     close_reason=f"Archive timeout ({hours_since_close:.1f}h since close)",
                                 )
                     continue
@@ -1265,7 +1446,7 @@ class BetEngine:
                         bet.market_close_at = end_dt_naive
 
                 # Time remaining to market close
-                hours_remaining: Optional[float] = None
+                hours_remaining: float | None = None
                 if end_dt is not None:
                     hours_remaining = (end_dt - now).total_seconds() / 3600.0
 
@@ -1320,10 +1501,15 @@ class BetEngine:
                     if price >= 0.95:
                         logger.info(
                             "Force-close: bet %d market ended %.1fh ago, price=%.4f (YES resolved)",
-                            bet.id, hours_since_close, price,
+                            bet.id,
+                            hours_since_close,
+                            price,
                         )
                         self._close_bet(
-                            copied_bet=bet, current_price=price, session=session, db=db,
+                            copied_bet=bet,
+                            current_price=price,
+                            session=session,
+                            db=db,
                             close_reason="Market ended",
                         )
                     elif price <= 0.05 and is_resolved:
@@ -1332,15 +1518,22 @@ class BetEngine:
                                 "Skipping premature NO resolution for live sport bet %d "
                                 "(%.1fh after market close < %.1fh minimum) — "
                                 "likely market cancellation, not game outcome",
-                                bet.id, hours_since_close, MIN_HOURS_AFTER_CLOSE,
+                                bet.id,
+                                hours_since_close,
+                                MIN_HOURS_AFTER_CLOSE,
                             )
                         else:
                             logger.info(
                                 "Force-close: bet %d market ended %.1fh ago, price=%.4f (NO resolved, oracle confirmed)",
-                                bet.id, hours_since_close, price,
+                                bet.id,
+                                hours_since_close,
+                                price,
                             )
                             self._close_bet(
-                                copied_bet=bet, current_price=price, session=session, db=db,
+                                copied_bet=bet,
+                                current_price=price,
+                                session=session,
+                                db=db,
                                 close_reason="Market ended",
                             )
                     else:
@@ -1349,27 +1542,37 @@ class BetEngine:
                         #   price <= 0.05 (loss) after ORACLE_TIMEOUT_H → accept as loss
                         #   mid-range price after ORACLE_STALE_H  → close at current price
                         # Live sports get longer windows because UMA settlement can
-                        # take 12–24h after game end.
+                        # take 12-24h after game end.
                         ORACLE_TIMEOUT_H = 8.0 if is_live_sport else 4.0
                         ORACLE_STALE_H = 24.0 if is_live_sport else 8.0
                         if price <= 0.05 and hours_since_close > ORACLE_TIMEOUT_H:
                             logger.info(
                                 "Oracle timeout: bet %d price=%.4f ≤0.05 for %.1fh after "
                                 "market close — force-closing as loss",
-                                bet.id, price, hours_since_close,
+                                bet.id,
+                                price,
+                                hours_since_close,
                             )
                             self._close_bet(
-                                copied_bet=bet, current_price=price, session=session, db=db,
+                                copied_bet=bet,
+                                current_price=price,
+                                session=session,
+                                db=db,
                                 close_reason=f"Oracle timeout ({hours_since_close:.1f}h since close)",
                             )
                         elif 0.05 < price < 0.95 and hours_since_close > ORACLE_STALE_H:
                             logger.warning(
                                 "Oracle stale: bet %d price=%.4f mid-range for %.1fh after "
                                 "market close — force-closing at current price",
-                                bet.id, price, hours_since_close,
+                                bet.id,
+                                price,
+                                hours_since_close,
                             )
                             self._close_bet(
-                                copied_bet=bet, current_price=price, session=session, db=db,
+                                copied_bet=bet,
+                                current_price=price,
+                                session=session,
+                                db=db,
                                 close_reason=f"Oracle stale ({hours_since_close:.1f}h since close)",
                             )
                         elif 0.05 < price < 0.95 and bet.mode == "REAL" and not is_live_sport:
@@ -1380,17 +1583,25 @@ class BetEngine:
                             logger.info(
                                 "REAL market-ended: bet %d price=%.4f mid-range %.1fh after close "
                                 "— attempting CLOB sell now (oracle pending)",
-                                bet.id, price, hours_since_close,
+                                bet.id,
+                                price,
+                                hours_since_close,
                             )
                             self._close_bet(
-                                copied_bet=bet, current_price=price, session=session, db=db,
+                                copied_bet=bet,
+                                current_price=price,
+                                session=session,
+                                db=db,
                                 close_reason=f"Market ended, oracle pending ({hours_since_close:.1f}h since close)",
                             )
                         else:
                             logger.debug(
                                 "Market ended %.1fh ago but not yet oracle-resolved "
                                 "(price=%.4f, resolved=%s) — waiting for on-chain settlement (bet %d)",
-                                hours_since_close, price, is_resolved, bet.id,
+                                hours_since_close,
+                                price,
+                                is_resolved,
+                                bet.id,
                             )
                     continue
 
@@ -1398,30 +1609,42 @@ class BetEngine:
                 if hours_remaining is not None and 0 <= hours_remaining < min_hours:
                     logger.debug(
                         "Near-expiry monitoring: bet %d closes in %.2fh, price=%.4f",
-                        bet.id, hours_remaining, price,
+                        bet.id,
+                        hours_remaining,
+                        price,
                     )
                     skip_near_expiry = bet.whale_address in _no_near_expiry_addresses
                     if skip_near_expiry:
                         logger.debug(
                             "Near-expiry: skipping price-based close for whale-excluded bet %d "
                             "(%.2fh left, price=%.4f) — waiting for oracle settlement",
-                            bet.id, hours_remaining, price,
+                            bet.id,
+                            hours_remaining,
+                            price,
                         )
                     elif not is_live_sport and (price >= 0.80 or price <= 0.20):
                         logger.info(
                             "Near-expiry close: bet %d price=%.4f crosses 0.80/0.20 "
                             "with %.2fh remaining",
-                            bet.id, price, hours_remaining,
+                            bet.id,
+                            price,
+                            hours_remaining,
                         )
                         self._close_bet(
-                            copied_bet=bet, current_price=price, session=session, db=db,
+                            copied_bet=bet,
+                            current_price=price,
+                            session=session,
+                            db=db,
                             close_reason=f"Near-expiry exit ({hours_remaining:.1f}h left, price {price:.3f})",
                         )
                     elif is_live_sport:
                         logger.debug(
                             "Near-expiry: skipping price-based close for live sport bet %d "
                             "(%s, %.2fh left, price=%.4f) — waiting for on-chain settlement",
-                            bet.id, bet.market_category, hours_remaining, price,
+                            bet.id,
+                            bet.market_category,
+                            hours_remaining,
+                            price,
                         )
                     continue
 
@@ -1433,14 +1656,30 @@ class BetEngine:
                 # When is_resolved=True the endDate may be a future UMA settlement
                 # deadline rather than the game end time, so market_ended is False
                 # even for long-finished matches — we close them here instead.
+                #
+                # Skip the threshold close when we ENTERED at an already-extreme price
+                # (>= 0.90 or <= 0.10) and the market hasn't confirmed resolution yet.
+                # These positions are intentional high-conviction entries; the whale will
+                # hold to resolution at 1.0 / 0.0 — close only on confirmed resolution
+                # or a whale exit signal, not just because price is still in that zone.
+                already_extreme_entry = (bet.price_at_entry >= 0.90 and price >= 0.95) or (
+                    bet.price_at_entry <= 0.10 and price <= 0.05
+                )
+                if already_extreme_entry and not is_resolved and not market_ended:
+                    continue
                 if (not is_live_sport or is_resolved) and (price >= 0.95 or price <= 0.05):
                     self._close_bet(
-                        copied_bet=bet, current_price=price, session=session, db=db,
+                        copied_bet=bet,
+                        current_price=price,
+                        session=session,
+                        db=db,
                         close_reason=f"Price reached resolution threshold ({price:.3f})",
                     )
                     logger.info(
                         "Resolved bet %d at price %.4f status=%s",
-                        bet.id, price, bet.status,
+                        bet.id,
+                        price,
+                        bet.status,
                     )
 
             db.commit()
@@ -1507,13 +1746,15 @@ class BetEngine:
                     resp.raise_for_status()
                     data = resp.json()
                     whale_positions = (
-                        data if isinstance(data, list)
+                        data
+                        if isinstance(data, list)
                         else data.get("data", data.get("positions", []))
                     )
                 except Exception as exc:
                     logger.warning(
                         "check_orphan_positions: failed to fetch positions for whale %s: %s",
-                        whale_address[:10], exc,
+                        whale_address[:10],
+                        exc,
                     )
                     continue
 
@@ -1549,8 +1790,10 @@ class BetEngine:
                             logger.info(
                                 "check_orphan_positions: bet %d — whale re-bought token %s "
                                 "(EXIT recorded at %s, bet opened at %s) — treating as orphan",
-                                bet.id, bet.token_id[:16],
-                                exit_after_open.timestamp, bet.opened_at,
+                                bet.id,
+                                bet.token_id[:16],
+                                exit_after_open.timestamp,
+                                bet.opened_at,
                             )
                             needs_close = True
 
@@ -1600,7 +1843,8 @@ class BetEngine:
                         logger.info(
                             "check_orphan_positions: bet %d — Data API shows 0 shares, "
                             "attempting CLOB sell (size_shares=%.4f) before closing neutral",
-                            bet.id, bet.size_shares,
+                            bet.id,
+                            bet.size_shares,
                         )
                         self._close_bet(
                             copied_bet=bet,
@@ -1615,7 +1859,9 @@ class BetEngine:
                         logger.info(
                             "check_orphan_positions: bet %d — whale exited token %s, "
                             "we hold %.4f shares — closing at market",
-                            bet.id, bet.token_id[:16], our_shares,
+                            bet.id,
+                            bet.token_id[:16],
+                            our_shares,
                         )
 
                         bet.size_shares = our_shares
@@ -1636,15 +1882,15 @@ class BetEngine:
 
     async def _fetch_resolution_data(
         self, token_ids: list
-    ) -> list[tuple[Optional[float], Optional[datetime], bool]]:
+    ) -> list[tuple[float | None, datetime | None, bool]]:
         """Fetch price, endDate and resolved flag for multiple tokens.
 
         Requests are throttled to at most MAX_CONCURRENT concurrent connections
         to avoid rate-limiting on the Gamma API.  Each failed request is retried
         once after a short back-off before giving up and returning (None, None, False).
         """
-        MAX_CONCURRENT = 2   # keep VPN pressure low — was 4, caused ReadTimeouts
-        RETRY_DELAY = 2.0    # seconds
+        MAX_CONCURRENT = 2  # keep VPN pressure low — was 4, caused ReadTimeouts
+        RETRY_DELAY = 2.0  # seconds
 
         sem = asyncio.Semaphore(MAX_CONCURRENT)
 
@@ -1666,13 +1912,11 @@ class BetEngine:
             follow_redirects=True,
             proxy=proxy,
         ) as http:
-            return await asyncio.gather(
-                *[_fetch_with_limit(tid, http) for tid in token_ids]
-            )
+            return await asyncio.gather(*[_fetch_with_limit(tid, http) for tid in token_ids])
 
     async def _get_resolution_data_async(
         self, token_id: str, http: httpx.AsyncClient
-    ) -> tuple[Optional[float], Optional[datetime], bool]:
+    ) -> tuple[float | None, datetime | None, bool]:
         """
         Async fetch of (price, end_dt, is_resolved) from Gamma API for a single token.
         is_resolved is True only when the market's oracle has actually settled the outcome.
@@ -1714,13 +1958,11 @@ class BetEngine:
                     continue
 
                 # Parse price
-                price: Optional[float] = None
+                price: float | None = None
                 idx = tokens.index(token_id)
                 if outcomes and idx < len(outcomes):
-                    try:
+                    with contextlib.suppress(TypeError, ValueError):
                         price = float(outcomes[idx])
-                    except (TypeError, ValueError):
-                        pass
 
                 # Parse endDate (Polymarket trading cutoff) and gameStartTime.
                 # For sports markets, endDate is often the betting cutoff set to
@@ -1728,7 +1970,7 @@ class BetEngine:
                 # kick-off. We prefer gameStartTime when it is later than endDate so
                 # that market_close_at (and thus the ledger countdown) reflects the
                 # real event time rather than an arbitrary trading cutoff.
-                end_dt: Optional[datetime] = None
+                end_dt: datetime | None = None
                 end_str = (
                     market.get("endDate")
                     or market.get("endDateIso")
@@ -1739,7 +1981,7 @@ class BetEngine:
                     try:
                         dt = datetime.fromisoformat(end_str.rstrip("Z"))
                         if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
+                            dt = dt.replace(tzinfo=UTC)
                         end_dt = dt
                     except (ValueError, TypeError):
                         pass
@@ -1750,7 +1992,7 @@ class BetEngine:
                     try:
                         gst = datetime.fromisoformat(str(game_start_str).rstrip("Z"))
                         if gst.tzinfo is None:
-                            gst = gst.replace(tzinfo=timezone.utc)
+                            gst = gst.replace(tzinfo=UTC)
                         if end_dt is None or gst > end_dt:
                             end_dt = gst
                     except (ValueError, TypeError):
@@ -1780,10 +2022,8 @@ class BetEngine:
                 #   ["0","1"]      → other_price=1.0  → oracle settled (close)
                 other_price_val: float = 0.0
                 if len(outcomes) >= 2:
-                    try:
+                    with contextlib.suppress(TypeError, ValueError, IndexError):
                         other_price_val = float(outcomes[1 - idx])
-                    except (TypeError, ValueError, IndexError):
-                        pass
 
                 # Primary signal: EITHER token ≥ 0.99 (oracle set price to "1").
                 # Must check both: when our token WINS (price=1.0, other=0.0)
@@ -1791,10 +2031,8 @@ class BetEngine:
                 # bet stuck open forever.
                 price_val: float = 0.0
                 if outcomes and idx < len(outcomes):
-                    try:
+                    with contextlib.suppress(TypeError, ValueError):
                         price_val = float(outcomes[idx])
-                    except (TypeError, ValueError):
-                        pass
                 is_resolved = other_price_val >= 0.99 or price_val >= 0.99
 
                 # When the oracle has settled our token at 1.0 (we won) but the
@@ -1805,7 +2043,9 @@ class BetEngine:
                     logger.info(
                         "_get_resolution_data_async: oracle price_val=%.4f overrides "
                         "CLOB price=%.4f for winning token %s",
-                        price_val, price, token_id[:16],
+                        price_val,
+                        price,
+                        token_id[:16],
                     )
                     price = price_val
 
@@ -1817,7 +2057,8 @@ class BetEngine:
                     logger.info(
                         "_get_resolution_data_async: umaResolutionStatus=resolved "
                         "but outcomePrices=%s (price lag) — treating as resolved for token %s",
-                        outcomes, token_id[:16],
+                        outcomes,
+                        token_id[:16],
                     )
                     is_resolved = True
 
@@ -1825,7 +2066,9 @@ class BetEngine:
         except Exception as exc:
             logger.warning(
                 "_get_resolution_data_async error for %s: %s (%s)",
-                token_id, exc, type(exc).__name__,
+                token_id,
+                exc,
+                type(exc).__name__,
             )
         return None, None, False
 
@@ -1833,45 +2076,27 @@ class BetEngine:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _compute_exit_fraction(self, whale_bet: WhaleBet, db: DBSession) -> float:
+    def _compute_exit_fraction(
+        self,
+        whale_bet: WhaleBet,
+        open_positions: list,
+        db: DBSession,
+    ) -> float:
         """Estimate what fraction of the whale's position this exit represents.
 
-        Sums all tracked BUY shares for this whale/token, subtracts prior SELLs,
-        then returns current_exit_shares / remaining_position.
+        Uses our own open CopiedBet positions as the denominator — anchors the
+        fraction to what WE actually hold rather than the whale's full history.
 
         Returns 1.0 (full exit) when data is insufficient to determine the fraction.
         """
-        from sqlalchemy import func as _func
         if not (whale_bet.whale_id and whale_bet.token_id and whale_bet.size_shares > 0):
             return 1.0
 
-        total_bought = (
-            db.query(_func.sum(WhaleBet.size_shares))
-            .filter(
-                WhaleBet.whale_id == whale_bet.whale_id,
-                WhaleBet.token_id == whale_bet.token_id,
-                WhaleBet.bet_type == "OPEN",
-            )
-            .scalar()
-        ) or 0.0
+        our_open_shares = sum(cb.size_shares for cb in open_positions if cb.size_shares)
+        if our_open_shares <= 0:
+            return 1.0  # no open positions tracked — treat as full exit
 
-        # Prior sells — exclude the current exit so we don't double-count it
-        total_prior_sold = (
-            db.query(_func.sum(WhaleBet.size_shares))
-            .filter(
-                WhaleBet.whale_id == whale_bet.whale_id,
-                WhaleBet.token_id == whale_bet.token_id,
-                WhaleBet.bet_type == "EXIT",
-                WhaleBet.id != whale_bet.id,
-            )
-            .scalar()
-        ) or 0.0
-
-        remaining = max(total_bought - total_prior_sold, 0.0)
-        if remaining <= 0:
-            return 1.0  # can't determine — default to full exit (close everything)
-
-        fraction = whale_bet.size_shares / remaining
+        fraction = whale_bet.size_shares / our_open_shares
         return min(fraction, 1.0)
 
     def _handle_exit(
@@ -1879,8 +2104,8 @@ class BetEngine:
         whale_bet: WhaleBet,
         session: MonitoringSession,
         db: DBSession,
-        live_exit_price: Optional[float] = None,
-    ) -> Optional[CopiedBet | bool]:
+        live_exit_price: float | None = None,
+    ) -> CopiedBet | bool | None:
         """Whale is selling out of a position.
 
         - Single tranche: always close it.
@@ -1905,46 +2130,71 @@ class BetEngine:
         if not open_positions:
             # We never held a position here — this EXIT is orphaned (whale sold a
             # market we either missed or skipped at entry).  Drop silently.
-            logger.debug(
-                "_handle_exit: no open positions for whale_bet %d (market %s, %s mode) — skipping silently",
-                whale_bet.id, whale_bet.market_id[:16], session.mode,
+            logger.warning(
+                "_handle_exit: no open positions for whale_bet %d "
+                "(market_id=%r, token_id=%s, mode=%s, whale=%s) — orphaned exit",
+                whale_bet.id,
+                whale_bet.market_id,
+                whale_bet.token_id,
+                session.mode,
+                (exiting_whale_address or "?")[:10],
             )
             return None
 
         exit_price = whale_bet.price
-        whale_alias = (whale_bet.whale.alias or whale_bet.whale.address[:10]) if whale_bet.whale else "?"
+        whale_alias = (
+            (whale_bet.whale.alias or whale_bet.whale.address[:10]) if whale_bet.whale else "?"
+        )
 
         # For simulation, use the live price at exit time so the fill mirrors what
         # real mode would get from the CLOB (which fills at the current best bid,
-        # not the whale's historical sell price). Fall back to whale price if unavailable.
+        # not the whale's historical sell price). Fall back to whale price if unavailable
+        # or if the CLOB returns 0.0 (resolved/illiquid market — invalid for an active exit).
         mode = open_positions[0].mode if open_positions else session.mode
         sim_exit_price = (
             live_exit_price
-            if (live_exit_price is not None and mode in ("SIMULATION", "HEDGE_SIM"))
+            if (
+                live_exit_price is not None
+                and live_exit_price > 0.0
+                and mode in ("SIMULATION", "HEDGE_SIM")
+            )
             else exit_price
         )
 
-        exit_reason = f"Whale exited ({whale_alias} sold @ {exit_price:.3f}, we sold @ {sim_exit_price:.3f})"
+        exit_reason = (
+            f"Whale exited ({whale_alias} sold @ {exit_price:.3f}, we sold @ {sim_exit_price:.3f})"
+        )
 
         close_ok: bool
         if len(open_positions) == 1:
             # Single tranche — always close regardless of fraction
             logger.info(
                 "_handle_exit: closing 1 tranche for whale %s token %s @ %.4f (sim fill @ %.4f)",
-                (exiting_whale_address or "?")[:10], whale_bet.token_id[:16], exit_price, sim_exit_price,
+                (exiting_whale_address or "?")[:10],
+                whale_bet.token_id[:16],
+                exit_price,
+                sim_exit_price,
             )
-            close_ok = self._close_all_tranches(open_positions, sim_exit_price, session, db, exit_reason)
+            close_ok = self._close_all_tranches(
+                open_positions, sim_exit_price, session, db, exit_reason
+            )
         else:
             # Multiple tranches — determine full vs partial exit
-            exit_fraction = self._compute_exit_fraction(whale_bet, db)
+            exit_fraction = self._compute_exit_fraction(whale_bet, open_positions, db)
             if exit_fraction >= _FULL_EXIT_THRESHOLD:
                 logger.info(
                     "_handle_exit: full exit (%.0f%%) — closing all %d tranches "
                     "for whale %s token %s @ %.4f (sim fill @ %.4f)",
-                    exit_fraction * 100, len(open_positions),
-                    (exiting_whale_address or "?")[:10], whale_bet.token_id[:16], exit_price, sim_exit_price,
+                    exit_fraction * 100,
+                    len(open_positions),
+                    (exiting_whale_address or "?")[:10],
+                    whale_bet.token_id[:16],
+                    exit_price,
+                    sim_exit_price,
                 )
-                close_ok = self._close_all_tranches(open_positions, sim_exit_price, session, db, exit_reason)
+                close_ok = self._close_all_tranches(
+                    open_positions, sim_exit_price, session, db, exit_reason
+                )
             else:
                 # Partial exit — close oldest tranches first (FIFO)
                 n_to_close = max(1, round(len(open_positions) * exit_fraction))
@@ -1952,11 +2202,18 @@ class BetEngine:
                 logger.info(
                     "_handle_exit: partial exit (%.0f%%) — closing %d of %d tranches "
                     "for whale %s token %s @ %.4f (sim fill @ %.4f), %d remain open",
-                    exit_fraction * 100, n_to_close, len(open_positions),
-                    (exiting_whale_address or "?")[:10], whale_bet.token_id[:16], exit_price, sim_exit_price,
+                    exit_fraction * 100,
+                    n_to_close,
+                    len(open_positions),
+                    (exiting_whale_address or "?")[:10],
+                    whale_bet.token_id[:16],
+                    exit_price,
+                    sim_exit_price,
                     len(open_positions) - n_to_close,
                 )
-                close_ok = self._close_all_tranches(to_close, sim_exit_price, session, db, exit_reason)
+                close_ok = self._close_all_tranches(
+                    to_close, sim_exit_price, session, db, exit_reason
+                )
 
         db.commit()
         if not close_ok:
@@ -1981,7 +2238,8 @@ class BetEngine:
         whale = whale_bet.whale
         whale_avg = whale.avg_bet_size_usdc if whale else 0.0
         risk_factor = risk_calc.calculate_risk_factor(
-            whale_bet.size_usdc, whale_avg,
+            whale_bet.size_usdc,
+            whale_avg,
             conviction_exponent=settings.CONVICTION_EXPONENT,
         )
         suggested_add_usdc = risk_calc.calculate_bet_size(
@@ -1994,21 +2252,18 @@ class BetEngine:
         # creating a new row for every addition.  This keeps one signal per position
         # showing the total the whale has added and how many times they've added.
         existing_signal = (
-            db.query(AddToPositionSignal)
-            .filter_by(copied_bet_id=existing_open.id)
-            .first()
+            db.query(AddToPositionSignal).filter_by(copied_bet_id=existing_open.id).first()
         )
         if existing_signal:
             existing_signal.whale_additional_usdc += whale_bet.size_usdc
             existing_signal.whale_additional_shares += whale_bet.size_shares
             existing_signal.addition_count = (existing_signal.addition_count or 1) + 1
             existing_signal.last_addition_at = whale_bet.timestamp
-            existing_signal.price = whale_bet.price          # latest addition price
+            existing_signal.price = whale_bet.price  # latest addition price
             existing_signal.suggested_add_usdc = suggested_add_usdc
             db.add(existing_signal)
             logger.info(
-                "Updated add-to-position signal for copied_bet=%d: "
-                "total=$%.2f additions=%d",
+                "Updated add-to-position signal for copied_bet=%d: total=$%.2f additions=%d",
                 existing_open.id,
                 existing_signal.whale_additional_usdc,
                 existing_signal.addition_count,
@@ -2064,8 +2319,10 @@ class BetEngine:
             self._drift_watchlist[whale_bet.id] = item
         logger.info(
             "Drift watchlist: added whale_bet=%d token=%s…  expires_in=%ds  (watchlist size=%d)",
-            whale_bet.id, whale_bet.token_id[:12],
-            settings.DRIFT_RETRY_WINDOW_SECONDS, len(self._drift_watchlist),
+            whale_bet.id,
+            whale_bet.token_id[:12],
+            settings.DRIFT_RETRY_WINDOW_SECONDS,
+            len(self._drift_watchlist),
         )
 
     async def retry_drift_watchlist(self, db: DBSession) -> None:
@@ -2082,6 +2339,10 @@ class BetEngine:
             items_snapshot = list(self._drift_watchlist.items())
 
         now = time.monotonic()
+        # Within-iteration dedup: prevents the race condition where multiple watchlist
+        # items for the same token all see "no open position" before the first one's
+        # DB commit is visible.
+        placed_tokens_this_iter: set[str] = set()
         for whale_bet_id, item in items_snapshot:
             # 1. Expiry check
             if now > item.expires_at:
@@ -2093,7 +2354,11 @@ class BetEngine:
             # 2. Load and validate session
             session = db.get(MonitoringSession, item.session_id)
             if not session or not session.is_active:
-                logger.debug("Drift watchlist: session %d gone — removing whale_bet=%d", item.session_id, whale_bet_id)
+                logger.debug(
+                    "Drift watchlist: session %d gone — removing whale_bet=%d",
+                    item.session_id,
+                    whale_bet_id,
+                )
                 with self._drift_lock:
                     self._drift_watchlist.pop(whale_bet_id, None)
                 continue
@@ -2118,8 +2383,11 @@ class BetEngine:
                     logger.info(
                         "Drift watchlist: whale_bet=%d aborted — whale exited token %s...%s "
                         "at %s (after buy at %s) — removing",
-                        whale_bet_id, item.token_id[:10], item.token_id[-6:],
-                        later_sell.timestamp, original_wb.timestamp,
+                        whale_bet_id,
+                        item.token_id[:10],
+                        item.token_id[-6:],
+                        later_sell.timestamp,
+                        original_wb.timestamp,
                     )
                     with self._drift_lock:
                         self._drift_watchlist.pop(whale_bet_id, None)
@@ -2143,100 +2411,178 @@ class BetEngine:
                         .all()
                     )
                     if _existing:
-                        _closest = min(_existing, key=lambda p: abs(item.whale_price - p.price_at_entry))
+                        _closest = min(
+                            _existing, key=lambda p: abs(item.whale_price - p.price_at_entry)
+                        )
                         if abs(item.whale_price - _closest.price_at_entry) <= _SAME_PRICE_TOLERANCE:
                             logger.info(
                                 "Drift watchlist: whale_bet=%d — open position already exists "
                                 "at %.3f (retry price %.3f within %.2f tolerance) — removing",
-                                whale_bet_id, _closest.price_at_entry,
-                                item.whale_price, _SAME_PRICE_TOLERANCE,
+                                whale_bet_id,
+                                _closest.price_at_entry,
+                                item.whale_price,
+                                _SAME_PRICE_TOLERANCE,
                             )
                             with self._drift_lock:
                                 self._drift_watchlist.pop(whale_bet_id, None)
                             continue
 
+            # 4b. Within-iteration dedup: if another watchlist item for the same token
+            #     already placed a bet this loop cycle, the DB won't reflect it yet.
+            #     Skip to avoid the race-condition that caused multi-position flooding.
+            if item.token_id in placed_tokens_this_iter:
+                logger.info(
+                    "Drift watchlist: whale_bet=%d — token %s already placed this "
+                    "iteration — removing to prevent duplicate",
+                    whale_bet_id,
+                    item.token_id[:16],
+                )
+                with self._drift_lock:
+                    self._drift_watchlist.pop(whale_bet_id, None)
+                continue
+
+            # 4c. Per-market hard cap — cross-iteration protection against exceeding
+            #     MAX_OPEN_POSITIONS_PER_MARKET even across sequential retry cycles.
+            _market_id_check = (
+                original_wb.market_id if original_wb else item.market_info.get("conditionId", "")
+            )
+            if _market_id_check:
+                _market_open = (
+                    db.query(CopiedBet)
+                    .filter(
+                        CopiedBet.market_id == _market_id_check,
+                        CopiedBet.status == "OPEN",
+                        CopiedBet.mode == session.mode,
+                    )
+                    .count()
+                )
+                if _market_open >= settings.MAX_OPEN_POSITIONS_PER_MARKET:
+                    logger.info(
+                        "Drift watchlist: whale_bet=%d — market %s already has %d open "
+                        "position(s) (cap=%d) — removing",
+                        whale_bet_id,
+                        _market_id_check[:16],
+                        _market_open,
+                        settings.MAX_OPEN_POSITIONS_PER_MARKET,
+                    )
+                    with self._drift_lock:
+                        self._drift_watchlist.pop(whale_bet_id, None)
+                    continue
+
             # 5. Fetch a live price, bypassing the 30 s cache
             try:
                 live_price = await self._client.get_best_price(item.token_id, force_refresh=True)
             except Exception as exc:
-                logger.debug("Drift watchlist: price fetch failed for whale_bet=%d: %s", whale_bet_id, exc)
+                logger.debug(
+                    "Drift watchlist: price fetch failed for whale_bet=%d: %s", whale_bet_id, exc
+                )
                 continue
 
             # 6. Re-check drift only — all other guards already passed
             price_ok, price_reason = risk_calc.check_price_staleness(
                 whale_price=item.whale_price,
                 live_price=live_price,
-                max_drift=settings.MAX_PRICE_DRIFT_PCT,
+                max_upward_drift=settings.MAX_UPWARD_DRIFT_PCT,
+                max_downward_drift=settings.MAX_DOWNWARD_DRIFT_PCT,
             )
             if not price_ok:
                 logger.debug(
                     "Drift watchlist: whale_bet=%d still drifted (%s) — retrying",
-                    whale_bet_id, price_reason,
+                    whale_bet_id,
+                    price_reason,
                 )
                 continue
 
-            # 7. Price is back in range — execute
-            mode = session.mode
-            try:
-                if mode in ("SIMULATION", "HEDGE_SIM"):
-                    size_shares, actual_price, actual_cost = self.simulate_buy(
-                        session=session,
-                        market_id=item.market_info.get("conditionId", ""),
-                        token_id=item.token_id,
-                        question=item.market_info.get("question", ""),
-                        outcome=item.market_info.get("outcome", ""),
-                        price=live_price if live_price is not None else item.whale_price,
-                        size_usdc=item.bet_size_usdc,
-                        db=db,
-                        live_price=live_price,
+            with self._placement_lock:
+                db.refresh(session)
+                if session.current_balance_usdc < 1.0:
+                    logger.info(
+                        "Drift watchlist: whale_bet=%d — insufficient balance $%.2f — removing",
+                        whale_bet_id,
+                        session.current_balance_usdc,
                     )
-                    item.bet_size_usdc = actual_cost  # update cost basis to fee-inclusive amount
-                else:
-                    order_resp = self.place_real_buy(
-                        token_id=item.token_id,
-                        size_usdc=item.bet_size_usdc,
-                        price=item.whale_price,
+                    with self._drift_lock:
+                        self._drift_watchlist.pop(whale_bet_id, None)
+                    continue
+                # 7. Price is back in range — execute
+                mode = session.mode
+                try:
+                    if mode in ("SIMULATION", "HEDGE_SIM"):
+                        size_shares, actual_price, actual_cost = self.simulate_buy(
+                            session=session,
+                            market_id=item.market_info.get("conditionId", ""),
+                            token_id=item.token_id,
+                            question=item.market_info.get("question", ""),
+                            outcome=item.market_info.get("outcome", ""),
+                            price=live_price if live_price is not None else item.whale_price,
+                            size_usdc=item.bet_size_usdc,
+                            db=db,
+                            live_price=live_price,
+                        )
+                        item.bet_size_usdc = actual_cost  # update cost basis to fee-inclusive amount
+                    else:
+                        order_resp = self.place_real_buy(
+                            token_id=item.token_id,
+                            size_usdc=item.bet_size_usdc,
+                            price=item.whale_price,
+                        )
+                        size_shares = float(
+                            order_resp.get(
+                                "size_matched", item.bet_size_usdc / max(item.whale_price, 0.01)
+                            )
+                        )
+                        fill_price = (
+                            order_resp.get("price")
+                            or order_resp.get("avgPrice")
+                            or order_resp.get("average_price")
+                        )
+                        actual_price = (
+                            float(fill_price) if fill_price else (live_price or item.whale_price)
+                        )
+                        # Deduct from session balance (simulate_buy handles this for SIM)
+                        session.current_balance_usdc = max(
+                            0.0, session.current_balance_usdc - item.bet_size_usdc
+                        )
+                        db.add(session)
+                except Exception as exc:
+                    logger.error(
+                        "Drift watchlist: placement failed for whale_bet=%d: %s", whale_bet_id, exc
                     )
-                    size_shares = float(order_resp.get("size_matched", item.bet_size_usdc / max(item.whale_price, 0.01)))
-                    fill_price = (
-                        order_resp.get("price")
-                        or order_resp.get("avgPrice")
-                        or order_resp.get("average_price")
+                    with self._drift_lock:
+                        self._drift_watchlist.pop(whale_bet_id, None)
+                    continue
+    
+                # 8. Upgrade the existing SKIPPED record to OPEN in-place
+                copied_bet = db.get(CopiedBet, item.copied_bet_id)
+                if copied_bet is None:
+                    logger.warning(
+                        "Drift watchlist: CopiedBet %d not found — removing", item.copied_bet_id
                     )
-                    actual_price = float(fill_price) if fill_price else (live_price or item.whale_price)
-                    # Deduct from session balance (simulate_buy handles this for SIM)
-                    session.current_balance_usdc = max(0.0, session.current_balance_usdc - item.bet_size_usdc)
-                    db.add(session)
-            except Exception as exc:
-                logger.error("Drift watchlist: placement failed for whale_bet=%d: %s", whale_bet_id, exc)
-                with self._drift_lock:
-                    self._drift_watchlist.pop(whale_bet_id, None)
-                continue
+                    with self._drift_lock:
+                        self._drift_watchlist.pop(whale_bet_id, None)
+                    continue
+    
+                copied_bet.status = "OPEN"
+                copied_bet.price_at_entry = actual_price
+                copied_bet.size_shares = size_shares
+                copied_bet.skip_reason = None
+                copied_bet.opened_at = datetime.utcnow()
+                session.total_bets_placed += 1
+                db.add(copied_bet)
+                db.add(session)
+                db.commit()
+                db.refresh(copied_bet)
 
-            # 8. Upgrade the existing SKIPPED record to OPEN in-place
-            copied_bet = db.get(CopiedBet, item.copied_bet_id)
-            if copied_bet is None:
-                logger.warning("Drift watchlist: CopiedBet %d not found — removing", item.copied_bet_id)
-                with self._drift_lock:
-                    self._drift_watchlist.pop(whale_bet_id, None)
-                continue
-
-            copied_bet.status = "OPEN"
-            copied_bet.price_at_entry = actual_price
-            copied_bet.size_shares = size_shares
-            copied_bet.skip_reason = None
-            copied_bet.opened_at = datetime.utcnow()
-            session.total_bets_placed += 1
-            db.add(copied_bet)
-            db.add(session)
-            db.commit()
-            db.refresh(copied_bet)
-
+            placed_tokens_this_iter.add(item.token_id)
             with self._drift_lock:
                 self._drift_watchlist.pop(whale_bet_id, None)
             logger.info(
                 "Drift watchlist: RETRY SUCCESS whale_bet=%d — placed %s @ %.4f for $%.2f  (watchlist size=%d)",
-                whale_bet_id, mode, actual_price, item.bet_size_usdc, len(self._drift_watchlist),
+                whale_bet_id,
+                mode,
+                actual_price,
+                item.bet_size_usdc,
+                len(self._drift_watchlist),
             )
 
     def _create_skipped_bet(
@@ -2299,7 +2645,7 @@ class BetEngine:
             "market is already closed",
             "market is already resolved",
             "market is inactive",
-            "closed ",       # "Market closed 3.2h ago"
+            "closed ",  # "Market closed 3.2h ago"
             "market status is",
             "market end date unknown",
         )
@@ -2312,8 +2658,8 @@ class BetEngine:
         token_id: str,
         session_mode: str,
         db: DBSession,
-        whale_address: Optional[str] = None,
-    ) -> Optional[CopiedBet]:
+        whale_address: str | None = None,
+    ) -> CopiedBet | None:
         """Find an OPEN CopiedBet for this market/token in the given session.
 
         If whale_address is provided (recommended for exits and add-to-position
@@ -2337,24 +2683,28 @@ class BetEngine:
         token_id: str,
         session_mode: str,
         db: DBSession,
-        whale_address: Optional[str] = None,
+        whale_address: str | None = None,
     ) -> list:
         """Return ALL OPEN CopiedBets for this market/token in entry order (oldest first).
 
         Used by _handle_exit to close every open tranche simultaneously when the
         whale exits a position they may have built up across multiple BUY trades.
         """
-        q = db.query(CopiedBet).filter(
-            CopiedBet.market_id == market_id,
-            CopiedBet.token_id == token_id,
-            CopiedBet.status == "OPEN",
-            CopiedBet.mode == session_mode,
-        ).order_by(CopiedBet.opened_at.asc())
+        q = (
+            db.query(CopiedBet)
+            .filter(
+                CopiedBet.market_id == market_id,
+                CopiedBet.token_id == token_id,
+                CopiedBet.status == "OPEN",
+                CopiedBet.mode == session_mode,
+            )
+            .order_by(CopiedBet.opened_at.asc())
+        )
         if whale_address is not None:
             q = q.filter(CopiedBet.whale_address == whale_address)
         return q.all()
 
-    def _get_actual_position_size(self, token_id: str) -> Optional[float]:
+    def _get_actual_position_size(self, token_id: str) -> float | None:
         """
         Query the Polymarket Data API for our actual on-chain token balance.
 
@@ -2365,6 +2715,7 @@ class BetEngine:
         on API error (caller should treat None as "unknown, don't retry").
         """
         import requests as _requests
+
         try:
             resp = _requests.get(
                 f"{settings.DATA_API_BASE}/positions",
@@ -2374,19 +2725,21 @@ class BetEngine:
             resp.raise_for_status()
             data = resp.json()
             positions = (
-                data if isinstance(data, list)
-                else data.get("data", data.get("positions", []))
+                data if isinstance(data, list) else data.get("data", data.get("positions", []))
             )
             logger.info(
                 "_get_actual_position_size: Data API returned %d position(s) for %s, "
                 "looking for token %s",
-                len(positions), settings.POLY_FUNDER_ADDRESS[:10], token_id[:16],
+                len(positions),
+                settings.POLY_FUNDER_ADDRESS[:10],
+                token_id[:16],
             )
             # Log first few assets to help diagnose format mismatches
             for p in positions[:5]:
                 logger.debug(
                     "  Data API position: asset=%s size=%s",
-                    str(p.get("asset", ""))[:20], p.get("size"),
+                    str(p.get("asset", ""))[:20],
+                    p.get("size"),
                 )
 
             # Try exact match first, then strip/normalise for robustness
@@ -2416,7 +2769,8 @@ class BetEngine:
                 size = float(pos.get("size", 0))
                 logger.info(
                     "_get_actual_position_size: found %.4f shares for token %s",
-                    size, token_id[:16],
+                    size,
+                    token_id[:16],
                 )
                 return size
             logger.info(
@@ -2427,7 +2781,8 @@ class BetEngine:
         except Exception as exc:
             logger.warning(
                 "_get_actual_position_size error for %s: %s — will not retry sell",
-                token_id[:16], exc,
+                token_id[:16],
+                exc,
             )
             return None
 
@@ -2438,7 +2793,7 @@ class BetEngine:
         session_mode: str,
         db: DBSession,
         whale_address: str,
-    ) -> Optional[CopiedBet]:
+    ) -> CopiedBet | None:
         """Return an OPEN position for the same whale in the same market but on a
         different token_id (opposite outcome). Used for hedge detection in HEDGE_SIM mode."""
         return (

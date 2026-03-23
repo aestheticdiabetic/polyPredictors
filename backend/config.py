@@ -4,6 +4,7 @@ Application configuration - loads from .env file.
 
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 # Load .env from project root
@@ -34,12 +35,14 @@ class Settings:
 
     # Monitoring settings
     POLLING_INTERVAL_SECONDS: int = int(os.getenv("POLLING_INTERVAL_SECONDS", "5"))
-    MIN_MARKET_HOURS_TO_CLOSE: float = float(os.getenv("MIN_MARKET_HOURS_TO_CLOSE", "1.0"))
+    MIN_MARKET_HOURS_TO_CLOSE: float = float(os.getenv("MIN_MARKET_HOURS_TO_CLOSE", "0.0"))
 
     # How often (in seconds) the permanent resolution checker runs.
     # Lower = more likely to catch prices at 0.05 before they snap to 0.0.
     # Default 60s is a reasonable balance; set lower (e.g. 30) for tighter stops.
-    RESOLUTION_CHECK_INTERVAL_SECONDS: int = int(os.getenv("RESOLUTION_CHECK_INTERVAL_SECONDS", "60"))
+    RESOLUTION_CHECK_INTERVAL_SECONDS: int = int(
+        os.getenv("RESOLUTION_CHECK_INTERVAL_SECONDS", "60")
+    )
 
     # Ignore whale trades older than this many hours.  Prevents the initial backlog
     # of historical trades (fetched when a whale is first added) from being evaluated
@@ -49,13 +52,16 @@ class Settings:
     # Maximum allowable price drift (in probability points) between when the whale
     # placed their bet and when we copy it.  E.g. 0.05 means: if the whale bet at
     # 0.20 and the current price is now above 0.25 or below 0.15, skip the bet.
+    # Still used for the exit-drift guard in polymarket_client (sell-side check).
     MAX_PRICE_DRIFT_PCT: float = float(os.getenv("MAX_PRICE_DRIFT_PCT", "0.05"))
 
-    # REAL mode only: tighter cap on upward price drift (current > whale price).
-    # Buying above the whale's entry compounds with fees to make the trade
-    # unprofitable. Default 0.02 = 2 probability points. Set to the same value as
-    # MAX_PRICE_DRIFT_PCT to disable asymmetric behaviour.
-    REAL_MAX_UPWARD_DRIFT: float = float(os.getenv("REAL_MAX_UPWARD_DRIFT", "0.02"))
+    # Asymmetric entry-drift thresholds (applied to all session modes).
+    # Upward drift (price > whale entry) means we'd overpay relative to the whale;
+    # we cap this tightly at 2 probability points.
+    # Downward drift (price < whale entry) is actually favourable — we get in cheaper
+    # — so we allow up to 10 probability points before treating it as a stale signal.
+    MAX_UPWARD_DRIFT_PCT: float = float(os.getenv("MAX_UPWARD_DRIFT_PCT", "0.02"))
+    MAX_DOWNWARD_DRIFT_PCT: float = float(os.getenv("MAX_DOWNWARD_DRIFT_PCT", "0.10"))
 
     # REAL mode only: maximum entry price allowed. Bets above this price have too
     # little remaining upside to cover the taker fee. Default 0.80.
@@ -69,10 +75,33 @@ class Settings:
     # a whale that places many small tracker bets on long-shot outcomes.
     MIN_BET_USDC: float = float(os.getenv("MIN_BET_USDC", "1.0"))
 
+    # Maximum open positions (tranches) per market enforced by the drift watchlist
+    # retry loop.  Prevents the race condition where multiple watchlist items for the
+    # same token all fire before the first fill is committed to the database.
+    # Does NOT restrict new tranches opened via the normal process_new_whale_bet path —
+    # those are governed by the add-to-position guard (same whale, same price ±0.03).
+    MAX_OPEN_POSITIONS_PER_MARKET: int = int(os.getenv("MAX_OPEN_POSITIONS_PER_MARKET", "2"))
+
+    # Arb mode: price at which the extremity multiplier equals 1.0 (neutral).
+    # extremity = abs(price - 0.5); rf = extremity / ARB_MIDPOINT, clamped [0.5, 3.0].
+    # At 0.25 (default): price 0.25 or 0.75 → rf=1.0 (base bet); price 0.10/0.90 → rf=1.6.
+    ARB_MIDPOINT: float = float(os.getenv("ARB_MIDPOINT", "0.25"))
+
+    # Arb mode: expected number of concurrent open positions for the whale.
+    # The wallet is divided across this many positions and scaled by the whale's
+    # relative bet size.  bet = (balance / N) * (whale_bet / whale_avg).
+    # Set to match how many simultaneous positions your arb whale typically holds.
+    ARB_CONCURRENT_POSITIONS: int = int(os.getenv("ARB_CONCURRENT_POSITIONS", "6"))
+
     # Exponent applied to conviction ratios >= 1.0 when computing the risk factor.
     # 1.0 = linear (original behaviour). 1.5 = convex curve that rewards high
     # conviction bets disproportionately (e.g. 2x avg → 2.83x factor vs 2.0x before).
     CONVICTION_EXPONENT: float = float(os.getenv("CONVICTION_EXPONENT", "1.5"))
+
+    # Background price pre-fetching — keeps prices fresh for all tokens in open positions
+    # so that when a new whale trade fires the cached price is at most this many seconds old.
+    # Set to 0 to disable. Lower = fresher prices, more CLOB API calls.
+    PRICE_PREFETCH_INTERVAL_SECONDS: int = int(os.getenv("PRICE_PREFETCH_INTERVAL_SECONDS", "3"))
 
     # Drift-skip retry watchlist — for near-expiry markets that were skipped due to
     # price drift, re-check the price this often (seconds) and for this long (seconds).
@@ -83,7 +112,9 @@ class Settings:
 
     # How often (seconds) to check for redeemable positions and redeem them on-chain.
     # Only active when REAL credentials are configured. Default 5 minutes.
-    REDEMPTION_CHECK_INTERVAL_SECONDS: int = int(os.getenv("REDEMPTION_CHECK_INTERVAL_SECONDS", "300"))
+    REDEMPTION_CHECK_INTERVAL_SECONDS: int = int(
+        os.getenv("REDEMPTION_CHECK_INTERVAL_SECONDS", "300")
+    )
 
     # Polygon RPC URL used for on-chain redemption transactions.
     POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
@@ -113,7 +144,9 @@ class Settings:
     # After FOK retry exhaustion, accept a fill at the current best bid regardless
     # of drift from the whale's exit price. Prevents positions staying open forever
     # when the market is moving fast. Default False = leave OPEN for next poll.
-    SELL_ACCEPT_DEGRADED_FILL: bool = os.getenv("SELL_ACCEPT_DEGRADED_FILL", "false").lower() == "true"
+    SELL_ACCEPT_DEGRADED_FILL: bool = (
+        os.getenv("SELL_ACCEPT_DEGRADED_FILL", "false").lower() == "true"
+    )
 
     # MATIC/USD conversion rate used to convert Polygon gas fees to USDC for P&L tracking.
     # Update when MATIC price drifts significantly. Gas costs are small (< $0.05/tx)
@@ -132,17 +165,19 @@ class Settings:
     DATABASE_URL: str = f"sqlite:///{_root}/data/polymarket_copier.db"
 
     # No default whales — add real ones via the UI Discover button or POST /api/whales
-    DEFAULT_WHALES: list = []
+    DEFAULT_WHALES: list = []  # noqa: RUF012
 
     def credentials_valid(self) -> bool:
         """Check if all REAL mode credentials are present."""
-        return all([
-            self.POLY_PRIVATE_KEY,
-            self.POLY_API_KEY,
-            self.POLY_API_SECRET,
-            self.POLY_API_PASSPHRASE,
-            self.POLY_FUNDER_ADDRESS,
-        ])
+        return all(
+            [
+                self.POLY_PRIVATE_KEY,
+                self.POLY_API_KEY,
+                self.POLY_API_SECRET,
+                self.POLY_API_PASSPHRASE,
+                self.POLY_FUNDER_ADDRESS,
+            ]
+        )
 
 
 settings = Settings()

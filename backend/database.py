@@ -2,15 +2,22 @@
 SQLAlchemy database setup and all ORM models.
 """
 
-import os
 from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text,
-    create_engine, event
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    event,
 )
-from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
 
 from backend.config import settings
 
@@ -19,9 +26,14 @@ Path(settings.DATABASE_URL.replace("sqlite:///", "")).parent.mkdir(parents=True,
 
 engine = create_engine(
     settings.DATABASE_URL,
-    connect_args={"check_same_thread": False},
+    # timeout=30: SQLite busy-wait — retry for up to 30s when another thread
+    # holds the write lock instead of immediately raising OperationalError.
+    # Needed because the chain monitor (2s interval) + activity API (5s) +
+    # resolution checker all write from separate APScheduler threads.
+    connect_args={"check_same_thread": False, "timeout": 30},
     echo=False,
 )
+
 
 # Enable WAL mode for better concurrent access
 @event.listens_for(engine, "connect")
@@ -46,6 +58,7 @@ class Base(DeclarativeBase):
 # Models
 # ---------------------------------------------------------------------------
 
+
 class Whale(Base):
     __tablename__ = "whales"
 
@@ -66,24 +79,34 @@ class Whale(Base):
     # null means follow all categories (opt-out model)
     category_filters = Column(Text, nullable=True)
 
+    # Arb mode — when True, bet sizing uses price-extremity formula instead of
+    # conviction (whale_bet / whale_avg). Designed for arbitrage whales whose bet
+    # size reflects market liquidity, not confidence level.
+    arb_mode = Column(Boolean, default=False, nullable=False)
+
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     # Relationships
     bets = relationship("WhaleBet", back_populates="whale", cascade="all, delete-orphan")
 
     def to_dict(self) -> dict:
-        win_rate = (self.win_count / self.total_bets_tracked * 100) if self.total_bets_tracked > 0 else 0
+        win_rate = (
+            (self.win_count / self.total_bets_tracked * 100) if self.total_bets_tracked > 0 else 0
+        )
         return {
             "id": self.id,
             "address": self.address,
             "alias": self.alias,
             "is_active": self.is_active,
             "avg_bet_size_usdc": round(self.avg_bet_size_usdc, 2),
-            "risk_profile_calculated_at": self.risk_profile_calculated_at.isoformat() if self.risk_profile_calculated_at else None,
+            "risk_profile_calculated_at": self.risk_profile_calculated_at.isoformat()
+            if self.risk_profile_calculated_at
+            else None,
             "total_bets_tracked": self.total_bets_tracked,
             "win_count": self.win_count,
             "win_rate_pct": round(win_rate, 1),
             "category_filters": self.category_filters,
+            "arb_mode": self.arb_mode,
             "created_at": self.created_at.isoformat(),
         }
 
@@ -92,13 +115,15 @@ class WhaleBet(Base):
     __tablename__ = "whale_bets"
 
     id = Column(Integer, primary_key=True, index=True)
-    whale_id = Column(Integer, ForeignKey("whales.id", ondelete="CASCADE"), nullable=False, index=True)
+    whale_id = Column(
+        Integer, ForeignKey("whales.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     market_id = Column(String(128), nullable=False, index=True)  # condition_id
     token_id = Column(String(128), nullable=False)
     question = Column(Text, nullable=False, default="")
-    side = Column(String(10), nullable=False)       # BUY / SELL
-    outcome = Column(String(10), nullable=False)    # YES / NO
-    price = Column(Float, nullable=False)           # 0.0 - 1.0
+    side = Column(String(10), nullable=False)  # BUY / SELL
+    outcome = Column(String(10), nullable=False)  # YES / NO
+    price = Column(Float, nullable=False)  # 0.0 - 1.0
     size_usdc = Column(Float, nullable=False)
     size_shares = Column(Float, nullable=False, default=0.0)
     timestamp = Column(DateTime, nullable=False, index=True)
@@ -108,7 +133,9 @@ class WhaleBet(Base):
     # Relationships
     whale = relationship("Whale", back_populates="bets")
     copied_bet = relationship("CopiedBet", back_populates="whale_bet", uselist=False)
-    add_to_position_signal = relationship("AddToPositionSignal", back_populates="whale_bet", uselist=False)
+    add_to_position_signal = relationship(
+        "AddToPositionSignal", back_populates="whale_bet", uselist=False
+    )
 
     def to_dict(self) -> dict:
         return {
@@ -165,12 +192,12 @@ class CopiedBet(Base):
 
     # Resolution
     pnl_usdc = Column(Float, nullable=True)
-    gas_fees_usdc = Column(Float, nullable=True)   # gas cost allocated to this position
+    gas_fees_usdc = Column(Float, nullable=True)  # gas cost allocated to this position
     resolution_price = Column(Float, nullable=True)
 
     # Categorisation
-    market_category = Column(String(50), nullable=True)   # Soccer | Basketball | Tennis | ...
-    bet_type = Column(String(50), nullable=True)          # Over/Under | Spread | Moneyline | ...
+    market_category = Column(String(50), nullable=True)  # Soccer | Basketball | Tennis | ...
+    bet_type = Column(String(50), nullable=True)  # Over/Under | Spread | Moneyline | ...
 
     # Timestamps
     opened_at = Column(DateTime, nullable=True)
@@ -205,9 +232,15 @@ class CopiedBet(Base):
             "skip_reason": self.skip_reason,
             "close_reason": self.close_reason,
             "pnl_usdc": round(self.pnl_usdc, 2) if self.pnl_usdc is not None else None,
-            "gas_fees_usdc": round(self.gas_fees_usdc, 4) if self.gas_fees_usdc is not None else None,
-            "net_pnl_usdc": round(self.pnl_usdc - (self.gas_fees_usdc or 0.0), 2) if self.pnl_usdc is not None else None,
-            "resolution_price": round(self.resolution_price, 4) if self.resolution_price is not None else None,
+            "gas_fees_usdc": round(self.gas_fees_usdc, 4)
+            if self.gas_fees_usdc is not None
+            else None,
+            "net_pnl_usdc": round(self.pnl_usdc - (self.gas_fees_usdc or 0.0), 2)
+            if self.pnl_usdc is not None
+            else None,
+            "resolution_price": round(self.resolution_price, 4)
+            if self.resolution_price is not None
+            else None,
             "market_category": self.market_category,
             "bet_type": self.bet_type,
             "opened_at": self.opened_at.isoformat() if self.opened_at else None,
@@ -223,9 +256,9 @@ class AddToPositionSignal(Base):
     whale_bet_id = Column(Integer, ForeignKey("whale_bets.id"), nullable=False)
     copied_bet_id = Column(Integer, ForeignKey("copied_bets.id"), nullable=False)
 
-    whale_additional_usdc = Column(Float, nullable=False)    # cumulative total across all additions
+    whale_additional_usdc = Column(Float, nullable=False)  # cumulative total across all additions
     whale_additional_shares = Column(Float, nullable=False, default=0.0)  # cumulative
-    price = Column(Float, nullable=False)                    # price of the most recent addition
+    price = Column(Float, nullable=False)  # price of the most recent addition
     timestamp = Column(DateTime, nullable=False, default=datetime.utcnow)  # first addition
 
     # Scaled bet size we would add under our own sizing rules (risk-factor
@@ -252,16 +285,23 @@ class AddToPositionSignal(Base):
             "whale_additional_shares": round(self.whale_additional_shares, 4),
             "price": round(self.price, 4),
             "timestamp": self.timestamp.isoformat(),
-            "suggested_add_usdc": round(self.suggested_add_usdc, 2) if self.suggested_add_usdc is not None else None,
-            "hypothetical_pnl_usdc": round(self.hypothetical_pnl_usdc, 2) if self.hypothetical_pnl_usdc is not None else None,
+            "suggested_add_usdc": round(self.suggested_add_usdc, 2)
+            if self.suggested_add_usdc is not None
+            else None,
+            "hypothetical_pnl_usdc": round(self.hypothetical_pnl_usdc, 2)
+            if self.hypothetical_pnl_usdc is not None
+            else None,
             "note": self.note,
             "addition_count": self.addition_count if self.addition_count is not None else 1,
-            "last_addition_at": self.last_addition_at.isoformat() if self.last_addition_at else None,
+            "last_addition_at": self.last_addition_at.isoformat()
+            if self.last_addition_at
+            else None,
         }
 
 
 class MonitoringSession(Base):
     """Tracks each monitoring session (renamed to avoid conflict with sqlalchemy Session)."""
+
     __tablename__ = "sessions"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -282,7 +322,9 @@ class MonitoringSession(Base):
     total_gas_fees_usdc = Column(Float, default=0.0, nullable=False)
 
     def to_dict(self) -> dict:
-        win_rate = (self.total_wins / self.total_bets_placed * 100) if self.total_bets_placed > 0 else 0
+        win_rate = (
+            (self.total_wins / self.total_bets_placed * 100) if self.total_bets_placed > 0 else 0
+        )
         duration_seconds = None
         if self.started_at:
             end = self.stopped_at or datetime.utcnow()
@@ -302,13 +344,16 @@ class MonitoringSession(Base):
             "win_rate_pct": round(win_rate, 1),
             "total_pnl_usdc": round(self.total_pnl_usdc, 2),
             "total_gas_fees_usdc": round(self.total_gas_fees_usdc or 0.0, 4),
-            "net_pnl_usdc": round((self.total_pnl_usdc or 0.0) - (self.total_gas_fees_usdc or 0.0), 2),
+            "net_pnl_usdc": round(
+                (self.total_pnl_usdc or 0.0) - (self.total_gas_fees_usdc or 0.0), 2
+            ),
             "duration_seconds": duration_seconds,
         }
 
 
 class AppState(Base):
     """Single-row KV store for application configuration."""
+
     __tablename__ = "app_state"
 
     key = Column(String(64), primary_key=True)
@@ -319,6 +364,7 @@ class AppState(Base):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def get_db():
     """FastAPI dependency: yields a database session."""
@@ -339,17 +385,18 @@ def init_db():
 def _migrate():
     """Apply additive schema migrations (add missing columns)."""
     migrations = [
-        ("copied_bets",           "market_close_at",   "DATETIME"),
-        ("copied_bets",           "close_reason",      "TEXT"),
-        ("copied_bets",           "market_category",   "VARCHAR(50)"),
-        ("copied_bets",           "bet_type",          "VARCHAR(50)"),
-        ("copied_bets",           "session_id",        "INTEGER REFERENCES sessions(id)"),
-        ("whales",                "category_filters",  "TEXT"),
-        ("add_to_position_signals", "suggested_add_usdc",  "FLOAT"),
-        ("add_to_position_signals", "addition_count",      "INTEGER DEFAULT 1"),
-        ("add_to_position_signals", "last_addition_at",    "DATETIME"),
-        ("sessions",               "total_gas_fees_usdc", "FLOAT DEFAULT 0.0"),
-        ("copied_bets",            "gas_fees_usdc",       "FLOAT"),
+        ("copied_bets", "market_close_at", "DATETIME"),
+        ("copied_bets", "close_reason", "TEXT"),
+        ("copied_bets", "market_category", "VARCHAR(50)"),
+        ("copied_bets", "bet_type", "VARCHAR(50)"),
+        ("copied_bets", "session_id", "INTEGER REFERENCES sessions(id)"),
+        ("whales", "category_filters", "TEXT"),
+        ("whales", "arb_mode", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("add_to_position_signals", "suggested_add_usdc", "FLOAT"),
+        ("add_to_position_signals", "addition_count", "INTEGER DEFAULT 1"),
+        ("add_to_position_signals", "last_addition_at", "DATETIME"),
+        ("sessions", "total_gas_fees_usdc", "FLOAT DEFAULT 0.0"),
+        ("copied_bets", "gas_fees_usdc", "FLOAT"),
     ]
     sa = __import__("sqlalchemy")
     with engine.connect() as conn:
@@ -361,10 +408,24 @@ def _migrate():
                 # Column already exists — safe to ignore
                 pass
 
+        # UNIQUE index on tx_hash — prevents duplicate inserts from concurrent scanners.
+        # Partial index (WHERE tx_hash IS NOT NULL) avoids conflicts on rows without a hash.
+        try:
+            conn.execute(
+                sa.text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ix_whale_bets_tx_hash "
+                    "ON whale_bets (tx_hash) WHERE tx_hash IS NOT NULL"
+                )
+            )
+            conn.commit()
+        except Exception:
+            pass
+
         # Back-fill session_id for existing bets: assign each bet to the session
         # with matching mode that started most recently at or before the bet's opened_at.
         try:
-            conn.execute(sa.text("""
+            conn.execute(
+                sa.text("""
                 UPDATE copied_bets
                 SET session_id = (
                     SELECT s.id FROM sessions s
@@ -374,7 +435,8 @@ def _migrate():
                     LIMIT 1
                 )
                 WHERE session_id IS NULL
-            """))
+            """)
+            )
             conn.commit()
         except Exception:
             pass
