@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 _MARKET_CACHE_TTL = 3600  # seconds
-_PRICE_CACHE_TTL = 30      # seconds — live prices refresh every 30 s
+_PRICE_CACHE_TTL = 30  # seconds — live prices refresh every 30 s
 _PRICE_NEGATIVE_TTL = 300  # seconds — 404 (no order book) cached for 5 min
 
 
@@ -99,6 +99,7 @@ class PolymarketClient:
             page_trades: list[dict] = []
             for attempt in range(MAX_ATTEMPTS):
                 try:
+
                     def _fetch(p=params):
                         r = _requests.get(url, params=p, timeout=15)
                         r.raise_for_status()
@@ -114,13 +115,20 @@ class PolymarketClient:
                     if attempt < MAX_ATTEMPTS - 1:
                         logger.warning(
                             "get_user_activity page %d attempt %d/%d failed for %s: %s — retrying",
-                            page + 1, attempt + 1, MAX_ATTEMPTS, address[:10], exc,
+                            page + 1,
+                            attempt + 1,
+                            MAX_ATTEMPTS,
+                            address[:10],
+                            exc,
                         )
                         await _asyncio.sleep(0.5 * (attempt + 1))
                     else:
                         logger.error(
                             "get_user_activity page %d error for %s after %d attempts: %s",
-                            page + 1, address[:10], MAX_ATTEMPTS, exc,
+                            page + 1,
+                            address[:10],
+                            MAX_ATTEMPTS,
+                            exc,
                         )
 
             all_trades.extend(page_trades)
@@ -177,9 +185,7 @@ class PolymarketClient:
     # Gamma API  (https://gamma-api.polymarket.com)
     # ------------------------------------------------------------------
 
-    async def get_market(
-        self, condition_id: str, token_id: str = None
-    ) -> dict | None:
+    async def get_market(self, condition_id: str, token_id: str = None) -> dict | None:
         """
         Fetch market details from Gamma API.
 
@@ -217,15 +223,19 @@ class PolymarketClient:
                 if status in (404, 422):
                     logger.debug(
                         "get_market %d for condition_id %s — will try token fallback",
-                        status, condition_id,
+                        status,
+                        condition_id,
                     )
                 else:
                     logger.warning("get_market HTTP error for %s: %s", condition_id, exc)
                 # Cache the failure so we don't retry for 30 minutes
                 self._market_cache[condition_id] = (None, now + _NEGATIVE_TTL)
             except Exception as exc:
-                logger.error("get_market error for %s: %s", condition_id, exc)
-                return None
+                # Non-HTTP error (proxy failure, timeout, etc.) — don't cache, but
+                # still fall through to the token_id fallback rather than bailing out.
+                logger.warning(
+                    "get_market error for %s: %s — will try token fallback", condition_id, exc
+                )
 
         # Fallback: look up by CLOB token_id
         if not token_id:
@@ -419,13 +429,19 @@ class PolymarketClient:
                 try:
                     fee_bps = int(raw)
                     self._taker_fee_cache[token_id] = fee_bps
-                    logger.debug("get_taker_fee_async: token %s → %d bps (from Gamma)", token_id[:16], fee_bps)
+                    logger.debug(
+                        "get_taker_fee_async: token %s → %d bps (from Gamma)",
+                        token_id[:16],
+                        fee_bps,
+                    )
                     return fee_bps
                 except (ValueError, TypeError):
                     pass
 
         # Fall back to conservative default so the viability gate doesn't under-estimate fees.
-        logger.debug("get_taker_fee_async: no feeRateBps for %s — using 1000 bps default", token_id[:16])
+        logger.debug(
+            "get_taker_fee_async: no feeRateBps for %s — using 1000 bps default", token_id[:16]
+        )
         return 1000
 
     # ------------------------------------------------------------------
@@ -455,7 +471,7 @@ class PolymarketClient:
                 chain_id=137,  # Polygon
                 key=settings.POLY_PRIVATE_KEY,
                 creds=creds,
-                signature_type=2,   # Polymarket proxy wallet (funder != signer EOA)
+                signature_type=2,  # Polymarket proxy wallet (funder != signer EOA)
                 funder=settings.POLY_FUNDER_ADDRESS,
             )
             # Patch the order builder's get_market_order_amounts to round the taker
@@ -548,7 +564,8 @@ class PolymarketClient:
                 if required_fee != fee:
                     logger.warning(
                         "place_market_buy: fee mismatch for %s — retrying with fee_rate_bps=%d",
-                        token_id[:16], required_fee,
+                        token_id[:16],
+                        required_fee,
                     )
                     self._taker_fee_cache[token_id] = required_fee
                     try:
@@ -559,7 +576,9 @@ class PolymarketClient:
             logger.error("place_market_buy error: %s", exc)
             raise
 
-    def place_market_sell(self, token_id: str, size_shares: float, whale_price: float = None) -> dict:
+    def place_market_sell(
+        self, token_id: str, size_shares: float, whale_price: float = None
+    ) -> dict:
         """
         Place a real market sell order via py-clob-client.
         size_shares: number of shares to sell (from DB record).
@@ -621,7 +640,8 @@ class PolymarketClient:
                     if required_fee != current_fee:
                         logger.warning(
                             "place_market_sell: fee mismatch for %s — retrying with fee_rate_bps=%d",
-                            token_id[:16], required_fee,
+                            token_id[:16],
+                            required_fee,
                         )
                         self._taker_fee_cache[token_id] = required_fee
                         try:
@@ -657,7 +677,10 @@ class PolymarketClient:
                     logger.warning(
                         "place_market_sell: price drifted from whale exit %.4f to %.4f "
                         "(drift=%.4f exceeds limit=%.4f) — aborting retries",
-                        drift_anchor, current_price, drift, settings.MAX_PRICE_DRIFT_PCT,
+                        drift_anchor,
+                        current_price,
+                        drift,
+                        settings.MAX_PRICE_DRIFT_PCT,
                     )
                     # If degraded-fill mode is on, skip the drift guard and fall through
                     # to the degraded fill below rather than returning immediately.
@@ -672,8 +695,12 @@ class PolymarketClient:
 
             logger.warning(
                 "place_market_sell: FOK cancelled at %.4f (attempt %d/%d)%s",
-                current_price, attempt + 1, max_fok_retries,
-                " — retrying at new market price" if attempt < max_fok_retries - 1 else " — all retries exhausted",
+                current_price,
+                attempt + 1,
+                max_fok_retries,
+                " — retrying at new market price"
+                if attempt < max_fok_retries - 1
+                else " — all retries exhausted",
             )
 
         # All standard retries exhausted. If SELL_ACCEPT_DEGRADED_FILL is enabled,
@@ -685,13 +712,17 @@ class PolymarketClient:
                 logger.warning(
                     "place_market_sell: all retries exhausted — degraded fill attempt at %.4f "
                     "(drift from anchor %.4f = %.4f, drift guard bypassed)",
-                    degraded_price, drift_anchor, abs(degraded_price - drift_anchor),
+                    degraded_price,
+                    drift_anchor,
+                    abs(degraded_price - drift_anchor),
                 )
                 resp = _submit_with_fee_retry(degraded_price)
                 sell_status = (resp.get("status") or "").lower()
                 if sell_status not in ("cancelled", "canceled"):
                     return resp
-                logger.warning("place_market_sell: degraded fill also cancelled at %.4f", degraded_price)
+                logger.warning(
+                    "place_market_sell: degraded fill also cancelled at %.4f", degraded_price
+                )
             except Exception as exc:
                 logger.error("place_market_sell: degraded fill error: %s", exc)
 
@@ -703,6 +734,7 @@ class PolymarketClient:
             return None
         try:
             from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
             client = self._get_clob_client()
             resp = client.get_balance_allowance(
                 BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=2)

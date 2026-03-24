@@ -111,14 +111,19 @@ class RiskCalculator:
         # Never bet more than the full balance
         result = min(result, session_balance)
 
+        scalar = settings.BET_SIZE_SCALAR
+        if scalar != 1.0:
+            result = round(result * scalar, 2)
+
         logger.debug(
-            "Bet size: balance=%.2f pct=%.3f base=%.2f rf=%.3f raw=%.2f cap=%.2f -> %.2f",
+            "Bet size: balance=%.2f pct=%.3f base=%.2f rf=%.3f raw=%.2f cap=%.2f scalar=%.2f -> %.2f",
             session_balance,
             max_bet_pct,
             base_bet,
             risk_factor,
             bet_size,
             hard_cap,
+            scalar,
             result,
         )
         return round(result, 2)
@@ -363,20 +368,26 @@ class RiskCalculator:
         base = session_balance / n
 
         rel = whale_bet_usdc / whale_avg_bet_usdc if whale_avg_bet_usdc > 0 else 1.0
+        rel = min(rel, _MAX_RISK_FACTOR)  # cap at same ceiling as standard mode
 
         result = base * rel
         result = min(result, session_balance)
         result = max(result, settings.MIN_BET_USDC)
 
+        scalar = settings.BET_SIZE_SCALAR
+        if scalar != 1.0:
+            result = round(result * scalar, 2)
+
         logger.debug(
             "Arb bet size: balance=%.2f N=%d base=%.2f "
-            "whale_bet=%.2f whale_avg=%.2f rel=%.3f -> %.2f",
+            "whale_bet=%.2f whale_avg=%.2f rel=%.3f scalar=%.2f -> %.2f",
             session_balance,
             n,
             base,
             whale_bet_usdc,
             whale_avg_bet_usdc,
             rel,
+            scalar,
             result,
         )
         return round(result, 2)

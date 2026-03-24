@@ -26,6 +26,11 @@ services:
       - SOCKSPROXYPORT=1080
       - TZ=America/Toronto
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "17m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9999"]
       interval: 10s
@@ -43,6 +48,11 @@ services:
     restart: unless-stopped
     command: ["python", "run.py", "--port", "8081"]
     env_file: .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "17m"
+        max-file: "3"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

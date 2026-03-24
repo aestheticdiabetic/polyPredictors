@@ -79,13 +79,21 @@ class WhaleMonitor:
                 trigger=IntervalTrigger(seconds=settings.CHAIN_EXIT_POLL_INTERVAL_SECONDS),
                 id="chain_exit_monitor",
                 replace_existing=True,
-                max_instances=2,
+                max_instances=1,
+                coalesce=True,
             )
             logger.info(
                 "On-chain exit monitor registered (every %ds) — "
                 "activity-API exit polling suppressed",
                 settings.CHAIN_EXIT_POLL_INTERVAL_SECONDS,
             )
+
+        self._resolution_scheduler.add_job(
+            func=self._backfill_missing_market_info,
+            trigger=IntervalTrigger(minutes=15),
+            id="backfill_market_info",
+            next_run_time=datetime.now(UTC),
+        )
 
         self._resolution_scheduler.start()
         logger.info(
@@ -446,7 +454,9 @@ class WhaleMonitor:
                     taker_fee_bps = fee_result if isinstance(fee_result, int) else 1000
 
                     # Now save to DB (flush takes RESERVED lock — network already done).
-                    whale_bet = await self._save_whale_bet(trade, whale, ts, db)
+                    whale_bet = await self._save_whale_bet(
+                        trade, whale, ts, db, market_info=market_info
+                    )
                     if whale_bet:
                         # Process the whale bet for every active session (supports
                         # simultaneous SIMULATION + HEDGE_SIM for side-by-side comparison)
@@ -669,7 +679,9 @@ class WhaleMonitor:
         finally:
             db.close()
 
-    async def _save_whale_bet(self, trade: dict, whale: Whale, ts: datetime, db) -> WhaleBet | None:
+    async def _save_whale_bet(
+        self, trade: dict, whale: Whale, ts: datetime, db, market_info: dict | None = None
+    ) -> WhaleBet | None:
         """
         Parse a raw trade dict and persist a WhaleBet record.
         Returns None if the trade is a duplicate or cannot be parsed.
@@ -719,10 +731,25 @@ class WhaleMonitor:
         if size_shares <= 0:
             size_shares = size_usdc / max(price, 0.001)
 
-        # Market identifiers
-        market_id = trade.get("conditionId") or trade.get("market") or trade.get("marketId") or ""
+        # Market identifiers — fall back to market_info fetched from Gamma API
+        _mi = market_info or {}
+        market_id = (
+            trade.get("conditionId")
+            or trade.get("market")
+            or trade.get("marketId")
+            or _mi.get("conditionId")
+            or _mi.get("condition_id")
+            or ""
+        )
         token_id = trade.get("asset") or trade.get("tokenId") or trade.get("outcome_token_id") or ""
-        question = trade.get("title") or trade.get("question") or trade.get("market_question") or ""
+        question = (
+            trade.get("title")
+            or trade.get("question")
+            or trade.get("market_question")
+            or _mi.get("question")
+            or _mi.get("title")
+            or ""
+        )
 
         # Determine bet type
         bet_type = "EXIT" if side == "SELL" else "OPEN"
@@ -927,6 +954,113 @@ class WhaleMonitor:
                         db.close()
         except Exception as exc:
             logger.error("Auto-redemption job error: %s", exc)
+
+    def _backfill_missing_market_info(self):
+        """
+        Periodic job: find whale_bets and copied_bets with empty question or
+        market_id and backfill them from the Gamma API.  Runs every 15 minutes
+        on the permanent scheduler so records missed at insertion time are
+        corrected quickly.
+        """
+        import httpx
+
+        from backend.categorizer import classify
+        from backend.database import CopiedBet, SessionLocal, WhaleBet
+
+        db = SessionLocal()
+        try:
+            missing_wb = (
+                db.query(WhaleBet.token_id)
+                .filter(
+                    WhaleBet.token_id != "",
+                    WhaleBet.token_id.isnot(None),
+                    (WhaleBet.question == "") | WhaleBet.question.is_(None),
+                )
+                .distinct()
+                .all()
+            )
+            missing_cb = (
+                db.query(CopiedBet.token_id)
+                .filter(
+                    CopiedBet.token_id != "",
+                    CopiedBet.token_id.isnot(None),
+                    (CopiedBet.question == "") | CopiedBet.question.is_(None),
+                )
+                .distinct()
+                .all()
+            )
+
+            token_ids = {r[0] for r in missing_wb} | {r[0] for r in missing_cb}
+            if not token_ids:
+                return
+
+            logger.info("Backfill: fetching market info for %d token_id(s)", len(token_ids))
+            client = httpx.Client(timeout=15)
+            updated_wb = updated_cb = 0
+            try:
+                for token_id in token_ids:
+                    try:
+                        r = client.get(
+                            "https://gamma-api.polymarket.com/markets",
+                            params={"clob_token_ids": token_id},
+                        )
+                        data = r.json()
+                        market = data[0] if isinstance(data, list) and data else None
+                        if not market:
+                            continue
+                        question = market.get("question") or market.get("title") or ""
+                        condition_id = market.get("conditionId") or market.get("condition_id") or ""
+                        if not question:
+                            continue
+                        market_category, _ = classify(question)
+
+                        wb_count = (
+                            db.query(WhaleBet)
+                            .filter(
+                                WhaleBet.token_id == token_id,
+                                (WhaleBet.question == "") | WhaleBet.question.is_(None),
+                            )
+                            .update(
+                                {"question": question, "market_id": condition_id},
+                                synchronize_session=False,
+                            )
+                        )
+                        cb_count = (
+                            db.query(CopiedBet)
+                            .filter(
+                                CopiedBet.token_id == token_id,
+                                (CopiedBet.question == "") | CopiedBet.question.is_(None),
+                            )
+                            .update(
+                                {
+                                    "question": question,
+                                    "market_id": condition_id,
+                                    "market_category": market_category,
+                                },
+                                synchronize_session=False,
+                            )
+                        )
+                        updated_wb += wb_count
+                        updated_cb += cb_count
+                    except Exception as fetch_exc:
+                        logger.warning(
+                            "Backfill fetch error for token %s: %s", token_id[:16], fetch_exc
+                        )
+            finally:
+                client.close()
+
+            if updated_wb or updated_cb:
+                db.commit()
+                logger.info(
+                    "Backfill complete: %d whale_bet(s), %d copied_bet(s) updated",
+                    updated_wb,
+                    updated_cb,
+                )
+        except Exception as exc:
+            logger.error("Backfill market info job error: %s", exc)
+            db.rollback()
+        finally:
+            db.close()
 
     # ------------------------------------------------------------------
     # Utilities

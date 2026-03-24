@@ -33,6 +33,12 @@ class Settings:
     SIM_ASSUMED_FEE_BPS: int = int(os.getenv("SIM_ASSUMED_FEE_BPS", "0"))
     MAX_BET_PCT: float = float(os.getenv("MAX_BET_PCT", "0.05"))
 
+    # Global scalar applied to every computed bet size (both standard and arb modes).
+    # Set < 1.0 to reduce all bet sizes proportionally without touching the underlying
+    # risk/conviction logic. Default 1.0 = no change. Increase back to 1.0 when
+    # capital grows sufficiently.
+    BET_SIZE_SCALAR: float = float(os.getenv("BET_SIZE_SCALAR", "1.0"))
+
     # Monitoring settings
     POLLING_INTERVAL_SECONDS: int = int(os.getenv("POLLING_INTERVAL_SECONDS", "5"))
     MIN_MARKET_HOURS_TO_CLOSE: float = float(os.getenv("MIN_MARKET_HOURS_TO_CLOSE", "0.0"))

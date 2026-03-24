@@ -30,7 +30,7 @@ engine = create_engine(
     # holds the write lock instead of immediately raising OperationalError.
     # Needed because the chain monitor (2s interval) + activity API (5s) +
     # resolution checker all write from separate APScheduler threads.
-    connect_args={"check_same_thread": False, "timeout": 30},
+    connect_args={"check_same_thread": False, "timeout": 60},
     echo=False,
 )
 
