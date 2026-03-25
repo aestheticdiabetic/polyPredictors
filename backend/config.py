@@ -171,6 +171,23 @@ class Settings:
     # Optional: HTTP proxy URL for routing traffic through VPN (e.g. gluetun)
     PROXY_URL: str = os.getenv("PROXY_URL", "")
 
+    # Discord integration
+    DISCORD_ENABLED: bool = os.getenv("DISCORD_ENABLED", "false").lower() == "true"
+    DISCORD_BOT_TOKEN: str = os.getenv("DISCORD_BOT_TOKEN", "")
+    DISCORD_CHANNEL_ID: int = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
+
+    # Stop-loss thresholds
+    STOP_LOSS_WARN_PCT: float = float(os.getenv("STOP_LOSS_WARN_PCT", "0.20"))
+    STOP_LOSS_AUTO_STOP_PCT: float = float(os.getenv("STOP_LOSS_AUTO_STOP_PCT", "0.35"))
+    STOP_LOSS_WINDOW_HOURS: int = int(os.getenv("STOP_LOSS_WINDOW_HOURS", "24"))
+    STOP_LOSS_CHECK_INTERVAL_SECONDS: int = int(
+        os.getenv("STOP_LOSS_CHECK_INTERVAL_SECONDS", "300")
+    )
+    STOP_LOSS_SNAPSHOT_INTERVAL_MINUTES: int = int(
+        os.getenv("STOP_LOSS_SNAPSHOT_INTERVAL_MINUTES", "30")
+    )
+    STOP_LOSS_COOLDOWN_HOURS: int = int(os.getenv("STOP_LOSS_COOLDOWN_HOURS", "4"))
+
     # API endpoints
     DATA_API_BASE: str = "https://data-api.polymarket.com"
     GAMMA_API_BASE: str = "https://gamma-api.polymarket.com"

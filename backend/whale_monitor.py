@@ -113,6 +113,20 @@ class WhaleMonitor:
             next_run_time=datetime.now(UTC),
         )
 
+        # Stop-loss monitor jobs — registered here so they run regardless of session state.
+        # _stop_loss_monitor is wired in after construction from main.py.
+        self._stop_loss_monitor = None
+        self._resolution_scheduler.add_job(
+            func=self._stop_loss_check_wrapper,
+            trigger=IntervalTrigger(seconds=settings.STOP_LOSS_CHECK_INTERVAL_SECONDS),
+            id="stop_loss_check",
+        )
+        self._resolution_scheduler.add_job(
+            func=self._stop_loss_snapshot_wrapper,
+            trigger=IntervalTrigger(minutes=settings.STOP_LOSS_SNAPSHOT_INTERVAL_MINUTES),
+            id="stop_loss_snapshot",
+        )
+
         self._resolution_scheduler.start()
         logger.info(
             "Permanent background scheduler started (resolution every %ds, exit polling every %ds)",
@@ -922,6 +936,22 @@ class WhaleMonitor:
             self._bet_engine.check_orphan_positions()
         except Exception as exc:
             logger.error("check_orphan_positions error: %s", exc)
+
+    def _stop_loss_check_wrapper(self):
+        if self._stop_loss_monitor is None:
+            return
+        try:
+            _run_async(self._stop_loss_monitor.check_async())
+        except Exception as exc:
+            logger.error("stop_loss_check error: %s", exc)
+
+    def _stop_loss_snapshot_wrapper(self):
+        if self._stop_loss_monitor is None:
+            return
+        try:
+            _run_async(self._stop_loss_monitor.snapshot_async())
+        except Exception as exc:
+            logger.error("stop_loss_snapshot error: %s", exc)
 
     def _auto_redemption_job(self):
         """Periodically redeem resolved positions on-chain. Runs in permanent scheduler."""

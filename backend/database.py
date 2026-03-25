@@ -384,6 +384,21 @@ class AppState(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
+class PortfolioSnapshot(Base):
+    """Periodic snapshot of portfolio value used for stop-loss 24h window comparisons."""
+
+    __tablename__ = "portfolio_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("sessions.id"), nullable=False, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    balance_usdc = Column(Float, nullable=False)
+    open_positions_value_usdc = Column(Float, nullable=False)
+    total_portfolio_usdc = Column(Float, nullable=False)
+
+    session = relationship("MonitoringSession")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

@@ -7,3 +7,4 @@ apscheduler==3.10.4
 py-clob-client==0.16.0
 Jinja2==3.1.4
 web3>=6.0.0
+discord.py>=2.3.0

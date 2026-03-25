@@ -3,6 +3,7 @@ FastAPI application entry point.
 All API routes are defined here.
 """
 
+import asyncio
 import json
 import logging
 import logging.handlers
@@ -29,7 +30,9 @@ from backend.database import (
     get_db,
     init_db,
 )
+from backend.discord_bot import DiscordBot
 from backend.polymarket_client import PolymarketClient
+from backend.stop_loss import StopLossMonitor
 from backend.whale_monitor import WhaleMonitor
 
 # ---------------------------------------------------------------------------
@@ -75,15 +78,38 @@ poly_client = PolymarketClient()
 bet_engine = BetEngine(polymarket_client=poly_client)
 whale_monitor = WhaleMonitor(bet_engine=bet_engine, polymarket_client=poly_client)
 
+# Discord bot (None when DISCORD_ENABLED=false or token missing)
+discord_bot: DiscordBot | None = None
+if settings.DISCORD_ENABLED and settings.DISCORD_BOT_TOKEN:
+    discord_bot = DiscordBot(whale_monitor_ref=whale_monitor)
+else:
+    logger.info("Discord integration disabled (set DISCORD_ENABLED=true + DISCORD_BOT_TOKEN to enable)")
+
+# Stop-loss monitor always runs; Discord dispatch is skipped when discord_bot is None
+stop_loss_monitor = StopLossMonitor(
+    polymarket_client=poly_client,
+    discord_bot=discord_bot,
+    whale_monitor_ref=whale_monitor,
+)
+whale_monitor._stop_loss_monitor = stop_loss_monitor
+
 
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Clean up on shutdown."""
+    """Start Discord bot task; clean up on shutdown."""
+    discord_task: asyncio.Task | None = None
+    if discord_bot is not None:
+        discord_task = asyncio.create_task(discord_bot.start())
+        logger.info("Discord bot task started")
     yield
     # Graceful shutdown
+    if discord_bot is not None:
+        await discord_bot.stop()
+        if discord_task and not discord_task.done():
+            discord_task.cancel()
     whale_monitor.shutdown()
     await poly_client.close()
     logger.info("Application shutdown complete")
@@ -263,7 +289,7 @@ async def stop_session(
     }
 
 
-def _auto_stop_session(mode: str = None):
+def _auto_stop_session(mode: str | None = None):
     """Called by scheduler when runtime_hours expires for a session."""
     db = SessionLocal()
     remaining = 0
@@ -377,7 +403,7 @@ async def whale_history(address: str, limit: int = Query(50, ge=1, le=200)):
         return {"trades": trades, "positions": positions, "address": address}
     except Exception as exc:
         logger.error("whale_history error: %s", exc)
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/api/whales/refresh-profiles")
@@ -385,14 +411,12 @@ async def refresh_profiles():
     """Manually trigger whale risk profile refresh."""
     try:
         # Run in a thread to avoid blocking event loop
-        import asyncio
-
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, whale_monitor.refresh_risk_profiles)
         return {"message": "Risk profiles refreshed"}
     except Exception as exc:
         logger.error("refresh_profiles error: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -732,7 +756,7 @@ async def stats_by_whale(mode: str = Query("all"), db: DBSession = Depends(get_d
 @app.get("/api/stats/by-whale-category")
 async def stats_by_whale_category(mode: str = Query("all"), db: DBSession = Depends(get_db)):
     """
-    Aggregate closed CopiedBets broken down by whale × sport × bet_type.
+    Aggregate closed CopiedBets broken down by whale x sport x bet_type.
     Returns per-whale sport and bet-type breakdowns for the analysis page.
     """
     import json as _json
@@ -955,7 +979,7 @@ async def get_leaderboard(
         entries = await poly_client.get_leaderboard(time_period=time_period, limit=limit)
     except Exception as exc:
         logger.error("get_leaderboard error: %s", exc)
-        raise HTTPException(status_code=502, detail="Leaderboard API unavailable")
+        raise HTTPException(status_code=502, detail="Leaderboard API unavailable") from exc
 
     tracked_addresses = {w.address for w in db.query(Whale).all()}
 
