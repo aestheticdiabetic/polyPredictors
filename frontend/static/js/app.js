@@ -673,7 +673,7 @@ function renderLedger(bets, pagination) {
         <td class="mono text-muted" style="font-size:0.75rem">${time}</td>
         <td title="${escHtml(bet.whale_address)}">${whaleLabel}</td>
         <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(bet.question)}">${escHtml(truncate(bet.question || bet.market_id, 40))}</td>
-        <td><span class="badge ${bet.mode === 'SIMULATION' ? 'badge-sim' : 'badge-real'}">${actionDir}</span></td>
+        <td><span class="badge ${bet.mode === 'SIMULATION' ? 'badge-sim' : 'badge-real'}">${actionDir}</span>${bet.followed_signal_id ? ' <span class="badge badge-signal" title="Placed by follow-add-signals (signal #' + bet.followed_signal_id + ')">SIG+</span>' : ''}</td>
         <td class="mono">${bet.price_at_entry ? bet.price_at_entry.toFixed(3) : '—'}</td>
         <td class="mono">${bet.size_usdc > 0 ? '$' + bet.size_usdc.toFixed(2) : '—'}</td>
         <td>${pnlHtml}</td>

@@ -519,6 +519,7 @@ tr.row-skip  td:first-child { border-left: 3px solid var(--warning); }
 .badge-neutral { background: rgba(87,101,116,0.15); color: var(--neutral); }
 .badge-sim     { background: var(--warning-dim); color: var(--warning); }
 .badge-real    { background: var(--danger-dim);  color: var(--danger);  }
+.badge-signal  { background: rgba(139,92,246,0.18); color: #a78bfa; }
 
 /* ============================================================
    Forms & Inputs
