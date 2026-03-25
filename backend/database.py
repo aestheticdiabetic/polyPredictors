@@ -292,7 +292,11 @@ class AddToPositionSignal(Base):
 
     # Relationships
     whale_bet = relationship("WhaleBet", back_populates="add_to_position_signal")
-    copied_bet = relationship("CopiedBet", back_populates="add_to_position_signals")
+    copied_bet = relationship(
+        "CopiedBet",
+        back_populates="add_to_position_signals",
+        foreign_keys="AddToPositionSignal.copied_bet_id",
+    )
     followed_bets = relationship("CopiedBet", foreign_keys="CopiedBet.followed_signal_id")
 
     def to_dict(self) -> dict:
