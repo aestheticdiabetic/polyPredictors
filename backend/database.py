@@ -222,7 +222,10 @@ class CopiedBet(Base):
     whale_bet = relationship("WhaleBet", back_populates="copied_bet")
     session = relationship("MonitoringSession", foreign_keys=[session_id])
     add_to_position_signals = relationship(
-        "AddToPositionSignal", back_populates="copied_bet", cascade="all, delete-orphan"
+        "AddToPositionSignal",
+        back_populates="copied_bet",
+        cascade="all, delete-orphan",
+        foreign_keys="AddToPositionSignal.copied_bet_id",
     )
 
     def to_dict(self) -> dict:
