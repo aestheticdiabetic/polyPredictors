@@ -346,7 +346,16 @@ class WhaleMonitor:
         # Fix #3a: query only the address column — no need for full ORM objects
         db = SessionLocal()
         try:
-            addresses = [row[0] for row in db.query(Whale.address).filter_by(is_active=True).all()]
+            active = [row[0] for row in db.query(Whale.address).filter_by(is_active=True).all()]
+            # Inactive whales with open REAL positions must still be polled for exits.
+            real_open = [
+                row[0]
+                for row in db.query(CopiedBet.whale_address)
+                .filter(CopiedBet.status == "OPEN", CopiedBet.mode == "REAL")
+                .distinct()
+                .all()
+            ]
+            addresses = list({*active, *real_open})
         except Exception as exc:
             logger.error("poll_whales: failed to load whales: %s", exc)
             return
@@ -356,7 +365,12 @@ class WhaleMonitor:
         if not addresses:
             return
 
-        logger.debug("Polling %d active whales", len(addresses))
+        logger.debug(
+            "Polling %d whales (%d active, %d inactive with open REAL bets)",
+            len(addresses),
+            len(active),
+            len(set(real_open) - set(active)),
+        )
 
         _run_async(self._poll_all_async(addresses))
 
@@ -530,7 +544,15 @@ class WhaleMonitor:
 
         db = SessionLocal()
         try:
-            addresses = [row[0] for row in db.query(Whale.address).filter_by(is_active=True).all()]
+            active = [row[0] for row in db.query(Whale.address).filter_by(is_active=True).all()]
+            real_open = [
+                row[0]
+                for row in db.query(CopiedBet.whale_address)
+                .filter(CopiedBet.status == "OPEN", CopiedBet.mode == "REAL")
+                .distinct()
+                .all()
+            ]
+            addresses = list({*active, *real_open})
         except Exception as exc:
             logger.error("poll_exits_only: failed to load whales: %s", exc)
             return
