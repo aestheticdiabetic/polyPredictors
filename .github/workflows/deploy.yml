@@ -16,6 +16,7 @@ jobs:
           key: ${{ secrets.DEPLOYCOPYBOT }}
           script: |
             cd /home/angus/polyPredictors
+            git reset --hard HEAD
             git pull
             docker rm -f polymarket-app 2>/dev/null || true
             docker build --no-cache -t polypredictors-polymarket-app . && docker compose up -d
