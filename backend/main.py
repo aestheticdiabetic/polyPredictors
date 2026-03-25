@@ -497,7 +497,7 @@ async def get_latest_session(mode: str = Query("all"), db: DBSession = Depends(g
 async def list_sessions(
     mode: str = Query("all"),
     page: int = Query(1, ge=1),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(20, ge=1, le=500),
     db: DBSession = Depends(get_db),
 ):
     """Return paginated list of all sessions with computed stats."""
