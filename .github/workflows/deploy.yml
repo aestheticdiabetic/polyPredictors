@@ -17,4 +17,4 @@ jobs:
           script: |
             cd /home/angus/polyPredictors
             git pull
-            docker compose -f docker-compose.vpn.yml up --build -d
+            docker compose up --build -d
