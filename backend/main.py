@@ -83,7 +83,9 @@ discord_bot: DiscordBot | None = None
 if settings.DISCORD_ENABLED and settings.DISCORD_BOT_TOKEN:
     discord_bot = DiscordBot(whale_monitor_ref=whale_monitor)
 else:
-    logger.info("Discord integration disabled (set DISCORD_ENABLED=true + DISCORD_BOT_TOKEN to enable)")
+    logger.info(
+        "Discord integration disabled (set DISCORD_ENABLED=true + DISCORD_BOT_TOKEN to enable)"
+    )
 
 # Stop-loss monitor always runs; Discord dispatch is skipped when discord_bot is None
 stop_loss_monitor = StopLossMonitor(
@@ -487,6 +489,162 @@ async def get_latest_session(mode: str = Query("all"), db: DBSession = Depends(g
     d["total_losses"] = losses
     d["total_pnl_usdc"] = round(pnl_total, 2)
     d["win_rate_pct"] = win_rate
+
+    return {"session": d}
+
+
+@app.get("/api/sessions/list")
+async def list_sessions(
+    mode: str = Query("all"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    db: DBSession = Depends(get_db),
+):
+    """Return paginated list of all sessions with computed stats."""
+    from sqlalchemy import func as _func
+
+    query = db.query(MonitoringSession)
+    query = _apply_session_mode_filter(query, mode)
+    total = query.count()
+    sessions = (
+        query.order_by(MonitoringSession.id.desc()).offset((page - 1) * limit).limit(limit).all()
+    )
+
+    result = []
+    for session in sessions:
+        d = session.to_dict()
+        rows = (
+            db.query(CopiedBet.status, _func.count(CopiedBet.id), _func.sum(CopiedBet.pnl_usdc))
+            .filter(CopiedBet.session_id == session.id)
+            .group_by(CopiedBet.status)
+            .all()
+        )
+        wins = losses = placed = 0
+        pnl_total = 0.0
+        for status, cnt, pnl_sum in rows:
+            if status != "SKIPPED":
+                placed += cnt
+            if status == "CLOSED_WIN":
+                wins += cnt
+            elif status == "CLOSED_LOSS":
+                losses += cnt
+            if pnl_sum is not None:
+                pnl_total += pnl_sum
+        win_rate = round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0.0
+        d["total_bets_placed"] = placed
+        d["total_wins"] = wins
+        d["total_losses"] = losses
+        d["total_pnl_usdc"] = round(pnl_total, 2)
+        d["win_rate_pct"] = win_rate
+        result.append(d)
+
+    return {
+        "sessions": result,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "pages": max(1, (total + limit - 1) // limit),
+        },
+    }
+
+
+@app.get("/api/sessions/{session_id}/stats")
+async def get_session_stats(session_id: int, db: DBSession = Depends(get_db)):
+    """Return full stats for a specific session including per-whale breakdown."""
+    from collections import defaultdict
+
+    from sqlalchemy import func as _func
+
+    session = db.query(MonitoringSession).filter(MonitoringSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    d = session.to_dict()
+
+    # Recompute summary stats from bet records
+    rows = (
+        db.query(CopiedBet.status, _func.count(CopiedBet.id), _func.sum(CopiedBet.pnl_usdc))
+        .filter(CopiedBet.session_id == session_id)
+        .group_by(CopiedBet.status)
+        .all()
+    )
+    wins = losses = placed = 0
+    pnl_total = 0.0
+    for status, cnt, pnl_sum in rows:
+        if status != "SKIPPED":
+            placed += cnt
+        if status == "CLOSED_WIN":
+            wins += cnt
+        elif status == "CLOSED_LOSS":
+            losses += cnt
+        if pnl_sum is not None:
+            pnl_total += pnl_sum
+    win_rate = round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0.0
+    d["total_bets_placed"] = placed
+    d["total_wins"] = wins
+    d["total_losses"] = losses
+    d["total_pnl_usdc"] = round(pnl_total, 2)
+    d["win_rate_pct"] = win_rate
+
+    # Per-whale breakdown
+    bets = (
+        db.query(CopiedBet)
+        .filter(CopiedBet.session_id == session_id, CopiedBet.status != "SKIPPED")
+        .all()
+    )
+    alias_map = {w.address: (w.alias or w.address) for w in db.query(Whale).all()}
+
+    groups: dict = defaultdict(
+        lambda: {
+            "followed": 0,
+            "open": 0,
+            "wins": 0,
+            "losses": 0,
+            "neutral": 0,
+            "pnl": 0.0,
+            "invested": 0.0,
+        }
+    )
+    for b in bets:
+        g = groups[b.whale_address]
+        g["followed"] += 1
+        g["invested"] += b.size_usdc or 0.0
+        if b.status == "OPEN":
+            g["open"] += 1
+        elif b.status == "CLOSED_WIN":
+            g["wins"] += 1
+            if b.pnl_usdc is not None:
+                g["pnl"] += b.pnl_usdc
+        elif b.status == "CLOSED_LOSS":
+            g["losses"] += 1
+            if b.pnl_usdc is not None:
+                g["pnl"] += b.pnl_usdc
+        elif b.status == "CLOSED_NEUTRAL":
+            g["neutral"] += 1
+            if b.pnl_usdc is not None:
+                g["pnl"] += b.pnl_usdc
+
+    whales_list = []
+    for addr, g in groups.items():
+        decided = g["wins"] + g["losses"]
+        wr = round(g["wins"] / decided * 100, 1) if decided > 0 else None
+        whales_list.append(
+            {
+                "whale_address": addr,
+                "whale_alias": alias_map.get(addr, addr[:10]),
+                "followed": g["followed"],
+                "open": g["open"],
+                "wins": g["wins"],
+                "losses": g["losses"],
+                "neutral": g["neutral"],
+                "win_rate_pct": wr,
+                "total_pnl_usdc": round(g["pnl"], 2),
+                "total_invested_usdc": round(g["invested"], 2),
+            }
+        )
+    whales_list.sort(key=lambda x: x["total_pnl_usdc"], reverse=True)
+    d["whales"] = whales_list
 
     return {"session": d}
 

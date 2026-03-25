@@ -16,9 +16,14 @@ const State = {
   ledgerStatus:      'all',
   ledgerMode:        'SIMULATION',  // scoped to the active tab (SIMULATION or REAL)
   ledgerSort:        'default',  // 'default' = newest first; 'close_asc' = soonest close first
-  ledgerSince:       null,       // ISO string — set when "This Session" tab is active
+  ledgerSince:       null,       // ISO string — set when "Sessions" tab is active
   ledgerUntil:       null,       // ISO string — upper bound for session filter
   latestSession:     null,       // cached session object for the banner
+  // Session browser
+  sessionList:       [],         // [{id, mode, started_at, ...}] ordered newest-first
+  sessionListPage:   1,
+  sessionListTotal:  0,
+  viewedSessionId:   null,       // null = latest; int = specific session
   signalsPage:       1,
   signalsTab:        'all',   // 'all' | 'win' | 'loss' | 'open'
   signalsGroupPage:  1,       // client-side page for grouped signal rows
@@ -163,7 +168,8 @@ function bindEvents() {
         State.ledgerStatus = 'all';
         State.ledgerSort = 'default';
         updateSortButton();
-        await fetchAndShowSessionBanner();
+        State.viewedSessionId = null;
+        await fetchAndShowSessionBrowser();
       } else {
         State.ledgerSince = null;
         State.ledgerUntil = null;
@@ -718,67 +724,11 @@ function changeLedgerPage(page) {
 }
 
 // ============================================================
-// Session Banner (This Session tab)
+// Session Banner — delegates to session_browser.js
 // ============================================================
 async function fetchAndShowSessionBanner() {
-  try {
-    const data = await api('GET', `/api/sessions/latest?mode=${State.mode}`);
-    const s = data.session;
-    State.latestSession = s;
-    if (!s) {
-      if (DOM.sessionBanner) DOM.sessionBanner.style.display = 'none';
-      fetchLedger();
-      return;
-    }
-    State.ledgerSince = s.started_at;
-    State.ledgerUntil = s.stopped_at || null;
-    renderSessionBanner(s);
-    fetchLedger();
-  } catch (err) {
-    console.error('fetchAndShowSessionBanner error:', err);
-    fetchLedger();
-  }
-}
-
-function renderSessionBanner(s) {
-  if (!DOM.sessionBanner) return;
-
-  const modeColor = s.mode === 'SIMULATION' ? 'var(--warning)' : 'var(--danger)';
-  const modeBg    = s.mode === 'SIMULATION' ? 'var(--warning-dim)' : 'var(--danger-dim)';
-  const statusLabel = s.is_active
-    ? '<span style="color:var(--success);font-weight:600">ACTIVE</span>'
-    : '<span style="color:var(--text-muted)">STOPPED</span>';
-
-  const startedStr = s.started_at
-    ? new Date(s.started_at.endsWith('Z') ? s.started_at : s.started_at + 'Z').toLocaleString()
-    : '—';
-
-  let durationStr = '—';
-  if (s.duration_seconds != null) {
-    const h = Math.floor(s.duration_seconds / 3600);
-    const m = Math.floor((s.duration_seconds % 3600) / 60);
-    durationStr = h > 0 ? `${h}h ${m}m` : `${m}m`;
-  }
-
-  const pnl = s.total_pnl_usdc || 0;
-  const pnlColor = pnl > 0 ? 'var(--success)' : pnl < 0 ? 'var(--danger)' : 'var(--text-muted)';
-  const pnlStr = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
-
-  DOM.sessionBanner.innerHTML = `
-    <div style="padding:10px 16px;background:var(--bg-secondary);display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)">
-      <span style="font-weight:600;font-size:0.85rem">Session #${s.id}</span>
-      <span style="background:${modeBg};color:${modeColor};padding:2px 8px;border-radius:10px;font-size:0.72rem;font-weight:700">${s.mode}</span>
-      ${statusLabel}
-      <span class="text-muted" style="font-size:0.78rem;margin-left:4px">Started ${startedStr} &mdash; ${durationStr}</span>
-    </div>
-    <div style="display:grid;grid-template-columns:repeat(5,1fr)">
-      <div class="signal-stat-cell"><div class="signal-stat-label">Placed</div><div class="signal-stat-value">${s.total_bets_placed}</div></div>
-      <div class="signal-stat-cell"><div class="signal-stat-label">Wins</div><div class="signal-stat-value" style="color:var(--success)">${s.total_wins}</div></div>
-      <div class="signal-stat-cell"><div class="signal-stat-label">Losses</div><div class="signal-stat-value" style="color:var(--danger)">${s.total_losses}</div></div>
-      <div class="signal-stat-cell"><div class="signal-stat-label">Win Rate</div><div class="signal-stat-value">${s.win_rate_pct.toFixed(1)}%</div></div>
-      <div class="signal-stat-cell"><div class="signal-stat-label">P&amp;L</div><div class="signal-stat-value" style="color:${pnlColor}">${pnlStr}</div></div>
-    </div>`;
-  DOM.sessionBanner.style.display = 'block';
+  State.viewedSessionId = null;
+  await fetchAndShowSessionBrowser();
 }
 
 // ============================================================
