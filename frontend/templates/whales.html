@@ -343,6 +343,19 @@ function buildDetailPanel(whale) {
       </div>
 
       <div class="filter-panel" style="margin-bottom:10px">
+        <div class="filter-panel-title">&#128200; Add-to-Position Following</div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:0.82rem;cursor:pointer">
+          <input type="checkbox" id="follow-add-signals-${safeId}" ${whale.follow_add_signals ? 'checked' : ''}
+                 onchange="toggleFollowAddSignals('${addr}', this)">
+          <span>
+            <strong>Follow Add Signals</strong> &mdash; place a bet when this whale adds more capital
+            to a position we already hold, sized by <em>suggested_add_usdc</em>.
+          </span>
+        </label>
+        <div id="follow-add-signals-status-${safeId}" style="font-size:0.75rem;color:var(--text-muted);margin-top:4px;margin-left:22px"></div>
+      </div>
+
+      <div class="filter-panel" style="margin-bottom:10px">
         <div class="filter-panel-title">&#9881; Category Filters</div>
 
         <div style="margin-bottom:8px">
@@ -504,6 +517,28 @@ async function toggleArbMode(address, checkbox) {
   }
 }
 
+// ── Follow-add-signals toggle ─────────────────────────────────────────────
+
+async function toggleFollowAddSignals(address, checkbox) {
+  const safeId = address.replace(/[^a-z0-9]/gi, "_");
+  const statusEl = document.getElementById(`follow-add-signals-status-${safeId}`);
+  try {
+    const resp = await fetch(`/api/whales/${address}/follow-add-signals`, { method: "PATCH" });
+    if (!resp.ok) throw new Error(await resp.text());
+    const data = await resp.json();
+    const state = data.whale.follow_add_signals ? "Follow Add Signals ON" : "Follow Add Signals OFF";
+    statusEl.textContent = `✓ ${state}`;
+    statusEl.style.color = "var(--success)";
+    showToast(state, "success");
+    setTimeout(() => { statusEl.textContent = ""; }, 3000);
+  } catch (e) {
+    checkbox.checked = !checkbox.checked;
+    statusEl.textContent = "✗ Error";
+    statusEl.style.color = "var(--danger)";
+    showToast("Failed to toggle follow-add-signals", "error");
+  }
+}
+
 // ── Main summary table ────────────────────────────────────────────────────
 
 let _analysisData = [];
@@ -527,11 +562,12 @@ async function fetchWhaleAnalysis() {
   const whaleByAddr = {};
   for (const w of whalesData.whales) whaleByAddr[w.address] = w;
 
-  // Merge — whale model fields take precedence for arb_mode
+  // Merge — whale model fields take precedence for arb_mode / follow_add_signals
   _analysisData = summaryData.whales.map(w => ({
     ...w,
     ...(catByAddr[w.whale_address] || {}),
     arb_mode: !!(whaleByAddr[w.whale_address] || {}).arb_mode,
+    follow_add_signals: !!(whaleByAddr[w.whale_address] || {}).follow_add_signals,
   }));
 
   renderWhaleAnalysis(_analysisData);

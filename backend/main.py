@@ -356,6 +356,18 @@ async def toggle_arb_mode(address: str, db: DBSession = Depends(get_db)):
     return {"whale": whale.to_dict()}
 
 
+@app.patch("/api/whales/{address}/follow-add-signals")
+async def toggle_follow_add_signals(address: str, db: DBSession = Depends(get_db)):
+    """Toggle follow_add_signals — place bets when whale adds to held positions."""
+    address = address.strip().lower()
+    whale = db.query(Whale).filter_by(address=address).first()
+    if not whale:
+        raise HTTPException(status_code=404, detail="Whale not found")
+    whale.follow_add_signals = not whale.follow_add_signals
+    db.commit()
+    return {"whale": whale.to_dict()}
+
+
 @app.get("/api/whales/{address}/history")
 async def whale_history(address: str, limit: int = Query(50, ge=1, le=200)):
     """Fetch a whale's recent activity from Polymarket API."""
