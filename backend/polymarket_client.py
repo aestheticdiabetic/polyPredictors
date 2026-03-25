@@ -33,7 +33,7 @@ def _normalize_market(market: dict) -> dict:
 
 _TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 _MARKET_CACHE_TTL = 3600  # seconds
-_PRICE_CACHE_TTL = 10  # seconds — live prices refresh every 10 s
+_PRICE_CACHE_TTL = 45  # seconds — live prices refresh every 45 s
 _PRICE_NEGATIVE_TTL = 300  # seconds — 404 (no order book) cached for 5 min
 
 
@@ -647,11 +647,9 @@ class PolymarketClient:
                 if _r.ok:
                     _markets = _r.json()
                     _market_data = _normalize_market(
-
-                            _markets[0]
-                            if isinstance(_markets, list)
-                            else _markets.get("markets", [{}])[0]
-
+                        _markets[0]
+                        if isinstance(_markets, list)
+                        else _markets.get("markets", [{}])[0]
                     )
                     self._market_cache[f"token:{token_id}"] = (
                         _market_data,

@@ -39,10 +39,16 @@ engine = create_engine(
 @event.listens_for(engine, "connect")
 def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
-    # WAL mode requires mmap/-shm files which are unreliable on Docker Windows
-    # bind mounts (NTFS → Linux, incomplete mmap support). DELETE mode is the
-    # classic SQLite journal — slower for concurrent reads but works everywhere.
-    cursor.execute("PRAGMA journal_mode=DELETE")
+    # WAL (Write-Ahead Logging) mode: readers never block writers and writers
+    # never block readers — far better throughput for the 3+ concurrent threads
+    # that write here (chain monitor, activity poller, resolution checker).
+    # Safe on Linux native filesystems (VPS deployment). Docker on Windows NTFS
+    # bind mounts may not support WAL due to incomplete mmap; if that's the
+    # deployment target revert to DELETE mode.
+    cursor.execute("PRAGMA journal_mode=WAL")
+    # NORMAL: flush after each WAL checkpoint rather than every write.
+    # Safe with WAL — durability is maintained by the WAL file itself.
+    cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 
@@ -84,6 +90,10 @@ class Whale(Base):
     # size reflects market liquidity, not confidence level.
     arb_mode = Column(Boolean, default=False, nullable=False)
 
+    # Follow add-to-position signals — when True, place a real/simulated bet each
+    # time the whale adds capital to a market we already hold, sized to suggested_add_usdc.
+    follow_add_signals = Column(Boolean, default=False, nullable=False)
+
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     # Relationships
@@ -107,6 +117,7 @@ class Whale(Base):
             "win_rate_pct": round(win_rate, 1),
             "category_filters": self.category_filters,
             "arb_mode": self.arb_mode,
+            "follow_add_signals": self.follow_add_signals,
             "created_at": self.created_at.isoformat(),
         }
 
@@ -204,6 +215,9 @@ class CopiedBet(Base):
     closed_at = Column(DateTime, nullable=True)
     market_close_at = Column(DateTime, nullable=True)  # market end date from Polymarket
 
+    # When placed by following an add-to-position signal, points to that signal. NULL otherwise.
+    followed_signal_id = Column(Integer, ForeignKey("add_to_position_signals.id"), nullable=True)
+
     # Relationships
     whale_bet = relationship("WhaleBet", back_populates="copied_bet")
     session = relationship("MonitoringSession", foreign_keys=[session_id])
@@ -246,6 +260,7 @@ class CopiedBet(Base):
             "opened_at": self.opened_at.isoformat() if self.opened_at else None,
             "closed_at": self.closed_at.isoformat() if self.closed_at else None,
             "market_close_at": self.market_close_at.isoformat() if self.market_close_at else None,
+            "followed_signal_id": self.followed_signal_id,
         }
 
 
@@ -253,8 +268,8 @@ class AddToPositionSignal(Base):
     __tablename__ = "add_to_position_signals"
 
     id = Column(Integer, primary_key=True, index=True)
-    whale_bet_id = Column(Integer, ForeignKey("whale_bets.id"), nullable=False)
-    copied_bet_id = Column(Integer, ForeignKey("copied_bets.id"), nullable=False)
+    whale_bet_id = Column(Integer, ForeignKey("whale_bets.id"), nullable=False, index=True)
+    copied_bet_id = Column(Integer, ForeignKey("copied_bets.id"), nullable=False, index=True)
 
     whale_additional_usdc = Column(Float, nullable=False)  # cumulative total across all additions
     whale_additional_shares = Column(Float, nullable=False, default=0.0)  # cumulative
@@ -275,6 +290,7 @@ class AddToPositionSignal(Base):
     # Relationships
     whale_bet = relationship("WhaleBet", back_populates="add_to_position_signal")
     copied_bet = relationship("CopiedBet", back_populates="add_to_position_signals")
+    followed_bets = relationship("CopiedBet", foreign_keys="CopiedBet.followed_signal_id")
 
     def to_dict(self) -> dict:
         return {
@@ -397,6 +413,8 @@ def _migrate():
         ("add_to_position_signals", "last_addition_at", "DATETIME"),
         ("sessions", "total_gas_fees_usdc", "FLOAT DEFAULT 0.0"),
         ("copied_bets", "gas_fees_usdc", "FLOAT"),
+        ("whales", "follow_add_signals", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("copied_bets", "followed_signal_id", "INTEGER REFERENCES add_to_position_signals(id)"),
     ]
     sa = __import__("sqlalchemy")
     with engine.connect() as conn:
@@ -420,6 +438,29 @@ def _migrate():
             conn.commit()
         except Exception:
             pass
+
+        # Compound indices on copied_bets — eliminate full-table scans in the hot
+        # placement path (process_new_whale_bet queries by whale+token+status and
+        # whale+mode+status on every bet).
+        for idx_sql in (
+            "CREATE INDEX IF NOT EXISTS ix_cb_whale_token_status "
+            "ON copied_bets (whale_address, token_id, status)",
+            "CREATE INDEX IF NOT EXISTS ix_cb_whale_mode_status "
+            "ON copied_bets (whale_address, mode, status)",
+            # Partial index — resolution checker scans only status='OPEN' rows.
+            "CREATE INDEX IF NOT EXISTS ix_cb_status_open "
+            "ON copied_bets (status) WHERE status = 'OPEN'",
+            # FK indices on add_to_position_signals — fast lookups by copied_bet_id.
+            "CREATE INDEX IF NOT EXISTS ix_atps_whale_bet_id "
+            "ON add_to_position_signals (whale_bet_id)",
+            "CREATE INDEX IF NOT EXISTS ix_atps_copied_bet_id "
+            "ON add_to_position_signals (copied_bet_id)",
+        ):
+            try:
+                conn.execute(sa.text(idx_sql))
+                conn.commit()
+            except Exception:
+                pass
 
         # Back-fill session_id for existing bets: assign each bet to the session
         # with matching mode that started most recently at or before the bet's opened_at.

@@ -201,7 +201,14 @@ class BetEngine:
                         _SAME_PRICE_TOLERANCE,
                         closest.price_at_entry,
                     )
-                    return self._handle_add_to_position(whale_bet, closest, session, db)
+                    return self._handle_add_to_position(
+                        whale_bet,
+                        closest,
+                        session,
+                        db,
+                        live_price=live_price,
+                        market_info=market_info or {},
+                    )
                 logger.info(
                     "New price tranche: whale %s bought %s @ %.3f "
                     "(diff=%.3f from existing %.3f > %.2f tolerance) — opening new tranche",
@@ -824,8 +831,8 @@ class BetEngine:
                     except (ValueError, TypeError):
                         pass
 
-            # Classify market category and bet type
-            market_category, bet_type_cat = classify(whale_bet.question)
+            # Reuse the classification already computed for the category-filter check above.
+            market_category, bet_type_cat = cat_sport, cat_bet_type
 
             # Persist CopiedBet
             copied_bet = CopiedBet(
@@ -2572,12 +2579,14 @@ class BetEngine:
         existing_open: CopiedBet,
         session: MonitoringSession,
         db: DBSession,
+        live_price: float | None = None,
+        market_info: dict | None = None,
     ) -> CopiedBet:
-        """Whale is adding to a market we already hold - record signal only, no new ledger entry.
+        """Whale is adding to a market we already hold.
 
-        Calculates suggested_add_usdc using the same risk-factor sizing as the
-        main bet engine, based on the session balance *after* the original
-        position's cost (already deducted from session.current_balance_usdc).
+        Always records an AddToPositionSignal. When the whale's follow_add_signals
+        flag is True, also places a new CopiedBet (sized to suggested_add_usdc)
+        using the same simulate_buy / place_real_buy path as normal bets.
         """
         whale = whale_bet.whale
         whale_avg = whale.avg_bet_size_usdc if whale else 0.0
@@ -2606,6 +2615,7 @@ class BetEngine:
             existing_signal.price = whale_bet.price  # latest addition price
             existing_signal.suggested_add_usdc = suggested_add_usdc
             db.add(existing_signal)
+            signal = existing_signal
             logger.info(
                 "Updated add-to-position signal for copied_bet=%d: total=$%.2f additions=%d",
                 existing_open.id,
@@ -2627,8 +2637,173 @@ class BetEngine:
             )
             db.add(signal)
 
-        db.commit()
-        # Return the existing open position — no new ledger entry created
+        # Flush so signal.id is populated before it may be used as a FK below.
+        db.flush()
+
+        # ── Conditional placement ─────────────────────────────────────────
+        if not (whale and whale.follow_add_signals):
+            db.commit()
+            return existing_open
+
+        if session.current_balance_usdc < 1.0:
+            logger.info(
+                "follow_add_signals: balance $%.2f < $1 — signal recorded, no placement",
+                session.current_balance_usdc,
+            )
+            db.commit()
+            return existing_open
+
+        if suggested_add_usdc < 1.0:
+            logger.info(
+                "follow_add_signals: suggested_add_usdc $%.4f < $1 minimum — skipping placement",
+                suggested_add_usdc,
+            )
+            db.commit()
+            return existing_open
+
+        market_info = market_info or {}
+        _neg_risk = bool(market_info.get("negRisk", False))
+        market_category, bet_type_cat = classify(whale_bet.question)
+
+        # Parse market close date (mirrors process_new_whale_bet lines 798-825)
+        market_close_at = None
+        end_str = (
+            market_info.get("endDate")
+            or market_info.get("endDateIso")
+            or market_info.get("end_date_iso")
+            or market_info.get("end_date")
+        )
+        if end_str:
+            try:
+                dt = datetime.fromisoformat(end_str.rstrip("Z"))
+                if dt.tzinfo is not None:
+                    dt = dt.replace(tzinfo=None)
+                market_close_at = dt
+            except (ValueError, TypeError):
+                pass
+        game_start_str = market_info.get("gameStartTime")
+        if game_start_str:
+            try:
+                gst = datetime.fromisoformat(str(game_start_str).rstrip("Z"))
+                if gst.tzinfo is not None:
+                    gst = gst.replace(tzinfo=None)
+                if market_close_at is None or gst > market_close_at:
+                    market_close_at = gst
+            except (ValueError, TypeError):
+                pass
+
+        mode = session.mode
+
+        with self._placement_lock:
+            db.refresh(session)
+            # Recalculate size with refreshed balance inside the lock
+            suggested_add_usdc = risk_calc.calculate_bet_size(
+                session_balance=session.current_balance_usdc,
+                risk_factor=risk_factor,
+                max_bet_pct=settings.MAX_BET_PCT,
+            )
+            if suggested_add_usdc < 1.0:
+                db.commit()
+                return existing_open
+
+            bet_size_usdc = suggested_add_usdc
+            entry_price = whale_bet.price
+            size_shares = 0.0
+
+            try:
+                if mode in ("SIMULATION", "HEDGE_SIM"):
+                    shares, actual_price, actual_cost = self.simulate_buy(
+                        session=session,
+                        market_id=whale_bet.market_id,
+                        token_id=whale_bet.token_id,
+                        question=whale_bet.question,
+                        outcome=whale_bet.outcome,
+                        price=whale_bet.price,
+                        size_usdc=bet_size_usdc,
+                        db=db,
+                        live_price=live_price,
+                    )
+                    entry_price = actual_price
+                    size_shares = shares
+                    bet_size_usdc = actual_cost
+                else:  # REAL
+                    import math as _math
+
+                    order_resp = self.place_real_buy(
+                        token_id=whale_bet.token_id,
+                        size_usdc=bet_size_usdc,
+                        price=whale_bet.price,
+                        neg_risk=_neg_risk,
+                    )
+                    logger.info("follow_add_signals REAL BUY response: %s", order_resp)
+                    order_status_raw = str(order_resp.get("status", "")).upper()
+                    if order_status_raw not in ("UNMATCHED", "CANCELLED", "CANCELED"):
+                        taking_raw = order_resp.get("takingAmount")
+                        making_raw = order_resp.get("makingAmount")
+                        if taking_raw is not None and making_raw is not None:
+                            taking_f, making_f = float(taking_raw), float(making_raw)
+                            if making_f > 0 and taking_f > 0:
+                                size_shares = _math.floor(taking_f * 100) / 100
+                                bet_size_usdc = round(making_f, 4)
+                                entry_price = round(making_f / taking_f, 6)
+                            else:
+                                size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
+                        else:
+                            size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
+                    session.current_balance_usdc = max(
+                        0.0, session.current_balance_usdc - bet_size_usdc
+                    )
+                    db.add(session)
+            except Exception as exc:
+                logger.error(
+                    "follow_add_signals: placement failed for whale_bet=%d: %s",
+                    whale_bet.id,
+                    exc,
+                )
+                db.commit()
+                return existing_open
+
+            follow_bet = CopiedBet(
+                whale_bet_id=whale_bet.id,
+                whale_address=whale.address,
+                session_id=session.id,
+                mode=mode,
+                market_id=whale_bet.market_id,
+                token_id=whale_bet.token_id,
+                question=whale_bet.question,
+                side=whale_bet.side,
+                outcome=whale_bet.outcome,
+                price_at_entry=entry_price,
+                size_usdc=bet_size_usdc,
+                size_shares=size_shares,
+                risk_factor=risk_factor,
+                whale_bet_usdc=whale_bet.size_usdc,
+                whale_avg_bet_usdc=whale_avg,
+                status="OPEN",
+                market_category=market_category,
+                bet_type=bet_type_cat,
+                opened_at=datetime.utcnow(),
+                market_close_at=market_close_at,
+                followed_signal_id=signal.id,
+            )
+            db.add(follow_bet)
+            session.total_bets_placed += 1
+            db.add(session)
+            db.commit()
+
+            logger.info(
+                "follow_add_signals: placed %s follow-bet whale_bet=%d %s @%.4f $%.2f"
+                " rf=%.2f signal_id=%d",
+                mode,
+                whale_bet.id,
+                whale_bet.outcome,
+                entry_price,
+                bet_size_usdc,
+                risk_factor,
+                signal.id,
+            )
+
+        # Return the original open position — follow_bet is a separate ledger entry
         return existing_open
 
     # ------------------------------------------------------------------

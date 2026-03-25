@@ -25,6 +25,24 @@ from backend.database import (
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Thread-local reusable event loop
+# ---------------------------------------------------------------------------
+# APScheduler's BackgroundScheduler runs jobs on a thread pool.  Using
+# asyncio.run() on every tick creates and destroys a new event loop each time
+# (~5-10 ms overhead) and also invalidates httpx TCP connections (transports
+# are tied to the event loop they were first used on).  Reusing one event loop
+# per scheduler thread avoids both costs.
+_tl: threading.local = threading.local()
+
+
+def _run_async(coro):
+    """Run *coro* on a reusable per-thread event loop."""
+    if not hasattr(_tl, "loop") or _tl.loop.is_closed():
+        _tl.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_tl.loop)
+    return _tl.loop.run_until_complete(coro)
+
 
 class WhaleMonitor:
     """
@@ -276,7 +294,7 @@ class WhaleMonitor:
             return
         db = SessionLocal()
         try:
-            asyncio.run(self._bet_engine.retry_drift_watchlist(db))
+            _run_async(self._bet_engine.retry_drift_watchlist(db))
         except Exception as exc:
             logger.error("_run_drift_retry error: %s", exc)
         finally:
@@ -288,7 +306,7 @@ class WhaleMonitor:
         Runs every PRICE_PREFETCH_INTERVAL_SECONDS to keep CLOB prices fresh
         for all tokens in open positions. No-ops if there are no open positions.
         """
-        asyncio.run(self._prefetch_prices())
+        _run_async(self._prefetch_prices())
 
     async def _prefetch_prices(self):
         """
@@ -340,7 +358,7 @@ class WhaleMonitor:
 
         logger.debug("Polling %d active whales", len(addresses))
 
-        asyncio.run(self._poll_all_async(addresses))
+        _run_async(self._poll_all_async(addresses))
 
     async def _poll_all_async(self, addresses: list):
         """
@@ -522,7 +540,7 @@ class WhaleMonitor:
         if not addresses:
             return
 
-        asyncio.run(self._poll_exits_async(addresses))
+        _run_async(self._poll_exits_async(addresses))
 
     async def _poll_exits_async(self, addresses: list):
         """Fetch recent activity for all whales in parallel, then handle exits."""
@@ -835,7 +853,7 @@ class WhaleMonitor:
         for an extended period (e.g. partial fills, gas costs, manual trades).
         """
         try:
-            balance = asyncio.run(self._client.get_wallet_balance())
+            balance = _run_async(self._client.get_wallet_balance())
         except Exception as exc:
             logger.error("_sync_real_balance: wallet fetch error: %s", exc)
             return
@@ -889,7 +907,7 @@ class WhaleMonitor:
         from backend.redemption import check_and_redeem
 
         try:
-            result = asyncio.run(check_and_redeem())
+            result = _run_async(check_and_redeem())
             redeemed = result.get("redeemed", 0)
             total_gas_matic = result.get("total_gas_matic", 0.0)
             if redeemed > 0 or total_gas_matic > 0:
