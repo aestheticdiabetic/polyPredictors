@@ -154,6 +154,15 @@ class Settings:
         os.getenv("SELL_ACCEPT_DEGRADED_FILL", "false").lower() == "true"
     )
 
+    # How many times to retry a sell that fails for a transient reason (FOK cancelled,
+    # zero-fill response, exception) before giving up and waiting for the next orphan
+    # poll cycle. Each retry is separated by SELL_CLOSE_RETRY_DELAY_SECONDS.
+    # Default 4. Set to 0 to disable (rely solely on the poll cycle).
+    SELL_CLOSE_RETRIES: int = int(os.getenv("SELL_CLOSE_RETRIES", "4"))
+
+    # Seconds to wait between sell retry attempts. Default 3.
+    SELL_CLOSE_RETRY_DELAY_SECONDS: int = int(os.getenv("SELL_CLOSE_RETRY_DELAY_SECONDS", "3"))
+
     # MATIC/USD conversion rate used to convert Polygon gas fees to USDC for P&L tracking.
     # Update when MATIC price drifts significantly. Gas costs are small (< $0.05/tx)
     # so a stale rate has minimal impact on overall P&L accuracy.

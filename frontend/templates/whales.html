@@ -182,11 +182,13 @@
             <th>Avg P&amp;L / Bet</th>
             <th>Best Bet</th>
             <th>Worst Bet</th>
+            <th title="Add-to-position signal win rate (resolved signals only)">Signal Win%</th>
+            <th title="Hypothetical P&amp;L if all add-to-position signals had been followed">Signal P&amp;L</th>
           </tr>
         </thead>
         <tbody id="whale-analysis-body">
           <tr>
-            <td colspan="9">
+            <td colspan="11">
               <div class="empty-state"><p>Loading whale data...</p></div>
             </td>
           </tr>
@@ -207,6 +209,10 @@
 
 const ALL_SPORTS    = ["Soccer","Basketball","Tennis","eSports","American Football","Baseball","Politics","Crypto","Other"];
 const ALL_BET_TYPES = ["Over/Under","Spread","Exact Score","Moneyline","Match Winner","Other"];
+
+function escHtml(s) {
+  return String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
 
 const SPORT_CLASS = {
   Soccer: "cat-soccer", Basketball: "cat-basketball", Tennis: "cat-tennis",
@@ -292,14 +298,23 @@ function readDisabled(containerId) {
     .map(c => c.dataset.value);
 }
 
+function readEnabled(containerId) {
+  return Array.from(document.querySelectorAll(`#${containerId} .filter-chip`))
+    .filter(c => c.querySelector("input").checked)
+    .map(c => c.dataset.value);
+}
+
 // ── Detail panel HTML ─────────────────────────────────────────────────────
 
 function buildDetailPanel(whale) {
   const addr = whale.whale_address;
   const safeId = addr.replace(/[^a-z0-9]/gi, "_");
   const filters = whale.category_filters || {};
-  const disabledSports   = filters.disabled_sports   || [];
-  const disabledBetTypes = filters.disabled_bet_types || [];
+  const allowedSports    = filters.allowed_sports    || [];
+  const isAllowlistMode  = allowedSports.length > 0;
+
+  const fmtPrice = v => (v != null ? v : "");
+  const fmtSize  = v => (v != null ? v : "");
 
   return `
     <div class="whale-detail-panel" id="panel-${safeId}">
@@ -327,44 +342,133 @@ function buildDetailPanel(whale) {
         <div id="arb-mode-status-${safeId}" style="font-size:0.75rem;color:var(--text-muted);margin-top:4px;margin-left:22px"></div>
       </div>
 
-      <div class="filter-panel">
-        <div class="filter-panel-title">&#9881; Category Filters
-          <span style="font-size:0.7rem;font-weight:400;color:var(--text-muted);margin-left:6px;text-transform:none">
-            Unchecked = skip this whale's bets in that category
-          </span>
+      <div class="filter-panel" style="margin-bottom:10px">
+        <div class="filter-panel-title">&#9881; Category Filters</div>
+
+        <div style="margin-bottom:8px">
+          <label style="display:flex;align-items:center;gap:8px;font-size:0.82rem;cursor:pointer">
+            <input type="checkbox" id="allowlist-mode-${safeId}" ${isAllowlistMode ? 'checked' : ''}
+                   onchange="toggleSportMode('${safeId}', this.checked)">
+            <span><strong>Allowlist mode</strong> &mdash; only copy bets from selected sports (ignore the block list)</span>
+          </label>
         </div>
-        <div class="filter-groups">
+
+        <div id="sport-block-group-${safeId}" style="${isAllowlistMode ? 'display:none' : ''}">
+          <div class="filter-group-label">Block sports / topics <span style="font-weight:400;color:var(--text-muted)">(unchecked = skip)</span></div>
+          <div class="filter-chips" id="sports-chips-${safeId}"></div>
+        </div>
+
+        <div id="sport-allow-group-${safeId}" style="${isAllowlistMode ? '' : 'display:none'}">
+          <div class="filter-group-label">Allow only these sports <span style="font-weight:400;color:var(--text-muted)">(checked = copy)</span></div>
+          <div class="filter-chips" id="sports-allow-chips-${safeId}"></div>
+        </div>
+
+        <div style="margin-top:8px">
+          <div class="filter-group-label">Bet Types <span style="font-weight:400;color:var(--text-muted)">(unchecked = skip)</span></div>
+          <div class="filter-chips" id="bettypes-chips-${safeId}"></div>
+        </div>
+      </div>
+
+      <div class="filter-panel" style="margin-bottom:10px">
+        <div class="filter-panel-title">&#128178; Whale Trade Thresholds</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:0.82rem">
           <div>
-            <div class="filter-group-label">Sports / Topics</div>
-            <div class="filter-chips" id="sports-chips-${safeId}"></div>
+            <div class="filter-group-label">Entry price range (0–1)</div>
+            <div style="display:flex;gap:6px;align-items:center">
+              <input type="number" id="min-price-${safeId}" min="0" max="1" step="0.01"
+                     placeholder="min" value="${fmtPrice(filters.min_entry_price)}"
+                     style="width:70px;padding:3px 5px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:4px;color:var(--text-primary)">
+              <span style="color:var(--text-muted)">–</span>
+              <input type="number" id="max-price-${safeId}" min="0" max="1" step="0.01"
+                     placeholder="max" value="${fmtPrice(filters.max_entry_price)}"
+                     style="width:70px;padding:3px 5px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:4px;color:var(--text-primary)">
+            </div>
           </div>
           <div>
-            <div class="filter-group-label">Bet Types</div>
-            <div class="filter-chips" id="bettypes-chips-${safeId}"></div>
+            <div class="filter-group-label">Whale bet size (USDC)</div>
+            <div style="display:flex;gap:6px;align-items:center">
+              <input type="number" id="min-size-${safeId}" min="0" step="1"
+                     placeholder="min $" value="${fmtSize(filters.min_whale_bet_usdc)}"
+                     style="width:80px;padding:3px 5px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:4px;color:var(--text-primary)">
+              <span style="color:var(--text-muted)">–</span>
+              <input type="number" id="max-size-${safeId}" min="0" step="1"
+                     placeholder="max $" value="${fmtSize(filters.max_whale_bet_usdc)}"
+                     style="width:80px;padding:3px 5px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:4px;color:var(--text-primary)">
+            </div>
           </div>
         </div>
-        <div class="filter-save-btn">
-          <button class="btn btn-primary btn-sm"
-                  onclick="saveFilters('${addr}', '${safeId}')">
-            Save Filters
-          </button>
-          <span id="save-status-${safeId}" style="margin-left:10px;font-size:0.78rem;color:var(--text-muted)"></span>
+      </div>
+
+      <div class="filter-panel" style="margin-bottom:10px">
+        <div class="filter-panel-title">&#128269; Keyword Filters <span style="font-size:0.7rem;font-weight:400;color:var(--text-muted);text-transform:none">(comma-separated, case-insensitive)</span></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:0.82rem">
+          <div>
+            <div class="filter-group-label">Required keywords (ALL must match)</div>
+            <input type="text" id="required-kw-${safeId}"
+                   placeholder="e.g. tennis, wimbledon"
+                   value="${escHtml((filters.required_keywords || []).join(', '))}"
+                   style="width:100%;padding:4px 6px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:4px;color:var(--text-primary);box-sizing:border-box">
+          </div>
+          <div>
+            <div class="filter-group-label">Excluded keywords (NONE may match)</div>
+            <input type="text" id="excluded-kw-${safeId}"
+                   placeholder="e.g. futures, winner"
+                   value="${escHtml((filters.excluded_keywords || []).join(', '))}"
+                   style="width:100%;padding:4px 6px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:4px;color:var(--text-primary);box-sizing:border-box">
+          </div>
         </div>
+      </div>
+
+      <div class="filter-save-btn">
+        <button class="btn btn-primary btn-sm" onclick="saveFilters('${addr}', '${safeId}')">
+          Save Filters
+        </button>
+        <span id="save-status-${safeId}" style="margin-left:10px;font-size:0.78rem;color:var(--text-muted)"></span>
       </div>
     </div>`;
 }
 
+function toggleSportMode(safeId, isAllowlist) {
+  document.getElementById(`sport-block-group-${safeId}`).style.display = isAllowlist ? 'none' : '';
+  document.getElementById(`sport-allow-group-${safeId}`).style.display = isAllowlist ? '' : 'none';
+}
+
 // ── Save filters ──────────────────────────────────────────────────────────
 
+function parseKwField(id) {
+  const val = (document.getElementById(id)?.value || "").trim();
+  return val ? val.split(",").map(s => s.trim()).filter(Boolean) : [];
+}
+
+function parseFloatField(id) {
+  const el = document.getElementById(id);
+  if (!el || el.value === "") return null;
+  const v = parseFloat(el.value);
+  return isNaN(v) ? null : v;
+}
+
 async function saveFilters(address, safeId) {
-  const disabledSports   = readDisabled(`sports-chips-${safeId}`);
+  const isAllowlist = document.getElementById(`allowlist-mode-${safeId}`)?.checked;
+  const disabledSports   = isAllowlist ? [] : readDisabled(`sports-chips-${safeId}`);
+  const allowedSports    = isAllowlist ? readEnabled(`sports-allow-chips-${safeId}`) : [];
   const disabledBetTypes = readDisabled(`bettypes-chips-${safeId}`);
   const statusEl = document.getElementById(`save-status-${safeId}`);
+  const payload = {
+    disabled_sports:      disabledSports,
+    disabled_bet_types:   disabledBetTypes,
+    allowed_sports:       allowedSports,
+    min_entry_price:      parseFloatField(`min-price-${safeId}`),
+    max_entry_price:      parseFloatField(`max-price-${safeId}`),
+    min_whale_bet_usdc:   parseFloatField(`min-size-${safeId}`),
+    max_whale_bet_usdc:   parseFloatField(`max-size-${safeId}`),
+    required_keywords:    parseKwField(`required-kw-${safeId}`),
+    excluded_keywords:    parseKwField(`excluded-kw-${safeId}`),
+  };
   try {
     const resp = await fetch(`/api/whales/${address}/categories`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ disabled_sports: disabledSports, disabled_bet_types: disabledBetTypes }),
+      body: JSON.stringify(payload),
     });
     if (!resp.ok) throw new Error(await resp.text());
     statusEl.textContent = "✓ Saved";
@@ -436,7 +540,7 @@ async function fetchWhaleAnalysis() {
 function renderWhaleAnalysis(whales) {
   const tbody = document.getElementById("whale-analysis-body");
   if (!whales || whales.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="9"><div class="empty-state"><p>No closed bets yet.</p></div></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11"><div class="empty-state"><p>No closed bets yet.</p></div></td></tr>`;
     return;
   }
 
@@ -462,11 +566,13 @@ function renderWhaleAnalysis(whales) {
       <td class="${pnlClass(w.avg_pnl_usdc)}">${fmt(w.avg_pnl_usdc)}</td>
       <td class="text-success">${w.best_bet_usdc != null ? fmt(w.best_bet_usdc) : "—"}</td>
       <td class="text-danger">${w.worst_bet_usdc != null ? fmt(w.worst_bet_usdc) : "—"}</td>
+      <td class="${winRateClass(w.signal_win_rate_pct)}">${w.signal_win_rate_pct != null ? w.signal_win_rate_pct + "%" : "—"}</td>
+      <td class="${pnlClass(w.signal_total_pnl_usdc)}">${w.signal_total_pnl_usdc != null ? fmt(w.signal_total_pnl_usdc) : "—"}</td>
     </tr>`;
 
     // Detail row (hidden until expanded)
     html += `<tr class="whale-detail-row" id="detail-row-${safeId}">
-      <td colspan="9">${buildDetailPanel(w)}</td>
+      <td colspan="11">${buildDetailPanel(w)}</td>
     </tr>`;
   }
   tbody.innerHTML = html;
@@ -475,8 +581,12 @@ function renderWhaleAnalysis(whales) {
   for (const w of whales) {
     const safeId = w.whale_address.replace(/[^a-z0-9]/gi, "_");
     const filters = w.category_filters || {};
-    buildFilterChips(`sports-chips-${safeId}`,    ALL_SPORTS,    ALL_SPORTS,    filters.disabled_sports   || []);
-    buildFilterChips(`bettypes-chips-${safeId}`,  ALL_BET_TYPES, ALL_BET_TYPES, filters.disabled_bet_types || []);
+    // Block-list chips: checked = enabled (not disabled)
+    buildFilterChips(`sports-chips-${safeId}`,       ALL_SPORTS,    ALL_SPORTS,    filters.disabled_sports   || []);
+    buildFilterChips(`bettypes-chips-${safeId}`,     ALL_BET_TYPES, ALL_BET_TYPES, filters.disabled_bet_types || []);
+    // Allow-list chips: checked = allowed; start all unchecked then check the saved allowlist
+    const allowedSports = filters.allowed_sports || [];
+    buildFilterChips(`sports-allow-chips-${safeId}`, ALL_SPORTS,    allowedSports, ALL_SPORTS.filter(s => !allowedSports.includes(s)));
   }
 }
 

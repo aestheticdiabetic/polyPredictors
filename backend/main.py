@@ -167,9 +167,7 @@ async def start_session(body: SessionStartRequest, db: DBSession = Depends(get_d
     """
 
     # Reject if the same mode is already running (different modes are fine)
-    existing = db.query(MonitoringSession).filter_by(
-        mode=body.mode, is_active=True
-    ).first()
+    existing = db.query(MonitoringSession).filter_by(mode=body.mode, is_active=True).first()
     if existing:
         raise HTTPException(
             status_code=400,
@@ -376,6 +374,7 @@ async def refresh_profiles():
     try:
         # Run in a thread to avoid blocking event loop
         import asyncio
+
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, whale_monitor.refresh_risk_profiles)
         return {"message": "Risk profiles refreshed"}
@@ -428,6 +427,7 @@ async def get_latest_session(mode: str = Query("all"), db: DBSession = Depends(g
     # The stored fields accumulate via in-memory writes and can drift from the true
     # values if a background job incorrectly attributes a bet to the wrong session.
     from sqlalchemy import func as _func
+
     rows = (
         db.query(CopiedBet.status, _func.count(CopiedBet.id), _func.sum(CopiedBet.pnl_usdc))
         .filter(CopiedBet.session_id == session.id)
@@ -462,8 +462,8 @@ async def get_ledger(
     mode: str = Query("all"),
     status: str = Query("all"),
     sort: str = Query("default"),  # "default" = newest first; "close_asc" = soonest close first
-    since: str | None = Query(None),   # ISO datetime — filter opened_at >= since
-    until: str | None = Query(None),   # ISO datetime — filter opened_at <= until
+    since: str | None = Query(None),  # ISO datetime — filter opened_at >= since
+    until: str | None = Query(None),  # ISO datetime — filter opened_at <= until
     db: DBSession = Depends(get_db),
 ):
     """Paginated bet ledger with optional filters."""
@@ -498,23 +498,18 @@ async def get_ledger(
 
     # Sort: soonest market close first (nulls last), otherwise newest bet first
     from sqlalchemy import nulls_last
+
     if sort == "close_asc":
         order = nulls_last(CopiedBet.market_close_at.asc())
     else:
         order = CopiedBet.id.desc()
 
-    bets = (
-        query.order_by(order)
-        .offset((page - 1) * limit)
-        .limit(limit)
-        .all()
-    )
+    bets = query.order_by(order).offset((page - 1) * limit).limit(limit).all()
 
     # Build alias lookup for the addresses on this page
     addresses = {b.whale_address for b in bets}
     alias_map = {
-        w.address: w.alias
-        for w in db.query(Whale).filter(Whale.address.in_(addresses)).all()
+        w.address: w.alias for w in db.query(Whale).filter(Whale.address.in_(addresses)).all()
     }
 
     result = []
@@ -574,7 +569,9 @@ async def ledger_stats(
     # Capital currently at risk (sum of size_usdc for all OPEN bets)
     open_bets = [b for b in bets if b.status == "OPEN"]
     capital_at_risk = round(sum(b.size_usdc for b in open_bets if b.mode == "REAL"), 2)
-    sim_capital_at_risk = round(sum(b.size_usdc for b in open_bets if b.mode in ("SIMULATION", "HEDGE_SIM")), 2)
+    sim_capital_at_risk = round(
+        sum(b.size_usdc for b in open_bets if b.mode in ("SIMULATION", "HEDGE_SIM")), 2
+    )
 
     if active:
         balance = active.current_balance_usdc
@@ -613,10 +610,17 @@ async def stats_by_whale(mode: str = Query("all"), db: DBSession = Depends(get_d
     whales = db.query(Whale).all()
     alias_map = {w.address: (w.alias or w.address) for w in whales}
 
-    groups: dict = defaultdict(lambda: {
-        "followed": 0, "open": 0, "wins": 0, "losses": 0, "neutral": 0,
-        "closed": 0, "pnl_values": [],
-    })
+    groups: dict = defaultdict(
+        lambda: {
+            "followed": 0,
+            "open": 0,
+            "wins": 0,
+            "losses": 0,
+            "neutral": 0,
+            "closed": 0,
+            "pnl_values": [],
+        }
+    )
 
     for b in bets:
         g = groups[b.whale_address]
@@ -624,38 +628,86 @@ async def stats_by_whale(mode: str = Query("all"), db: DBSession = Depends(get_d
         if b.status == "OPEN":
             g["open"] += 1
         elif b.status == "CLOSED_WIN":
-            g["wins"] += 1; g["closed"] += 1
-            if b.pnl_usdc is not None: g["pnl_values"].append(b.pnl_usdc)
+            g["wins"] += 1
+            g["closed"] += 1
+            if b.pnl_usdc is not None:
+                g["pnl_values"].append(b.pnl_usdc)
         elif b.status == "CLOSED_LOSS":
-            g["losses"] += 1; g["closed"] += 1
-            if b.pnl_usdc is not None: g["pnl_values"].append(b.pnl_usdc)
+            g["losses"] += 1
+            g["closed"] += 1
+            if b.pnl_usdc is not None:
+                g["pnl_values"].append(b.pnl_usdc)
         elif b.status == "CLOSED_NEUTRAL":
-            g["neutral"] += 1; g["closed"] += 1
-            if b.pnl_usdc is not None: g["pnl_values"].append(b.pnl_usdc)
+            g["neutral"] += 1
+            g["closed"] += 1
+            if b.pnl_usdc is not None:
+                g["pnl_values"].append(b.pnl_usdc)
 
     result = []
     for address, g in groups.items():
         total_pnl = round(sum(g["pnl_values"]), 2)
-        decided   = g["wins"] + g["losses"]
-        avg_pnl   = round(total_pnl / decided, 2) if decided > 0 else 0.0
-        win_rate  = round(g["wins"] / decided * 100, 1) if decided > 0 else None
-        best      = round(max(g["pnl_values"]), 2) if g["pnl_values"] else None
-        worst     = round(min(g["pnl_values"]), 2) if g["pnl_values"] else None
-        result.append({
-            "whale_address": address,
-            "whale_alias":   alias_map.get(address, address),
-            "followed":      g["followed"],
-            "open":          g["open"],
-            "wins":          g["wins"],
-            "losses":        g["losses"],
-            "neutral":       g["neutral"],
-            "closed":        g["closed"],
-            "win_rate_pct":  win_rate,
-            "total_pnl_usdc": total_pnl,
-            "avg_pnl_usdc":  avg_pnl,
-            "best_bet_usdc": best,
-            "worst_bet_usdc": worst,
-        })
+        decided = g["wins"] + g["losses"]
+        avg_pnl = round(total_pnl / decided, 2) if decided > 0 else 0.0
+        win_rate = round(g["wins"] / decided * 100, 1) if decided > 0 else None
+        best = round(max(g["pnl_values"]), 2) if g["pnl_values"] else None
+        worst = round(min(g["pnl_values"]), 2) if g["pnl_values"] else None
+        result.append(
+            {
+                "whale_address": address,
+                "whale_alias": alias_map.get(address, address),
+                "followed": g["followed"],
+                "open": g["open"],
+                "wins": g["wins"],
+                "losses": g["losses"],
+                "neutral": g["neutral"],
+                "closed": g["closed"],
+                "win_rate_pct": win_rate,
+                "total_pnl_usdc": total_pnl,
+                "avg_pnl_usdc": avg_pnl,
+                "best_bet_usdc": best,
+                "worst_bet_usdc": worst,
+            }
+        )
+
+    # --- Add-to-position signal stats per whale ----------------------------
+    # Fetch all signals whose linked CopiedBet passes the mode filter.
+    sig_query = (
+        db.query(AddToPositionSignal)
+        .join(CopiedBet, AddToPositionSignal.copied_bet_id == CopiedBet.id)
+        .filter(CopiedBet.status != "SKIPPED")
+    )
+    sig_query = _apply_mode_filter(sig_query, mode)
+    all_signals = sig_query.all()
+
+    sig_groups: dict = defaultdict(lambda: {"resolved": 0, "profitable": 0, "pnl": 0.0})
+    for sig in all_signals:
+        bet: CopiedBet = sig.copied_bet
+        if not bet or bet.status in ("OPEN", "PENDING", "SKIPPED", "CLOSED_NEUTRAL"):
+            continue
+        investment = (
+            sig.suggested_add_usdc
+            if sig.suggested_add_usdc is not None
+            else sig.whale_additional_usdc
+        )
+        if bet.resolution_price is None:
+            continue
+        hypo_pnl = investment / max(sig.price, 0.001) * bet.resolution_price - investment
+        sg = sig_groups[bet.whale_address]
+        sg["resolved"] += 1
+        sg["pnl"] += hypo_pnl
+        if hypo_pnl > 0.01:
+            sg["profitable"] += 1
+
+    for entry in result:
+        sg = sig_groups.get(entry["whale_address"])
+        if sg and sg["resolved"] > 0:
+            entry["signal_resolved"] = sg["resolved"]
+            entry["signal_win_rate_pct"] = round(sg["profitable"] / sg["resolved"] * 100, 1)
+            entry["signal_total_pnl_usdc"] = round(sg["pnl"], 2)
+        else:
+            entry["signal_resolved"] = 0
+            entry["signal_win_rate_pct"] = None
+            entry["signal_total_pnl_usdc"] = None
 
     # Sort by total P&L descending
     result.sort(key=lambda x: x["total_pnl_usdc"], reverse=True)
@@ -689,10 +741,12 @@ async def stats_by_whale_category(mode: str = Query("all"), db: DBSession = Depe
     arb_mode_map = {w.address: bool(w.arb_mode) for w in whales}
 
     # {address: {"by_sport": {sport: bucket}, "by_bet_type": {bet_type: bucket}}}
-    data: dict = defaultdict(lambda: {
-        "by_sport": defaultdict(_empty_bucket),
-        "by_bet_type": defaultdict(_empty_bucket),
-    })
+    data: dict = defaultdict(
+        lambda: {
+            "by_sport": defaultdict(_empty_bucket),
+            "by_bet_type": defaultdict(_empty_bucket),
+        }
+    )
 
     for b in closed_bets:
         sport = b.market_category or "Other"
@@ -713,17 +767,19 @@ async def stats_by_whale_category(mode: str = Query("all"), db: DBSession = Depe
         result = []
         for label, g in sorted(buckets.items()):
             total_pnl = round(sum(g["pnl_values"]), 2) if g["pnl_values"] else 0.0
-            decided  = g["wins"] + g["losses"]
+            decided = g["wins"] + g["losses"]
             win_rate = round(g["wins"] / decided * 100, 1) if decided > 0 else None
-            result.append({
-                "label": label,
-                "wins": g["wins"],
-                "losses": g["losses"],
-                "neutral": g["neutral"],
-                "closed": g["closed"],
-                "win_rate_pct": win_rate,
-                "total_pnl_usdc": total_pnl,
-            })
+            result.append(
+                {
+                    "label": label,
+                    "wins": g["wins"],
+                    "losses": g["losses"],
+                    "neutral": g["neutral"],
+                    "closed": g["closed"],
+                    "win_rate_pct": win_rate,
+                    "total_pnl_usdc": total_pnl,
+                }
+            )
         result.sort(key=lambda x: x["total_pnl_usdc"], reverse=True)
         return result
 
@@ -734,14 +790,16 @@ async def stats_by_whale_category(mode: str = Query("all"), db: DBSession = Depe
             parsed_filters = _json.loads(raw_filters) if raw_filters else {}
         except Exception:
             parsed_filters = {}
-        output.append({
-            "whale_address": address,
-            "whale_alias": alias_map.get(address, address),
-            "category_filters": parsed_filters,
-            "arb_mode": arb_mode_map.get(address, False),
-            "by_sport": _summarise(d["by_sport"]),
-            "by_bet_type": _summarise(d["by_bet_type"]),
-        })
+        output.append(
+            {
+                "whale_address": address,
+                "whale_alias": alias_map.get(address, address),
+                "category_filters": parsed_filters,
+                "arb_mode": arb_mode_map.get(address, False),
+                "by_sport": _summarise(d["by_sport"]),
+                "by_bet_type": _summarise(d["by_bet_type"]),
+            }
+        )
 
     output.sort(key=lambda x: sum(s["total_pnl_usdc"] for s in x["by_sport"]), reverse=True)
     return {"whales": output}
@@ -751,15 +809,29 @@ async def stats_by_whale_category(mode: str = Query("all"), db: DBSession = Depe
 # Whale category filter management
 # ---------------------------------------------------------------------------
 
+
 class CategoryFiltersRequest(BaseModel):
+    # Opt-out: skip bets in these sports/bet-types
     disabled_sports: list[str] = []
     disabled_bet_types: list[str] = []
+    # Opt-in: if non-empty, ONLY copy bets from these sports (overrides disabled_sports)
+    allowed_sports: list[str] = []
+    # Price threshold: only copy if whale's entry price is within [min, max]
+    min_entry_price: float | None = None
+    max_entry_price: float | None = None
+    # Whale bet size filter: only copy if whale's bet size is within [min, max]
+    min_whale_bet_usdc: float | None = None
+    max_whale_bet_usdc: float | None = None
+    # Keyword filters on the market question (case-insensitive)
+    required_keywords: list[str] = []  # ALL must be present
+    excluded_keywords: list[str] = []  # NONE may be present
 
 
 @app.get("/api/whales/{address}/categories")
 async def get_whale_categories(address: str, db: DBSession = Depends(get_db)):
     """Return the current category filter config for a whale."""
     import json as _json
+
     whale = db.query(Whale).filter_by(address=address).first()
     if not whale:
         raise HTTPException(status_code=404, detail="Whale not found")
@@ -771,6 +843,13 @@ async def get_whale_categories(address: str, db: DBSession = Depends(get_db)):
         "address": address,
         "disabled_sports": filters.get("disabled_sports", []),
         "disabled_bet_types": filters.get("disabled_bet_types", []),
+        "allowed_sports": filters.get("allowed_sports", []),
+        "min_entry_price": filters.get("min_entry_price"),
+        "max_entry_price": filters.get("max_entry_price"),
+        "min_whale_bet_usdc": filters.get("min_whale_bet_usdc"),
+        "max_whale_bet_usdc": filters.get("max_whale_bet_usdc"),
+        "required_keywords": filters.get("required_keywords", []),
+        "excluded_keywords": filters.get("excluded_keywords", []),
     }
 
 
@@ -780,14 +859,22 @@ async def update_whale_categories(
     body: CategoryFiltersRequest,
     db: DBSession = Depends(get_db),
 ):
-    """Update which sports / bet types to skip for a whale (opt-out model)."""
+    """Update per-whale copy filters (category, price, size, keywords)."""
     import json as _json
+
     whale = db.query(Whale).filter_by(address=address).first()
     if not whale:
         raise HTTPException(status_code=404, detail="Whale not found")
     payload = {
         "disabled_sports": body.disabled_sports,
         "disabled_bet_types": body.disabled_bet_types,
+        "allowed_sports": body.allowed_sports,
+        "min_entry_price": body.min_entry_price,
+        "max_entry_price": body.max_entry_price,
+        "min_whale_bet_usdc": body.min_whale_bet_usdc,
+        "max_whale_bet_usdc": body.max_whale_bet_usdc,
+        "required_keywords": body.required_keywords,
+        "excluded_keywords": body.excluded_keywords,
     }
     whale.category_filters = _json.dumps(payload)
     db.add(whale)
@@ -824,18 +911,12 @@ async def get_activity(mode: str = Query("all"), db: DBSession = Depends(get_db)
     """
     query = db.query(CopiedBet)
     query = _apply_mode_filter(query, mode)
-    bets = (
-        query
-        .order_by(CopiedBet.id.desc())
-        .limit(20)
-        .all()
-    )
+    bets = query.order_by(CopiedBet.id.desc()).limit(20).all()
 
     # Build a whale alias lookup from the addresses present in this page only
     addresses = {bet.whale_address for bet in bets}
     alias_map = {
-        w.address: w.alias
-        for w in db.query(Whale).filter(Whale.address.in_(addresses)).all()
+        w.address: w.alias for w in db.query(Whale).filter(Whale.address.in_(addresses)).all()
     }
 
     items = []
@@ -859,16 +940,12 @@ async def get_leaderboard(
 ):
     """Fetch Polymarket leaderboard for whale discovery."""
     try:
-        entries = await poly_client.get_leaderboard(
-            time_period=time_period, limit=limit
-        )
+        entries = await poly_client.get_leaderboard(time_period=time_period, limit=limit)
     except Exception as exc:
         logger.error("get_leaderboard error: %s", exc)
         raise HTTPException(status_code=502, detail="Leaderboard API unavailable")
 
-    tracked_addresses = {
-        w.address for w in db.query(Whale).all()
-    }
+    tracked_addresses = {w.address for w in db.query(Whale).all()}
 
     results = []
     skipped_low_volume = 0
@@ -898,18 +975,21 @@ async def get_leaderboard(
             or f"Whale_{address[:6]}"
         )
 
-        results.append({
-            "address": address,
-            "alias": alias,
-            "pnl_usdc": round(float(pnl), 2) if pnl else 0.0,
-            "volume_usdc": round(volume, 2),
-            "already_tracked": address in tracked_addresses,
-        })
+        results.append(
+            {
+                "address": address,
+                "alias": alias,
+                "pnl_usdc": round(float(pnl), 2) if pnl else 0.0,
+                "volume_usdc": round(volume, 2),
+                "already_tracked": address in tracked_addresses,
+            }
+        )
 
     if skipped_low_volume:
         logger.debug(
             "Leaderboard: filtered out %d traders below $%.0f volume threshold",
-            skipped_low_volume, settings.MIN_WHALE_VOLUME_USDC,
+            skipped_low_volume,
+            settings.MIN_WHALE_VOLUME_USDC,
         )
 
     # Write a timestamped discover log so every leaderboard call is reviewable
@@ -952,6 +1032,7 @@ def _write_discover_log(
 # Add-to-position signals
 # ---------------------------------------------------------------------------
 
+
 def _signal_to_dict(sig: AddToPositionSignal) -> dict:
     """
     Enrich a signal dict with its linked CopiedBet's outcome so the frontend
@@ -966,11 +1047,11 @@ def _signal_to_dict(sig: AddToPositionSignal) -> dict:
     bet: CopiedBet = sig.copied_bet
 
     if bet:
-        d["bet_status"]     = bet.status
-        d["bet_question"]   = bet.question or bet.market_id
-        d["entry_price"]    = round(bet.price_at_entry, 4)
-        d["whale_address"]  = bet.whale_address
-        d["whale_alias"]    = bet.whale_address  # overridden below if alias available
+        d["bet_status"] = bet.status
+        d["bet_question"] = bet.question or bet.market_id
+        d["entry_price"] = round(bet.price_at_entry, 4)
+        d["whale_address"] = bet.whale_address
+        d["whale_alias"] = bet.whale_address  # overridden below if alias available
         # Resolve alias from the whale_bet → whale relationship
         if bet.whale_bet and bet.whale_bet.whale:
             alias = bet.whale_bet.whale.alias
@@ -980,17 +1061,21 @@ def _signal_to_dict(sig: AddToPositionSignal) -> dict:
         # Use suggested_add_usdc (our scaled bet size) if available, otherwise
         # fall back to the whale's raw addition for legacy records.
         if bet.resolution_price is not None and bet.status not in ("OPEN", "PENDING", "SKIPPED"):
-            investment        = sig.suggested_add_usdc if sig.suggested_add_usdc is not None else sig.whale_additional_usdc
+            investment = (
+                sig.suggested_add_usdc
+                if sig.suggested_add_usdc is not None
+                else sig.whale_additional_usdc
+            )
             additional_shares = investment / max(sig.price, 0.001)
-            proceeds          = additional_shares * bet.resolution_price
-            hypo_pnl          = round(proceeds - investment, 2)
+            proceeds = additional_shares * bet.resolution_price
+            hypo_pnl = round(proceeds - investment, 2)
             d["hypothetical_pnl_usdc"] = hypo_pnl
         else:
             d["hypothetical_pnl_usdc"] = None  # still open — unknown outcome
     else:
-        d["bet_status"]   = "UNKNOWN"
+        d["bet_status"] = "UNKNOWN"
         d["bet_question"] = ""
-        d["entry_price"]  = None
+        d["entry_price"] = None
 
     return d
 
@@ -1013,16 +1098,20 @@ async def get_signals_stats(mode: str = Query("all"), db: DBSession = Depends(ge
         )
     signals = query.all()
 
-    total           = len(signals)
-    open_count      = 0
-    resolved_count  = 0
-    profitable      = 0
-    losing          = 0
-    total_invested  = 0.0
-    total_pnl       = 0.0
+    total = len(signals)
+    open_count = 0
+    resolved_count = 0
+    profitable = 0
+    losing = 0
+    total_invested = 0.0
+    total_pnl = 0.0
 
     for sig in signals:
-        investment = sig.suggested_add_usdc if sig.suggested_add_usdc is not None else sig.whale_additional_usdc
+        investment = (
+            sig.suggested_add_usdc
+            if sig.suggested_add_usdc is not None
+            else sig.whale_additional_usdc
+        )
         total_invested += investment
         bet: CopiedBet = sig.copied_bet
 
@@ -1044,7 +1133,7 @@ async def get_signals_stats(mode: str = Query("all"), db: DBSession = Depends(ge
                 losing += 1
 
     win_rate = round(profitable / resolved_count * 100, 1) if resolved_count > 0 else None
-    avg_pnl  = round(total_pnl / resolved_count, 2) if resolved_count > 0 else None
+    avg_pnl = round(total_pnl / resolved_count, 2) if resolved_count > 0 else None
 
     # Recommendation signal: positive if win_rate > 55% and avg_pnl > 0
     if resolved_count == 0:
@@ -1057,16 +1146,16 @@ async def get_signals_stats(mode: str = Query("all"), db: DBSession = Depends(ge
         verdict = "neutral"
 
     return {
-        "total_signals":     total,
-        "open_signals":      open_count,
-        "resolved_signals":  resolved_count,
-        "profitable":        profitable,
-        "losing":            losing,
-        "win_rate_pct":      win_rate,
-        "total_invested":    round(total_invested, 2),
-        "total_pnl_usdc":    round(total_pnl, 2),
+        "total_signals": total,
+        "open_signals": open_count,
+        "resolved_signals": resolved_count,
+        "profitable": profitable,
+        "losing": losing,
+        "win_rate_pct": win_rate,
+        "total_invested": round(total_invested, 2),
+        "total_pnl_usdc": round(total_pnl, 2),
         "avg_pnl_per_signal": avg_pnl,
-        "verdict":           verdict,
+        "verdict": verdict,
     }
 
 
@@ -1090,11 +1179,7 @@ async def get_signals(
         )
     total = base.count()
     signals = (
-        base
-        .order_by(AddToPositionSignal.id.desc())
-        .offset((page - 1) * limit)
-        .limit(limit)
-        .all()
+        base.order_by(AddToPositionSignal.id.desc()).offset((page - 1) * limit).limit(limit).all()
     )
     return {
         "signals": [_signal_to_dict(s) for s in signals],

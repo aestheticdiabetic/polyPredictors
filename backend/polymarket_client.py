@@ -3,6 +3,8 @@ Polymarket API client - wraps Data API, Gamma API, and CLOB API.
 All methods are async using httpx.
 """
 
+import contextlib
+import json
 import logging
 import time
 
@@ -11,6 +13,23 @@ import httpx
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_market(market: dict) -> dict:
+    """
+    Gamma API sometimes returns array fields (outcomePrices, clobTokenIds,
+    outcomes) as JSON-encoded strings rather than native Python lists.
+    Parse those strings so callers always receive proper list objects.
+    """
+    if not market:
+        return market
+    for field in ("outcomePrices", "clobTokenIds", "outcomes"):
+        val = market.get(field)
+        if isinstance(val, str):
+            with contextlib.suppress(json.JSONDecodeError, ValueError):
+                market[field] = json.loads(val)
+    return market
+
 
 _TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 _MARKET_CACHE_TTL = 3600  # seconds
@@ -48,10 +67,8 @@ class PolymarketClient:
         even on successful 200 responses (the body read fails on the stale
         transport).  Resetting at the start of each loop invocation fixes this.
         """
-        try:
+        with contextlib.suppress(Exception):
             await self._http.aclose()
-        except Exception:
-            pass
         self._http = httpx.AsyncClient(
             timeout=_TIMEOUT,
             follow_redirects=True,
@@ -185,7 +202,7 @@ class PolymarketClient:
     # Gamma API  (https://gamma-api.polymarket.com)
     # ------------------------------------------------------------------
 
-    async def get_market(self, condition_id: str, token_id: str = None) -> dict | None:
+    async def get_market(self, condition_id: str, token_id: str | None = None) -> dict | None:
         """
         Fetch market details from Gamma API.
 
@@ -215,7 +232,7 @@ class PolymarketClient:
             try:
                 resp = await self._http.get(url)
                 resp.raise_for_status()
-                data = resp.json()
+                data = _normalize_market(resp.json())
                 self._market_cache[condition_id] = (data, now + _MARKET_CACHE_TTL)
                 return data
             except httpx.HTTPStatusError as exc:
@@ -252,7 +269,7 @@ class PolymarketClient:
             resp.raise_for_status()
             data = resp.json()
             markets = data if isinstance(data, list) else data.get("markets", [])
-            market = markets[0] if markets else None
+            market = _normalize_market(markets[0]) if markets else None
             self._market_cache[cache_key] = (market, now + _MARKET_CACHE_TTL)
             if market:
                 logger.debug(
@@ -294,7 +311,7 @@ class PolymarketClient:
                 resp.raise_for_status()
                 data = resp.json()
                 markets = data if isinstance(data, list) else data.get("markets", [])
-                market = markets[0] if markets else None
+                market = _normalize_market(markets[0]) if markets else None
                 self._market_cache[cache_key] = (market, now + _MARKET_CACHE_TTL)
             except Exception as exc:
                 logger.debug("get_last_trade_price error for %s: %s", token_id, exc)
@@ -476,7 +493,7 @@ class PolymarketClient:
             )
             # Patch the order builder's get_market_order_amounts to round the taker
             # (shares) to round_config.size (2dp) rather than round_config.amount
-            # (4–6dp depending on tick size). The Polymarket API rejects market buy
+            # (4-6dp depending on tick size). The Polymarket API rejects market buy
             # orders whose taker amount has more than 2 decimal places.
             import types
 
@@ -499,7 +516,7 @@ class PolymarketClient:
                     raw_maker_amt = round_up(raw_maker_amt, round_config.amount + 4)
                     if decimal_places(raw_maker_amt) > round_config.amount:
                         raw_maker_amt = round_down(raw_maker_amt, round_config.amount)
-                # API minimum order is $1 — rounding (e.g. 1.01 shares × $0.99)
+                # API minimum order is $1 — rounding (e.g. 1.01 shares x $0.99)
                 # can push maker below $1; bump taker by one unit and recompute.
                 if raw_maker_amt < 1.0:
                     unit = 10 ** (-round_config.size)
@@ -522,43 +539,49 @@ class PolymarketClient:
             logger.error("Failed to create ClobClient: %s", exc)
             raise
 
-    def place_market_buy(self, token_id: str, amount_usdc: float) -> dict:
+    def _reset_clob_client(self) -> None:
+        """Discard the cached CLOB client so the next call to _get_clob_client()
+        rebuilds it with a fresh nonce.  Called after 'invalid signature' errors."""
+        self._clob_client = None
+
+    def place_market_buy(self, token_id: str, amount_usdc: float, neg_risk: bool = False) -> dict:
         """
         Place a real market buy order via py-clob-client.
         amount_usdc: USDC to spend.
+        neg_risk: True for negRisk markets (uses NegRisk exchange contract for signing).
         Returns order response dict.
 
-        Fee handling: the CLOB /markets endpoint is unreliable for fee data.
-        We attempt with the cached fee (default 0), and if the API rejects with
-        an "invalid fee rate" error we parse the required fee from the message,
-        cache it, and retry once.
+        Retry logic (in order):
+          1. Fee mismatch — parse required fee from error, update cache, retry.
+          2. Invalid signature — nonce drift; reset the CLOB client and retry once
+             with a fresh instance.
         """
         import re
 
-        from py_clob_client.clob_types import MarketOrderArgs
-
-        client = self._get_clob_client()
+        from py_clob_client.clob_types import MarketOrderArgs, PartialCreateOrderOptions
 
         def _attempt(fee_bps: int) -> dict:
+            c = self._get_clob_client()
             order_args = MarketOrderArgs(
                 token_id=token_id,
                 amount=round(amount_usdc, 2),
                 fee_rate_bps=fee_bps,
             )
-            signed_order = client.create_market_order(order_args)
-            resp = client.post_order(signed_order)
+            signed_order = c.create_market_order(
+                order_args, PartialCreateOrderOptions(neg_risk=neg_risk)
+            )
+            resp = c.post_order(signed_order)
             return resp if isinstance(resp, dict) else {"status": "ok", "response": str(resp)}
 
         # Default to 1000 bps (10%) — the standard Polymarket taker fee.
-        # Starting at 0 caused every first buy to fail and retry (4-6s delay),
-        # allowing significant price movement between intent and fill.
         fee = self._taker_fee_cache.get(token_id, 1000)
         try:
             return _attempt(fee)
         except Exception as exc:
-            # Parse required fee from error message, e.g.:
-            # "invalid fee rate (1000), current market's taker fee: 0"
-            match = re.search(r"taker fee[:\s]+(\d+)", str(exc), re.IGNORECASE)
+            exc_str = str(exc)
+
+            # 1. Fee mismatch — parse required fee and retry.
+            match = re.search(r"taker fee[:\s]+(\d+)", exc_str, re.IGNORECASE)
             if match:
                 required_fee = int(match.group(1))
                 if required_fee != fee:
@@ -573,11 +596,25 @@ class PolymarketClient:
                     except Exception as retry_exc:
                         logger.error("place_market_buy error: %s", retry_exc)
                         raise
+
+            # 2. Invalid signature — nonce has drifted; rebuild the client and retry.
+            if "invalid signature" in exc_str.lower():
+                logger.warning(
+                    "place_market_buy: invalid signature for %s — resetting CLOB client and retrying",
+                    token_id[:16],
+                )
+                self._reset_clob_client()
+                try:
+                    return _attempt(fee)
+                except Exception as retry_exc:
+                    logger.error("place_market_buy error after client reset: %s", retry_exc)
+                    raise
+
             logger.error("place_market_buy error: %s", exc)
             raise
 
     def place_market_sell(
-        self, token_id: str, size_shares: float, whale_price: float = None
+        self, token_id: str, size_shares: float, whale_price: float | None = None
     ) -> dict:
         """
         Place a real market sell order via py-clob-client.
@@ -598,9 +635,15 @@ class PolymarketClient:
         import re
 
         from py_clob_client.client import OrderType
-        from py_clob_client.clob_types import OrderArgs
+        from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
 
         client = self._get_clob_client()
+
+        # Detect negRisk markets from the market cache — negRisk markets require
+        # signing against a different exchange contract.  The cache is populated
+        # by get_market() when whale activity is first detected for this token.
+        _cached = self._market_cache.get(f"token:{token_id}")
+        neg_risk = bool((_cached[0] or {}).get("negRisk", False)) if _cached else False
 
         # tick size is stable; fetch once up-front
         tick_size = float(client.get_tick_size(token_id))
@@ -622,18 +665,22 @@ class PolymarketClient:
                 side="SELL",
                 fee_rate_bps=fee_bps,
             )
-            signed_order = client.create_order(order_args)
+            signed_order = client.create_order(
+                order_args, PartialCreateOrderOptions(neg_risk=neg_risk)
+            )
             # FOK: fill immediately in full or cancel — never leaves a live order.
             resp = client.post_order(signed_order, OrderType.FOK)
             return resp if isinstance(resp, dict) else {"status": "ok", "response": str(resp)}
 
         def _submit_with_fee_retry(price: float) -> dict:
-            """Submit at price, retrying once on fee-mismatch error."""
+            """Submit at price, retrying on fee-mismatch or invalid-signature errors."""
             current_fee = self._taker_fee_cache.get(token_id, 0)
             try:
                 return _submit(price, current_fee)
             except Exception as exc:
                 exc_str = str(exc)
+
+                # Fee mismatch — parse required fee and retry.
                 match = re.search(r"taker fee[:\s]+(\d+)", exc_str, re.IGNORECASE)
                 if match:
                     required_fee = int(match.group(1))
@@ -649,6 +696,20 @@ class PolymarketClient:
                         except Exception as retry_exc:
                             logger.error("place_market_sell error: %s", retry_exc)
                             raise
+
+                # Invalid signature — nonce drift; rebuild client and retry.
+                if "invalid signature" in exc_str.lower():
+                    logger.warning(
+                        "place_market_sell: invalid signature for %s — resetting CLOB client and retrying",
+                        token_id[:16],
+                    )
+                    self._reset_clob_client()
+                    try:
+                        return _submit(price, current_fee)
+                    except Exception as retry_exc:
+                        logger.error("place_market_sell error after client reset: %s", retry_exc)
+                        raise
+
                 if "not enough balance" in exc_str.lower() or "allowance" in exc_str.lower():
                     logger.warning(
                         "place_market_sell: no balance/allowance for token %s — marking as no-position",

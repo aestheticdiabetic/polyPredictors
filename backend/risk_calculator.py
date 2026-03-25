@@ -168,6 +168,34 @@ class RiskCalculator:
         if status in ("closed", "resolved", "finalized", "settled"):
             return False, f"Market status is '{status}'"
 
+        # Outcome prices resolved check — Gamma may lag on setting resolved=True,
+        # but outcomePrices will already be at 1.0/0.0 when the oracle settles.
+        # Catch this before attempting an order that the CLOB will reject.
+        #
+        # Guard: if live_price is available the CLOB still has an active order book
+        # for this token, which means the market is definitively open — skip the
+        # outcomePrices check entirely.  Without this guard, a heavily one-sided
+        # active market (e.g. YES=0.02 / NO=0.98) is falsely flagged as resolved.
+        #
+        # Note: Gamma API sometimes returns outcomePrices as a JSON-encoded string
+        # (e.g. '["0.03", "0.97"]') rather than a list — parse it defensively.
+        if live_price is None:
+            outcome_prices = market_info.get("outcomePrices", [])
+            if isinstance(outcome_prices, str):
+                import json as _json
+
+                try:
+                    outcome_prices = _json.loads(outcome_prices)
+                except (ValueError, _json.JSONDecodeError):
+                    outcome_prices = []
+            for op in outcome_prices:
+                try:
+                    val = float(op)
+                    if 0.98 <= val <= 1.02:
+                        return False, f"Market resolved (outcome price {val:.3f})"
+                except (TypeError, ValueError):
+                    pass
+
         # Check endDate — deny if missing (conservative: unknown close time = unsafe)
         end_date_str = (
             market_info.get("endDate")

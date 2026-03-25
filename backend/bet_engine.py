@@ -358,25 +358,125 @@ class BetEngine:
                     db=db,
                 )
 
-            # Category filter — skip if this whale has disabled this sport or bet type
+            # Per-whale filters — category, price threshold, bet size, keywords
             cat_sport, cat_bet_type = classify(whale_bet.question)
             if whale and whale.category_filters:
                 import json as _json
 
                 try:
                     filters = _json.loads(whale.category_filters)
+
+                    # Sport: opt-in allowlist takes precedence over opt-out list
+                    allowed_sports = filters.get("allowed_sports", [])
                     disabled_sports = filters.get("disabled_sports", [])
                     disabled_bet_types = filters.get("disabled_bet_types", [])
-                    if cat_sport in disabled_sports or cat_bet_type in disabled_bet_types:
+                    if allowed_sports:
+                        if cat_sport not in allowed_sports:
+                            return self._create_skipped_bet(
+                                whale_bet=whale_bet,
+                                session=session,
+                                bet_size_usdc=bet_size_usdc,
+                                risk_factor=risk_factor,
+                                whale_avg=whale_avg,
+                                skip_reason=f"Sport not in allowlist: {cat_sport}",
+                                db=db,
+                            )
+                    elif cat_sport in disabled_sports:
                         return self._create_skipped_bet(
                             whale_bet=whale_bet,
                             session=session,
                             bet_size_usdc=bet_size_usdc,
                             risk_factor=risk_factor,
                             whale_avg=whale_avg,
-                            skip_reason=f"Category filtered: {cat_sport} / {cat_bet_type}",
+                            skip_reason=f"Category filtered: {cat_sport}",
                             db=db,
                         )
+                    if cat_bet_type in disabled_bet_types:
+                        return self._create_skipped_bet(
+                            whale_bet=whale_bet,
+                            session=session,
+                            bet_size_usdc=bet_size_usdc,
+                            risk_factor=risk_factor,
+                            whale_avg=whale_avg,
+                            skip_reason=f"Bet type filtered: {cat_bet_type}",
+                            db=db,
+                        )
+
+                    # Whale entry price threshold
+                    min_price = filters.get("min_entry_price")
+                    max_price = filters.get("max_entry_price")
+                    if min_price is not None and whale_bet.price < min_price:
+                        return self._create_skipped_bet(
+                            whale_bet=whale_bet,
+                            session=session,
+                            bet_size_usdc=bet_size_usdc,
+                            risk_factor=risk_factor,
+                            whale_avg=whale_avg,
+                            skip_reason=f"Whale price {whale_bet.price:.3f} below min {min_price:.3f}",
+                            db=db,
+                        )
+                    if max_price is not None and whale_bet.price > max_price:
+                        return self._create_skipped_bet(
+                            whale_bet=whale_bet,
+                            session=session,
+                            bet_size_usdc=bet_size_usdc,
+                            risk_factor=risk_factor,
+                            whale_avg=whale_avg,
+                            skip_reason=f"Whale price {whale_bet.price:.3f} above max {max_price:.3f}",
+                            db=db,
+                        )
+
+                    # Whale bet size threshold
+                    min_size = filters.get("min_whale_bet_usdc")
+                    max_size = filters.get("max_whale_bet_usdc")
+                    if min_size is not None and whale_bet.size_usdc < min_size:
+                        return self._create_skipped_bet(
+                            whale_bet=whale_bet,
+                            session=session,
+                            bet_size_usdc=bet_size_usdc,
+                            risk_factor=risk_factor,
+                            whale_avg=whale_avg,
+                            skip_reason=f"Whale bet ${whale_bet.size_usdc:.0f} below min ${min_size:.0f}",
+                            db=db,
+                        )
+                    if max_size is not None and whale_bet.size_usdc > max_size:
+                        return self._create_skipped_bet(
+                            whale_bet=whale_bet,
+                            session=session,
+                            bet_size_usdc=bet_size_usdc,
+                            risk_factor=risk_factor,
+                            whale_avg=whale_avg,
+                            skip_reason=f"Whale bet ${whale_bet.size_usdc:.0f} above max ${max_size:.0f}",
+                            db=db,
+                        )
+
+                    # Keyword filters on market question (case-insensitive)
+                    question_lower = whale_bet.question.lower()
+                    required_kw = filters.get("required_keywords", [])
+                    excluded_kw = filters.get("excluded_keywords", [])
+                    for kw in required_kw:
+                        if kw.lower() not in question_lower:
+                            return self._create_skipped_bet(
+                                whale_bet=whale_bet,
+                                session=session,
+                                bet_size_usdc=bet_size_usdc,
+                                risk_factor=risk_factor,
+                                whale_avg=whale_avg,
+                                skip_reason=f"Missing required keyword: {kw!r}",
+                                db=db,
+                            )
+                    for kw in excluded_kw:
+                        if kw.lower() in question_lower:
+                            return self._create_skipped_bet(
+                                whale_bet=whale_bet,
+                                session=session,
+                                bet_size_usdc=bet_size_usdc,
+                                risk_factor=risk_factor,
+                                whale_avg=whale_avg,
+                                skip_reason=f"Excluded keyword matched: {kw!r}",
+                                db=db,
+                            )
+
                 except Exception:
                     pass
 
@@ -433,6 +533,7 @@ class BetEngine:
 
             # Place or simulate
             entry_price = whale_bet.price
+            _neg_risk = bool(market_info.get("negRisk", False))
             _post_fill_pnl: float | None = None
             _post_fill_sell_price: float | None = None
             try:
@@ -458,6 +559,7 @@ class BetEngine:
                         token_id=whale_bet.token_id,
                         size_usdc=bet_size_usdc,
                         price=whale_bet.price,
+                        neg_risk=_neg_risk,
                     )
                     # Detect FOK/unmatched cancellations — no tokens were actually received
                     order_status_raw = str(order_resp.get("status", "")).upper()
@@ -576,15 +678,118 @@ class BetEngine:
                     db.add(session)
             except Exception as exc:
                 logger.error("Failed to place bet for whale_bet %d: %s", whale_bet.id, exc)
-                return self._create_skipped_bet(
-                    whale_bet=whale_bet,
-                    session=session,
-                    bet_size_usdc=bet_size_usdc,
-                    risk_factor=risk_factor,
-                    whale_avg=whale_avg,
-                    skip_reason=f"Order failed: {exc}",
-                    db=db,
-                )
+                # Retry once on PolyApiException if price is still within drift parameters.
+                try:
+                    from py_clob_client.exceptions import PolyApiException as _PolyApiExc
+
+                    _is_poly_exc = isinstance(exc, _PolyApiExc)
+                except ImportError:
+                    _is_poly_exc = "PolyApiException" in type(exc).__name__
+                if _is_poly_exc and mode not in ("SIMULATION", "HEDGE_SIM"):
+                    retry_price_ok, retry_price_reason = risk_calc.check_price_staleness(
+                        whale_price=whale_bet.price,
+                        live_price=live_price,
+                        max_upward_drift=settings.MAX_UPWARD_DRIFT_PCT,
+                        max_downward_drift=settings.MAX_DOWNWARD_DRIFT_PCT,
+                    )
+                    if retry_price_ok:
+                        logger.warning(
+                            "PolyApiException on whale_bet %d — price still within drift, retrying buy",
+                            whale_bet.id,
+                        )
+                        try:
+                            order_resp = self.place_real_buy(
+                                token_id=whale_bet.token_id,
+                                size_usdc=bet_size_usdc,
+                                price=whale_bet.price,
+                                neg_risk=_neg_risk,
+                            )
+                            # Retry succeeded — re-enter the success path inline
+                            import math as _math
+
+                            order_status_raw = str(order_resp.get("status", "")).upper()
+                            if order_status_raw in ("UNMATCHED", "CANCELLED", "CANCELED"):
+                                size_shares = 0.0
+                                bet_status = "OPEN"
+                                skip_reason_val = None
+                            else:
+                                taking_raw = order_resp.get("takingAmount")
+                                making_raw = order_resp.get("makingAmount")
+                                if taking_raw is not None and making_raw is not None:
+                                    try:
+                                        taking_f = float(taking_raw)
+                                        making_f = float(making_raw)
+                                        if making_f > 0 and taking_f > 0:
+                                            size_shares = _math.floor(taking_f * 100) / 100
+                                            bet_size_usdc = round(making_f, 4)
+                                            entry_price = round(making_f / taking_f, 6)
+                                        else:
+                                            entry_price = float(whale_bet.price)
+                                            size_shares = (
+                                                _math.floor(bet_size_usdc / entry_price * 100) / 100
+                                            )
+                                    except (TypeError, ValueError):
+                                        entry_price = float(whale_bet.price)
+                                        size_shares = (
+                                            _math.floor(bet_size_usdc / entry_price * 100) / 100
+                                        )
+                                else:
+                                    entry_price = float(whale_bet.price)
+                                    size_shares = (
+                                        _math.floor(bet_size_usdc / entry_price * 100) / 100
+                                    )
+                                bet_status = "OPEN"
+                                skip_reason_val = None
+                            session.current_balance_usdc = max(
+                                0.0, session.current_balance_usdc - bet_size_usdc
+                            )
+                            db.add(session)
+                            logger.info(
+                                "Retry BUY succeeded for whale_bet %d: entry=%.4f shares=%.4f",
+                                whale_bet.id,
+                                entry_price,
+                                size_shares,
+                            )
+                        except Exception as retry_exc:
+                            logger.error(
+                                "Retry buy also failed for whale_bet %d: %s",
+                                whale_bet.id,
+                                retry_exc,
+                            )
+                            return self._create_skipped_bet(
+                                whale_bet=whale_bet,
+                                session=session,
+                                bet_size_usdc=bet_size_usdc,
+                                risk_factor=risk_factor,
+                                whale_avg=whale_avg,
+                                skip_reason=f"Order failed (retry): {retry_exc}",
+                                db=db,
+                            )
+                    else:
+                        logger.info(
+                            "PolyApiException on whale_bet %d — price out of drift after failure (%s), skipping",
+                            whale_bet.id,
+                            retry_price_reason,
+                        )
+                        return self._create_skipped_bet(
+                            whale_bet=whale_bet,
+                            session=session,
+                            bet_size_usdc=bet_size_usdc,
+                            risk_factor=risk_factor,
+                            whale_avg=whale_avg,
+                            skip_reason=f"Order failed + price drifted: {exc}",
+                            db=db,
+                        )
+                else:
+                    return self._create_skipped_bet(
+                        whale_bet=whale_bet,
+                        session=session,
+                        bet_size_usdc=bet_size_usdc,
+                        risk_factor=risk_factor,
+                        whale_avg=whale_avg,
+                        skip_reason=f"Order failed: {exc}",
+                        db=db,
+                    )
 
             # Parse market close date from market_info for ledger display.
             # Prefer gameStartTime (actual tip-off / kick-off) over endDate (trading
@@ -806,10 +1011,18 @@ class BetEngine:
     # Real mode helpers
     # ------------------------------------------------------------------
 
-    def place_real_buy(self, token_id: str, size_usdc: float, price: float) -> dict:
+    def place_real_buy(
+        self, token_id: str, size_usdc: float, price: float, neg_risk: bool = False
+    ) -> dict:
         """Place a real market buy via py-clob-client."""
-        logger.info("REAL BUY: token=%s size=$%.2f price=%.4f", token_id[:16], size_usdc, price)
-        return self._client.place_market_buy(token_id, size_usdc)
+        logger.info(
+            "REAL BUY: token=%s size=$%.2f price=%.4f neg_risk=%s",
+            token_id[:16],
+            size_usdc,
+            price,
+            neg_risk,
+        )
+        return self._client.place_market_buy(token_id, size_usdc, neg_risk=neg_risk)
 
     def place_real_sell(
         self, token_id: str, size_shares: float, whale_price: float | None = None
@@ -822,6 +1035,146 @@ class BetEngine:
             whale_price,
         )
         return self._client.place_market_sell(token_id, size_shares, whale_price=whale_price)
+
+    def _sell_with_retry(
+        self,
+        copied_bet: CopiedBet,
+        whale_price: float,
+    ) -> tuple[float | None, float | None]:
+        """
+        Attempt a CLOB sell for `copied_bet`, retrying up to
+        settings.SELL_CLOSE_RETRIES times on transient failures (FOK cancelled,
+        zero-fill response, no_position size mismatch, or exception).
+
+        Returns (fill_price, taking_amount_usdc) on a confirmed fill.
+        Returns (copied_bet.price_at_entry, None) when the position is
+        confirmed absent on-chain (neutral close — no actual sell needed).
+        Returns (None, None) when all attempts are exhausted (leave OPEN).
+
+        Side-effect: may update copied_bet.size_shares and price_at_entry
+        when the on-chain balance differs from the DB record.
+        """
+        import time as _time
+
+        max_attempts = settings.SELL_CLOSE_RETRIES + 1
+        delay = settings.SELL_CLOSE_RETRY_DELAY_SECONDS
+
+        for attempt in range(max_attempts):
+            last = attempt + 1 >= max_attempts
+
+            def _log_retry(reason: str, _attempt: int = attempt, _last: bool = last) -> None:
+                if not _last:
+                    logger.warning(
+                        "Real sell bet %d: %s — retrying in %ds (attempt %d/%d)",
+                        copied_bet.id,
+                        reason,
+                        delay,
+                        _attempt + 1,
+                        max_attempts,
+                    )
+                else:
+                    logger.warning(
+                        "Real sell bet %d: %s — all %d attempts exhausted, leaving OPEN",
+                        copied_bet.id,
+                        reason,
+                        max_attempts,
+                    )
+
+            try:
+                order_resp = self.place_real_sell(
+                    copied_bet.token_id, copied_bet.size_shares, whale_price=whale_price
+                )
+                logger.info(
+                    "REAL SELL response bet %d (attempt %d/%d): %s",
+                    copied_bet.id,
+                    attempt + 1,
+                    max_attempts,
+                    order_resp,
+                )
+                sell_status = (order_resp.get("status") or "").lower()
+
+                # ---- FOK cancelled ----
+                if sell_status in ("cancelled", "canceled"):
+                    _log_retry("FOK cancelled")
+                    if not last:
+                        _time.sleep(delay)
+                        continue
+                    return None, None
+
+                # ---- no_position: DB size may be off, fetch actual balance ----
+                if sell_status == "no_position":
+                    actual_shares = self._get_actual_position_size(copied_bet.token_id)
+                    if not actual_shares or actual_shares <= 0:
+                        # Genuinely absent — neutral close (no sell needed).
+                        logger.warning(
+                            "Real sell bet %d: no on-chain position confirmed (attempt %d/%d) — "
+                            "closing neutral",
+                            copied_bet.id,
+                            attempt + 1,
+                            max_attempts,
+                        )
+                        return copied_bet.price_at_entry, None
+                    # Update DB size to match on-chain reality and retry.
+                    logger.warning(
+                        "Real sell bet %d: CLOB rejected %.4f shares but on-chain shows "
+                        "%.4f — updating size and retrying (attempt %d/%d)",
+                        copied_bet.id,
+                        copied_bet.size_shares,
+                        actual_shares,
+                        attempt + 1,
+                        max_attempts,
+                    )
+                    copied_bet.size_shares = actual_shares
+                    copied_bet.price_at_entry = round(copied_bet.size_usdc / actual_shares, 4)
+                    if not last:
+                        _time.sleep(delay)
+                    continue
+
+                # ---- apparent success: validate fill is non-zero ----
+                raw_price = (
+                    order_resp.get("price")
+                    or order_resp.get("avgPrice")
+                    or order_resp.get("average_price")
+                )
+                fill_price = float(raw_price) if raw_price else whale_price
+                raw_taking = order_resp.get("takingAmount")
+                taking_amount_usdc = float(raw_taking) if raw_taking else None
+
+                if taking_amount_usdc is not None and taking_amount_usdc == 0.0:
+                    _log_retry(f"takingAmount=0 (status={order_resp.get('status')})")
+                    if not last:
+                        _time.sleep(delay)
+                        continue
+                    return None, None
+
+                raw_matched = order_resp.get("size_matched") or order_resp.get("sizeMatched")
+                if raw_matched is not None and float(raw_matched) == 0.0:
+                    _log_retry(f"size_matched=0 (status={order_resp.get('status')})")
+                    if not last:
+                        _time.sleep(delay)
+                        continue
+                    return None, None
+
+                if taking_amount_usdc is None and not raw_price:
+                    logger.warning(
+                        "Real sell bet %d: no fill confirmation in response "
+                        "(status=%s, resp=%s) — accepting with estimated price %.4f",
+                        copied_bet.id,
+                        order_resp.get("status"),
+                        order_resp,
+                        fill_price,
+                    )
+
+                return fill_price, taking_amount_usdc
+
+            except Exception as exc:
+                _log_retry(f"exception: {exc}")
+                if not last:
+                    _time.sleep(delay)
+                    continue
+                return None, None
+
+        return None, None
 
     def _close_bet(
         self,
@@ -878,122 +1231,10 @@ class BetEngine:
                     session.current_balance_usdc,
                 )
                 return 0.0
-            try:
-                order_resp = self.place_real_sell(
-                    copied_bet.token_id, copied_bet.size_shares, whale_price=current_price
-                )
-                logger.info("REAL SELL response: %s", order_resp)
-                sell_status = (order_resp.get("status") or "").lower()
-                if sell_status in ("cancelled", "canceled"):
-                    # FOK order was not filled (price moved between fetch and submit).
-                    # Leave the position OPEN so the next exit-poll retries the sell.
-                    logger.warning(
-                        "Real sell bet %d: FOK order cancelled (price moved) — "
-                        "position remains OPEN, will retry next poll",
-                        copied_bet.id,
-                    )
-                    return 0.0
-                if order_resp.get("status") == "no_position":
-                    # CLOB says "not enough balance/allowance" — could be a size_shares
-                    # mismatch (our DB estimate is slightly off from actual fill due to
-                    # fee deduction, tick-size rounding, or partial fill).
-                    # Query the Data API for the real on-chain balance and retry before
-                    # giving up.  Only close neutral if the position is genuinely absent.
-                    actual_shares = self._get_actual_position_size(copied_bet.token_id)
-                    if actual_shares and actual_shares > 0:
-                        logger.warning(
-                            "Real sell bet %d: CLOB rejected size_shares=%.4f but Data API "
-                            "shows %.4f shares on-chain — retrying sell with actual balance",
-                            copied_bet.id,
-                            copied_bet.size_shares,
-                            actual_shares,
-                        )
-                        try:
-                            retry_resp = self.place_real_sell(
-                                copied_bet.token_id, actual_shares, whale_price=current_price
-                            )
-                            _retry_status = (retry_resp.get("status") or "").lower()
-                            if _retry_status in ("cancelled", "canceled"):
-                                logger.warning(
-                                    "Real sell bet %d retry: FOK canceled — position stays OPEN",
-                                    copied_bet.id,
-                                )
-                                return 0.0
-                            if retry_resp.get("status") != "no_position":
-                                # Success — use actual shares for correct P&L.
-                                # Also update price_at_entry so the ledger shows the
-                                # true effective fill price (size_usdc / actual_shares)
-                                # rather than the whale's price.  Without this, a fill
-                                # at $1.00/share on a market priced at $0.78 appears as
-                                # a win when sold at $0.80 (0.80 > 0.78) but is actually
-                                # a loss (bought at $1.00, sold at $0.80).
-                                copied_bet.size_shares = actual_shares
-                                if actual_shares > 0:
-                                    copied_bet.price_at_entry = round(
-                                        copied_bet.size_usdc / actual_shares, 4
-                                    )
-                                raw = (
-                                    retry_resp.get("price")
-                                    or retry_resp.get("avgPrice")
-                                    or retry_resp.get("average_price")
-                                )
-                                if raw:
-                                    fill_price = float(raw)
-                                raw_taking = retry_resp.get("takingAmount")
-                                if raw_taking:
-                                    taking_amount_usdc = float(raw_taking)
-                                logger.info(
-                                    "Real sell bet %d: retry with %.4f shares succeeded "
-                                    "(effective entry price updated to %.4f, takingAmount=%s)",
-                                    copied_bet.id,
-                                    actual_shares,
-                                    copied_bet.price_at_entry,
-                                    raw_taking,
-                                )
-                            else:
-                                # Still no position after retry — leave OPEN for next poll.
-                                # Do NOT mark closed without a confirmed CLOB fill.
-                                logger.warning(
-                                    "Real sell bet %d: retry also returned no_position — "
-                                    "leaving OPEN for next poll (tokens still on-chain)",
-                                    copied_bet.id,
-                                )
-                                return 0.0
-                        except Exception as retry_exc:
-                            logger.error(
-                                "Real sell bet %d retry error: %s — position NOT closed",
-                                copied_bet.id,
-                                retry_exc,
-                            )
-                            return 0.0
-                    else:
-                        # Data API also shows no position (0 or absent) — genuinely absent.
-                        # Could be: FOK-cancelled buy, concurrent close, or already redeemed.
-                        logger.warning(
-                            "Real sell bet %d: no on-chain position confirmed by Data API "
-                            "(size_shares=%.4f) — closing as neutral",
-                            copied_bet.id,
-                            copied_bet.size_shares,
-                        )
-                        fill_price = copied_bet.price_at_entry  # proceeds ≈ size_usdc → pnl ≈ 0
-                else:
-                    raw = (
-                        order_resp.get("price")
-                        or order_resp.get("avgPrice")
-                        or order_resp.get("average_price")
-                    )
-                    if raw:
-                        fill_price = float(raw)
-                    raw_taking = order_resp.get("takingAmount")
-                    if raw_taking:
-                        taking_amount_usdc = float(raw_taking)
-            except Exception as exc:
-                logger.error(
-                    "Real sell failed for bet %d: %s — position NOT closed, will retry",
-                    copied_bet.id,
-                    exc,
-                )
+            sell_result = self._sell_with_retry(copied_bet, current_price)
+            if sell_result == (None, None):
                 return 0.0
+            fill_price, taking_amount_usdc = sell_result
 
         # Use actual USDC received (takingAmount from CLOB) when available.
         # Falls back to shares x price for oracle-priced closes (resolved markets
@@ -1019,6 +1260,24 @@ class BetEngine:
         copied_bet.pnl_usdc = round(pnl, 2)
         copied_bet.resolution_price = fill_price
         copied_bet.closed_at = datetime.utcnow()
+
+        # For REAL mode: update "we sold @ X" in the close_reason to show our
+        # actual CLOB fill price, not the whale's exit price that was baked in
+        # by _handle_exit before the sell was attempted.
+        if close_reason and copied_bet.mode == "REAL":
+            import re as _re
+
+            actual_fill = (
+                round(taking_amount_usdc / copied_bet.size_shares, 4)
+                if (taking_amount_usdc and copied_bet.size_shares)
+                else fill_price
+            )
+            close_reason = _re.sub(
+                r", we sold @ [\d.]+",
+                f", we sold @ {actual_fill:.3f}",
+                close_reason,
+            )
+
         if close_reason:
             copied_bet.close_reason = close_reason
 
@@ -1163,39 +1422,93 @@ class BetEngine:
             else:
                 sell_shares = _math.floor(actual * 100) / 100
 
-            # Single CLOB sell for total balance
-            try:
-                order_resp = self.place_real_sell(token_id, sell_shares, whale_price=exit_price)
-                logger.info("_close_all_tranches SELL response: %s", order_resp)
-                _sell_status = (order_resp.get("status") or "").lower()
-                if _sell_status in ("cancelled", "canceled"):
-                    logger.warning(
-                        "_close_all_tranches: FOK order cancelled for %s — positions NOT closed, will retry",
-                        token_id[:16],
+            # Single CLOB sell for total balance — retry on transient failures
+            import time as _time
+
+            _max_attempts = settings.SELL_CLOSE_RETRIES + 1
+            _delay = settings.SELL_CLOSE_RETRY_DELAY_SECONDS
+            _sell_ok = False
+            for _attempt in range(_max_attempts):
+                _last = _attempt + 1 >= _max_attempts
+                try:
+                    order_resp = self.place_real_sell(token_id, sell_shares, whale_price=exit_price)
+                    logger.info(
+                        "_close_all_tranches SELL response (attempt %d/%d): %s",
+                        _attempt + 1,
+                        _max_attempts,
+                        order_resp,
                     )
-                    return False  # leave positions OPEN for next exit poll
-                if order_resp.get("status") == "no_position":
+                    _sell_status = (order_resp.get("status") or "").lower()
+                    if _sell_status in ("cancelled", "canceled"):
+                        if not _last:
+                            logger.warning(
+                                "_close_all_tranches: FOK cancelled for %s — retrying in %ds "
+                                "(attempt %d/%d)",
+                                token_id[:16],
+                                _delay,
+                                _attempt + 1,
+                                _max_attempts,
+                            )
+                            _time.sleep(_delay)
+                            continue
+                        logger.warning(
+                            "_close_all_tranches: FOK cancelled for %s — all %d attempts "
+                            "exhausted, leaving OPEN",
+                            token_id[:16],
+                            _max_attempts,
+                        )
+                        return False
+                    if order_resp.get("status") == "no_position":
+                        if not _last:
+                            logger.warning(
+                                "_close_all_tranches: no_position for %s — retrying in %ds "
+                                "(attempt %d/%d)",
+                                token_id[:16],
+                                _delay,
+                                _attempt + 1,
+                                _max_attempts,
+                            )
+                            _time.sleep(_delay)
+                            continue
+                        logger.error(
+                            "_close_all_tranches: CLOB no_position selling %.4f shares of %s "
+                            "— all %d attempts exhausted, leaving OPEN",
+                            sell_shares,
+                            token_id[:16],
+                            _max_attempts,
+                        )
+                        return False
+                    raw = (
+                        order_resp.get("price")
+                        or order_resp.get("avgPrice")
+                        or order_resp.get("average_price")
+                    )
+                    if raw:
+                        fill_price = float(raw)
+                    _sell_ok = True
+                    break
+                except Exception as exc:
+                    if not _last:
+                        logger.warning(
+                            "_close_all_tranches: sell error for %s: %s — retrying in %ds "
+                            "(attempt %d/%d)",
+                            token_id[:16],
+                            exc,
+                            _delay,
+                            _attempt + 1,
+                            _max_attempts,
+                        )
+                        _time.sleep(_delay)
+                        continue
                     logger.error(
-                        "_close_all_tranches: CLOB no_position selling %.4f shares of %s "
-                        "(Data API showed %.4f) — positions NOT closed, will retry",
-                        sell_shares,
+                        "_close_all_tranches: sell failed for %s after %d attempts: %s — "
+                        "positions NOT closed",
                         token_id[:16],
-                        actual if actual is not None else db_total_shares,
+                        _max_attempts,
+                        exc,
                     )
-                    return False  # leave positions OPEN for next exit poll
-                raw = (
-                    order_resp.get("price")
-                    or order_resp.get("avgPrice")
-                    or order_resp.get("average_price")
-                )
-                if raw:
-                    fill_price = float(raw)
-            except Exception as exc:
-                logger.error(
-                    "_close_all_tranches: sell failed for %s: %s — positions NOT closed",
-                    token_id[:16],
-                    exc,
-                )
+                    return False
+            if not _sell_ok:
                 return False
         else:
             logger.info(
@@ -1780,6 +2093,24 @@ class BetEngine:
 
                 for bet in bets:
                     needs_close = False
+
+                    # Skip positions opened very recently — on-chain state takes
+                    # several seconds to propagate to the Data API and CLOB indexer.
+                    # A confirmed buy that fires the orphan check within ~3 minutes
+                    # will see 0 shares and ghost-close a valid position as NEUTRAL.
+                    _age_seconds = (
+                        (datetime.utcnow() - bet.opened_at).total_seconds()
+                        if bet.opened_at
+                        else 999
+                    )
+                    if _age_seconds < 60:
+                        logger.debug(
+                            "check_orphan_positions: skipping bet %d — only %.0fs old "
+                            "(waiting for on-chain propagation)",
+                            bet.id,
+                            _age_seconds,
+                        )
+                        continue
 
                     if bet.token_id not in whale_held:
                         # Case 1: whale no longer holds the token at all
@@ -2540,6 +2871,7 @@ class BetEngine:
                             token_id=item.token_id,
                             size_usdc=item.bet_size_usdc,
                             price=item.whale_price,
+                            neg_risk=bool(item.market_info.get("negRisk", False)),
                         )
                         size_shares = float(
                             order_resp.get(
