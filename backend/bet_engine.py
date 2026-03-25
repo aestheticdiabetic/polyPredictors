@@ -64,6 +64,11 @@ class BetEngine:
         # concurrent scanner threads (chain monitor + activity poller + drift
         # retry) cannot both read the same committed balance and over-commit.
         self._placement_lock = threading.Lock()
+        # token_id → (price, end_dt, is_resolved, fetched_at): cached resolution
+        # data to avoid re-fetching cold tokens every cycle.
+        # Hot tokens (price >= 0.85 or <= 0.15, or near expiry) use a 90s TTL.
+        # Cold tokens (price 0.15-0.85, far from expiry) use a 600s TTL.
+        self._resolution_cache: dict[str, tuple[float | None, datetime | None, bool, datetime]] = {}
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -1667,23 +1672,84 @@ class BetEngine:
             cashing out before expiry.
         - Standard open market:
             Close only when price is very decisive (>= 0.95 or <= 0.05).
+
+        Performance:
+        - token_ids are deduplicated before fetching: N bets on the same token
+          require only 1 API call, not N.
+        - A two-tier TTL cache avoids re-fetching tokens that are unlikely to
+          need action soon:
+            Hot (price >= 0.85 or <= 0.15, near expiry, or market ended): 90s TTL
+            Cold (price 0.15-0.85, far from expiry): 600s TTL
         """
+        # TTL constants (seconds)
+        HOT_TTL = 90
+        COLD_TTL = 600
+        # Price boundary that promotes a token to "hot"
+        HOT_PRICE_THRESHOLD = 0.15
+        # Hours-to-close boundary that promotes a token to "hot"
+        HOT_HOURS_THRESHOLD = 2.0
+
         db = SessionLocal()
         try:
             open_bets = db.query(CopiedBet).filter(CopiedBet.status == "OPEN").all()
-            logger.info("check_resolution: %d open bet(s) to check", len(open_bets))
             if not open_bets:
                 return
 
-            # Fetch price + endDate for all open bets in parallel
-            resolution_data = asyncio.run(
-                self._fetch_resolution_data([b.token_id for b in open_bets])
+            now = datetime.now(UTC)
+
+            # --- Deduplicate token_ids and apply tiered TTL cache ---
+            # Build a set of unique token_ids that need a fresh API fetch.
+            unique_tokens: list[str] = list({b.token_id for b in open_bets})
+            tokens_to_fetch: list[str] = []
+            for tid in unique_tokens:
+                cached = self._resolution_cache.get(tid)
+                if cached is None:
+                    tokens_to_fetch.append(tid)
+                    continue
+                c_price, c_end_dt, _c_resolved, c_fetched_at = cached
+                age_s = (now - c_fetched_at).total_seconds()
+                # Determine TTL for this token from cached data
+                hours_to_close: float | None = None
+                if c_end_dt is not None:
+                    hours_to_close = (c_end_dt - now).total_seconds() / 3600.0
+                market_ended = hours_to_close is not None and hours_to_close < 0
+                is_hot = (
+                    market_ended
+                    or (
+                        c_price is not None
+                        and (
+                            c_price >= (1.0 - HOT_PRICE_THRESHOLD) or c_price <= HOT_PRICE_THRESHOLD
+                        )
+                    )
+                    or (hours_to_close is not None and 0 <= hours_to_close < HOT_HOURS_THRESHOLD)
+                )
+                ttl = HOT_TTL if is_hot else COLD_TTL
+                if age_s >= ttl:
+                    tokens_to_fetch.append(tid)
+
+            logger.info(
+                "check_resolution: %d open bet(s), %d unique token(s), %d to fetch (%d cached)",
+                len(open_bets),
+                len(unique_tokens),
+                len(tokens_to_fetch),
+                len(unique_tokens) - len(tokens_to_fetch),
             )
+
+            # Fetch only stale/uncached tokens
+            if tokens_to_fetch:
+                fetched_results = asyncio.run(self._fetch_resolution_data(tokens_to_fetch))
+                for tid, result in zip(tokens_to_fetch, fetched_results, strict=False):
+                    self._resolution_cache[tid] = (*result, now)
+
+            # Build per-bet resolution data from the (now warm) cache
+            resolution_data = [
+                self._resolution_cache.get(b.token_id, (None, None, False, now))[:3]
+                for b in open_bets
+            ]
 
             # Cache sessions by mode so we only query once per mode
             session_cache: dict[str, MonitoringSession | None] = {}
 
-            now = datetime.now(UTC)
             min_hours = settings.MIN_MARKET_HOURS_TO_CLOSE
 
             _LIVE_SPORTS = {
@@ -2240,7 +2306,7 @@ class BetEngine:
         to avoid rate-limiting on the Gamma API.  Each failed request is retried
         once after a short back-off before giving up and returning (None, None, False).
         """
-        MAX_CONCURRENT = 2  # keep VPN pressure low — was 4, caused ReadTimeouts
+        MAX_CONCURRENT = 10  # no VPN on VPS; raised from 2 for faster resolution cycles
         RETRY_DELAY = 2.0  # seconds
 
         sem = asyncio.Semaphore(MAX_CONCURRENT)
