@@ -17,4 +17,4 @@ jobs:
           script: |
             cd /home/angus/polyPredictors
             git pull
-            docker compose up --build -d
+            docker build --no-cache -t polypredictors-polymarket-app . && docker compose up -d
