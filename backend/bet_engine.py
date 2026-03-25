@@ -63,7 +63,9 @@ class BetEngine:
         # Serialises the balance-read → bet-size → deduct cycle so that
         # concurrent scanner threads (chain monitor + activity poller + drift
         # retry) cannot both read the same committed balance and over-commit.
-        self._placement_lock = threading.Lock()
+        # RLock (reentrant) is required because _handle_add_to_position also
+        # acquires this lock and may be called while the caller already holds it.
+        self._placement_lock = threading.RLock()
         # token_id → (price, end_dt, is_resolved, fetched_at): cached resolution
         # data to avoid re-fetching cold tokens every cycle.
         # Hot tokens (price >= 0.85 or <= 0.15, or near expiry) use a 90s TTL.
@@ -173,65 +175,71 @@ class BetEngine:
                     db=db,
                 )
 
-        # ---- SAME-PRICE ADD-TO-POSITION GUARD ---------------------------------
-        # If the whale already holds an OPEN position in this token at approximately
-        # the same price, record as an add-to-position signal rather than opening
-        # a new tranche.  Trades at a meaningfully different price are independent
-        # positions held until the whale exits that specific entry level.
-        _SAME_PRICE_TOLERANCE = 0.03  # 3 cents absolute — same entry level (tick variation)
-        if whale_address:
-            existing_for_token = (
-                db.query(CopiedBet)
-                .filter(
-                    CopiedBet.whale_address == whale_address,
-                    CopiedBet.token_id == whale_bet.token_id,
-                    CopiedBet.status == "OPEN",
-                    CopiedBet.mode == mode,
-                )
-                .all()
-            )
-            if existing_for_token:
-                closest = min(
-                    existing_for_token,
-                    key=lambda p: abs(whale_bet.price - p.price_at_entry),
-                )
-                price_diff = abs(whale_bet.price - closest.price_at_entry)
-                if price_diff <= _SAME_PRICE_TOLERANCE:
-                    logger.info(
-                        "Add-to-position: whale %s bought %s @ %.3f within %.2f of "
-                        "existing entry %.3f — recording signal, no new tranche",
-                        whale_address[:10],
-                        whale_bet.token_id[:16],
-                        whale_bet.price,
-                        _SAME_PRICE_TOLERANCE,
-                        closest.price_at_entry,
-                    )
-                    return self._handle_add_to_position(
-                        whale_bet,
-                        closest,
-                        session,
-                        db,
-                        live_price=live_price,
-                        market_info=market_info or {},
-                    )
-                logger.info(
-                    "New price tranche: whale %s bought %s @ %.3f "
-                    "(diff=%.3f from existing %.3f > %.2f tolerance) — opening new tranche",
-                    whale_address[:10],
-                    whale_bet.token_id[:16],
-                    whale_bet.price,
-                    price_diff,
-                    closest.price_at_entry,
-                    _SAME_PRICE_TOLERANCE,
-                )
-
         # ---- CASE 3: Fresh position / new price tranche -------------------
+        # The add-to-position guard and the placement itself are both inside the
+        # lock so that concurrent threads (chain monitor + activity poller + drift
+        # retry) cannot both pass the guard simultaneously and each open a new
+        # tranche before either has committed its position to the DB.
+        # RLock is used so _handle_add_to_position (which also acquires the lock)
+        # does not deadlock when called from within this block.
 
         with self._placement_lock:
             # Re-read session balance now that we hold the lock —
             # another thread may have committed a deduction since
             # this thread first loaded the session object.
             db.refresh(session)
+
+            # ---- SAME-PRICE ADD-TO-POSITION GUARD (inside lock) ---------------
+            # Checked here (not before the lock) so that concurrent threads cannot
+            # both pass the guard before either has committed its new CopiedBet row,
+            # which was causing multi-position flooding on rapid same-price buys.
+            _SAME_PRICE_TOLERANCE = 0.03  # 3 cents absolute — same entry level
+            if whale_address:
+                existing_for_token = (
+                    db.query(CopiedBet)
+                    .filter(
+                        CopiedBet.whale_address == whale_address,
+                        CopiedBet.token_id == whale_bet.token_id,
+                        CopiedBet.status == "OPEN",
+                        CopiedBet.mode == mode,
+                    )
+                    .all()
+                )
+                if existing_for_token:
+                    closest = min(
+                        existing_for_token,
+                        key=lambda p: abs(whale_bet.price - p.price_at_entry),
+                    )
+                    price_diff = abs(whale_bet.price - closest.price_at_entry)
+                    if price_diff <= _SAME_PRICE_TOLERANCE:
+                        logger.info(
+                            "Add-to-position: whale %s bought %s @ %.3f within %.2f of "
+                            "existing entry %.3f — recording signal, no new tranche",
+                            whale_address[:10],
+                            whale_bet.token_id[:16],
+                            whale_bet.price,
+                            _SAME_PRICE_TOLERANCE,
+                            closest.price_at_entry,
+                        )
+                        return self._handle_add_to_position(
+                            whale_bet,
+                            closest,
+                            session,
+                            db,
+                            live_price=live_price,
+                            market_info=market_info or {},
+                        )
+                    logger.info(
+                        "New price tranche: whale %s bought %s @ %.3f "
+                        "(diff=%.3f from existing %.3f > %.2f tolerance) — opening new tranche",
+                        whale_address[:10],
+                        whale_bet.token_id[:16],
+                        whale_bet.price,
+                        price_diff,
+                        closest.price_at_entry,
+                        _SAME_PRICE_TOLERANCE,
+                    )
+
             # Risk calculations
             # For the first WHALE_CALIBRATION_BETS placed bets for this whale we don't
             # yet have a reliable average, so use the minimum as a tracker bet.  Once
@@ -1116,17 +1124,46 @@ class BetEngine:
                 # ---- no_position: DB size may be off, fetch actual balance ----
                 if sell_status == "no_position":
                     actual_shares = self._get_actual_position_size(copied_bet.token_id)
-                    if not actual_shares or actual_shares <= 0:
-                        # Genuinely absent — neutral close (no sell needed).
+
+                    if actual_shares is None:
+                        # Data API error — can't confirm position is absent.
+                        # Retry rather than risk a phantom neutral close.
                         logger.warning(
-                            "Real sell bet %d: no on-chain position confirmed (attempt %d/%d) — "
-                            "closing neutral",
+                            "Real sell bet %d: CLOB no_position but Data API returned error "
+                            "(attempt %d/%d) — retrying",
                             copied_bet.id,
                             attempt + 1,
                             max_attempts,
                         )
+                        if not last:
+                            _time.sleep(delay)
+                            continue
+                        return None, None  # leave OPEN, retried next cycle
+
+                    if actual_shares <= 0:
+                        # Data API explicitly confirms 0 shares.
+                        # On attempt 0 this is likely an indexing race condition
+                        # (buy just filled but not yet indexed) — require at least
+                        # one retry before accepting a neutral close.
+                        if attempt == 0:
+                            logger.warning(
+                                "Real sell bet %d: CLOB no_position and Data API shows 0 on "
+                                "first attempt — likely indexing lag, retrying (attempt 1/%d)",
+                                copied_bet.id,
+                                max_attempts,
+                            )
+                            _time.sleep(delay)
+                            continue
+                        # Confirmed absent after at least one retry — neutral close.
+                        logger.warning(
+                            "Real sell bet %d: no on-chain position confirmed after %d "
+                            "attempt(s) — closing neutral",
+                            copied_bet.id,
+                            attempt + 1,
+                        )
                         return copied_bet.price_at_entry, None
-                    # Update DB size to match on-chain reality and retry.
+
+                    # Data API shows a non-zero balance — update DB size and retry.
                     logger.warning(
                         "Real sell bet %d: CLOB rejected %.4f shares but on-chain shows "
                         "%.4f — updating size and retrying (attempt %d/%d)",
