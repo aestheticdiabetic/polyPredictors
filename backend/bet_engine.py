@@ -1679,11 +1679,11 @@ class BetEngine:
         - A two-tier TTL cache avoids re-fetching tokens that are unlikely to
           need action soon:
             Hot (price >= 0.85 or <= 0.15, near expiry, or market ended): 90s TTL
-            Cold (price 0.15-0.85, far from expiry): 600s TTL
+            Cold (price 0.15-0.85, far from expiry): 86400s TTL
         """
         # TTL constants (seconds)
         HOT_TTL = 90
-        COLD_TTL = 600
+        COLD_TTL = 86400  # 24h — suited to 1-day crypto markets
         # Price boundary that promotes a token to "hot"
         HOT_PRICE_THRESHOLD = 0.15
         # Hours-to-close boundary that promotes a token to "hot"
