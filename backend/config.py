@@ -40,7 +40,7 @@ class Settings:
     BET_SIZE_SCALAR: float = float(os.getenv("BET_SIZE_SCALAR", "1.0"))
 
     # Monitoring settings
-    POLLING_INTERVAL_SECONDS: int = int(os.getenv("POLLING_INTERVAL_SECONDS", "5"))
+    POLLING_INTERVAL_SECONDS: int = int(os.getenv("POLLING_INTERVAL_SECONDS", "2"))
     MIN_MARKET_HOURS_TO_CLOSE: float = float(os.getenv("MIN_MARKET_HOURS_TO_CLOSE", "0.0"))
 
     # How often (in seconds) the permanent resolution checker runs.
@@ -107,7 +107,7 @@ class Settings:
     # Background price pre-fetching — keeps prices fresh for all tokens in open positions
     # so that when a new whale trade fires the cached price is at most this many seconds old.
     # Set to 0 to disable. Lower = fresher prices, more CLOB API calls.
-    PRICE_PREFETCH_INTERVAL_SECONDS: int = int(os.getenv("PRICE_PREFETCH_INTERVAL_SECONDS", "3"))
+    PRICE_PREFETCH_INTERVAL_SECONDS: int = int(os.getenv("PRICE_PREFETCH_INTERVAL_SECONDS", "2"))
 
     # Drift-skip retry watchlist — for near-expiry markets that were skipped due to
     # price drift, re-check the price this often (seconds) and for this long (seconds).
@@ -161,7 +161,7 @@ class Settings:
     SELL_CLOSE_RETRIES: int = int(os.getenv("SELL_CLOSE_RETRIES", "4"))
 
     # Seconds to wait between sell retry attempts. Default 3.
-    SELL_CLOSE_RETRY_DELAY_SECONDS: int = int(os.getenv("SELL_CLOSE_RETRY_DELAY_SECONDS", "3"))
+    SELL_CLOSE_RETRY_DELAY_SECONDS: int = int(os.getenv("SELL_CLOSE_RETRY_DELAY_SECONDS", "1"))
 
     # MATIC/USD conversion rate used to convert Polygon gas fees to USDC for P&L tracking.
     # Update when MATIC price drifts significantly. Gas costs are small (< $0.05/tx)

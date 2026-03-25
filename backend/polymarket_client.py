@@ -33,7 +33,7 @@ def _normalize_market(market: dict) -> dict:
 
 _TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 _MARKET_CACHE_TTL = 3600  # seconds
-_PRICE_CACHE_TTL = 30  # seconds — live prices refresh every 30 s
+_PRICE_CACHE_TTL = 10  # seconds — live prices refresh every 10 s
 _PRICE_NEGATIVE_TTL = 300  # seconds — 404 (no order book) cached for 5 min
 
 
@@ -91,16 +91,9 @@ class PolymarketClient:
         Paginates automatically until fewer than `limit` results are returned
         or `max_pages` pages have been fetched (default 10 → up to 1000 trades).
         """
-        url = f"{settings.DATA_API_BASE}/activity"
-        # Use synchronous requests (via asyncio.to_thread) rather than the shared
-        # httpx.AsyncClient.  The VPN tunnel drops the body read mid-response even
-        # after a clean 200 OK — an asyncio transport-level failure that cannot be
-        # retried on the same AsyncClient.  Synchronous requests uses plain OS
-        # sockets with no asyncio transport layer, which reconnect automatically.
         import asyncio as _asyncio
 
-        import requests as _requests
-
+        url = f"{settings.DATA_API_BASE}/activity"
         MAX_ATTEMPTS = 3
         all_trades: list[dict] = []
 
@@ -116,13 +109,9 @@ class PolymarketClient:
             page_trades: list[dict] = []
             for attempt in range(MAX_ATTEMPTS):
                 try:
-
-                    def _fetch(p=params):
-                        r = _requests.get(url, params=p, timeout=15)
-                        r.raise_for_status()
-                        return r.json()
-
-                    data = await _asyncio.to_thread(_fetch)
+                    resp = await self._http.get(url, params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
                     if isinstance(data, list):
                         page_trades = data
                     else:
@@ -138,7 +127,7 @@ class PolymarketClient:
                             address[:10],
                             exc,
                         )
-                        await _asyncio.sleep(0.5 * (attempt + 1))
+                        await _asyncio.sleep(0.1)
                     else:
                         logger.error(
                             "get_user_activity page %d error for %s after %d attempts: %s",
