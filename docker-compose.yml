@@ -1,0 +1,18 @@
+version: "3.8"
+services:
+  polymarket-app:
+    build: .
+    container_name: polymarket-app
+    ports:
+      - "127.0.0.1:8081:8081"
+    restart: unless-stopped
+    command: ["python", "run.py", "--port", "8081"]
+    env_file: .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "17m"
+        max-file: "3"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
