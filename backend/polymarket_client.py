@@ -631,7 +631,39 @@ class PolymarketClient:
         # Detect negRisk markets from the market cache — negRisk markets require
         # signing against a different exchange contract.  The cache is populated
         # by get_market() when whale activity is first detected for this token.
+        # On a cold start the cache may be empty for positions carried over from
+        # a previous run, so fall back to a synchronous Gamma API fetch rather
+        # than defaulting to False (wrong contract → invalid signature on sell).
         _cached = self._market_cache.get(f"token:{token_id}")
+        if not _cached:
+            try:
+                import requests as _req
+
+                _r = _req.get(
+                    f"{settings.GAMMA_API_BASE}/markets",
+                    params={"clob_token_ids": token_id},
+                    timeout=5,
+                )
+                if _r.ok:
+                    _markets = _r.json()
+                    _market_data = _normalize_market(
+
+                            _markets[0]
+                            if isinstance(_markets, list)
+                            else _markets.get("markets", [{}])[0]
+
+                    )
+                    self._market_cache[f"token:{token_id}"] = (
+                        _market_data,
+                        time.monotonic() + _MARKET_CACHE_TTL,
+                    )
+                    _cached = self._market_cache.get(f"token:{token_id}")
+            except Exception as _exc:
+                logger.warning(
+                    "place_market_sell: negRisk cache-miss fetch failed for %s: %s",
+                    token_id[:16],
+                    _exc,
+                )
         neg_risk = bool((_cached[0] or {}).get("negRisk", False)) if _cached else False
 
         # tick size is stable; fetch once up-front
