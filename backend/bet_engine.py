@@ -1182,18 +1182,47 @@ class BetEngine:
                         )
                         return copied_bet.price_at_entry, None
 
-                    # Data API shows a non-zero balance — update DB size and retry.
-                    logger.warning(
-                        "Real sell bet %d: CLOB rejected %.4f shares but on-chain shows "
-                        "%.4f — updating size and retrying (attempt %d/%d)",
-                        copied_bet.id,
-                        copied_bet.size_shares,
-                        actual_shares,
-                        attempt + 1,
-                        max_attempts,
-                    )
-                    copied_bet.size_shares = actual_shares
-                    copied_bet.price_at_entry = round(copied_bet.size_usdc / actual_shares, 4)
+                    # Data API shows a non-zero balance.
+                    # Only update size_shares downward (corrects a partial fill) or
+                    # by a small margin (±10% — genuine fill variance). Never inflate
+                    # to a value larger than the original, which would happen when the
+                    # Data API is returning the combined balance of multiple open bets
+                    # on the same token. Inflating size_shares causes P&L to be
+                    # calculated on shares belonging to other bets, producing false
+                    # positive P&L.
+                    original_shares = copied_bet.size_shares
+                    if actual_shares <= original_shares * 1.1:
+                        # Safe to update — actual fill is within expected range or lower.
+                        if actual_shares != original_shares:
+                            logger.warning(
+                                "Real sell bet %d: CLOB rejected %.4f shares but on-chain shows "
+                                "%.4f — updating size and retrying (attempt %d/%d)",
+                                copied_bet.id,
+                                original_shares,
+                                actual_shares,
+                                attempt + 1,
+                                max_attempts,
+                            )
+                            copied_bet.size_shares = actual_shares
+                            copied_bet.price_at_entry = round(
+                                copied_bet.size_usdc / actual_shares, 4
+                            )
+                    else:
+                        # actual_shares >> expected — likely the Data API is returning
+                        # the combined balance of multiple bets on this token. Do NOT
+                        # update size_shares; retry with the original amount to avoid
+                        # selling other bets' shares and inflating this bet's P&L.
+                        logger.warning(
+                            "Real sell bet %d: on-chain balance %.4f is %.0f%% larger than "
+                            "expected %.4f — likely combined position, retrying with "
+                            "original size (attempt %d/%d)",
+                            copied_bet.id,
+                            actual_shares,
+                            (actual_shares / original_shares - 1) * 100,
+                            original_shares,
+                            attempt + 1,
+                            max_attempts,
+                        )
                     if not last:
                         _time.sleep(delay)
                     continue
