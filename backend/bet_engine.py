@@ -1142,24 +1142,43 @@ class BetEngine:
 
                     if actual_shares <= 0:
                         # Data API explicitly confirms 0 shares.
-                        # On attempt 0 this is likely an indexing race condition
-                        # (buy just filled but not yet indexed) — require at least
-                        # one retry before accepting a neutral close.
-                        if attempt == 0:
+                        # Polygon + Polymarket indexing lag can be 5-30s after a fill.
+                        # Never neutral-close a bet that was opened within the last
+                        # NEUTRAL_CLOSE_GRACE_SECONDS seconds — the Data API simply
+                        # hasn't indexed the position yet.
+                        NEUTRAL_CLOSE_GRACE_SECONDS = 45
+                        age_seconds: float = float("inf")
+                        if copied_bet.opened_at is not None:
+                            from datetime import UTC as _UTC
+
+                            age_seconds = (
+                                datetime.now(_UTC) - copied_bet.opened_at.replace(tzinfo=_UTC)
+                            ).total_seconds()
+                        if age_seconds < NEUTRAL_CLOSE_GRACE_SECONDS:
                             logger.warning(
-                                "Real sell bet %d: CLOB no_position and Data API shows 0 on "
-                                "first attempt — likely indexing lag, retrying (attempt 1/%d)",
+                                "Real sell bet %d: CLOB no_position and Data API shows 0 "
+                                "but bet is only %.0fs old (grace=%ds) — "
+                                "likely indexing lag, retrying (attempt %d/%d)",
                                 copied_bet.id,
+                                age_seconds,
+                                NEUTRAL_CLOSE_GRACE_SECONDS,
+                                attempt + 1,
                                 max_attempts,
                             )
-                            _time.sleep(delay)
-                            continue
-                        # Confirmed absent after at least one retry — neutral close.
+                            if not last:
+                                _time.sleep(delay)
+                                continue
+                            # Grace period elapsed during retries — leave OPEN for
+                            # the next resolution cycle rather than neutral-closing.
+                            return None, None
+                        # Bet is old enough that an absent Data API position is
+                        # genuinely empty — neutral close (no actual sell needed).
                         logger.warning(
                             "Real sell bet %d: no on-chain position confirmed after %d "
-                            "attempt(s) — closing neutral",
+                            "attempt(s) (bet age=%.0fs) — closing neutral",
                             copied_bet.id,
                             attempt + 1,
+                            age_seconds,
                         )
                         return copied_bet.price_at_entry, None
 
