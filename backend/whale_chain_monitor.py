@@ -140,6 +140,10 @@ class WhaleChainMonitor:
     async def _connect_and_stream(self):
         log.info("WhaleChainMonitor: connecting to %s...", self._ws_url[:60])
 
+        # Warm market cache once on first connect so known markets are instant
+        if self._last_block == 0:
+            await self._warm_market_cache()
+
         async with websockets.connect(
             self._ws_url,
             ping_interval=30,
@@ -333,6 +337,60 @@ class WhaleChainMonitor:
                 log.warning("WhaleChainMonitor: getLogs error blocks %d→%d: %s", chunk, end, exc)
             chunk = end + 1
         return logs
+
+    # ------------------------------------------------------------------
+    # Market cache warm-up
+    # ------------------------------------------------------------------
+
+    async def _warm_market_cache(self):
+        """Pre-fetch market metadata for all tokens with open positions or recent whale bets.
+
+        Called once on first connect so that _dispatch_entry cache hits are instant
+        for markets the whales already trade in.
+        """
+        client = getattr(self._whale_monitor, "_client", None)
+        if not client:
+            return
+
+        loop = asyncio.get_event_loop()
+
+        def _load_token_ids() -> set[str]:
+            db = SessionLocal()
+            try:
+                open_tokens = {
+                    r[0]
+                    for r in db.query(CopiedBet.token_id).filter_by(status="OPEN").all()
+                    if r[0]
+                }
+                recent_tokens = {
+                    r[0]
+                    for r in db.query(WhaleBet.token_id)
+                    .filter(WhaleBet.token_id.isnot(None))
+                    .order_by(WhaleBet.id.desc())
+                    .limit(200)
+                    .all()
+                    if r[0]
+                }
+                return open_tokens | recent_tokens
+            finally:
+                db.close()
+
+        token_ids = await loop.run_in_executor(None, _load_token_ids)
+        if not token_ids:
+            return
+
+        log.info("WhaleChainMonitor: warming market cache for %d token(s)...", len(token_ids))
+
+        # Cap concurrency to avoid hammering the Gamma API
+        sem = asyncio.Semaphore(10)
+
+        async def _fetch_one(tid: str):
+            async with sem:
+                with contextlib.suppress(Exception):
+                    await client.get_market("", token_id=tid)
+
+        await asyncio.gather(*[_fetch_one(tid) for tid in token_ids])
+        log.info("WhaleChainMonitor: market cache warm-up complete (%d tokens)", len(token_ids))
 
     # ------------------------------------------------------------------
     # Whale map
@@ -579,22 +637,28 @@ class WhaleChainMonitor:
             log.warning("WhaleChainMonitor: no client for entry dispatch")
             return
 
-        # Phase 1: async HTTP
-        market_info: dict = {}
-        try:
-            market_info = await client.get_market("", token_id=token_id) or {}
-        except Exception as exc:
-            log.debug("WhaleChainMonitor: market lookup failed %s: %s", token_id[:16], exc)
+        # Phase 1: fire market lookup, live price, and taker fee in parallel.
+        # token_id is known from the on-chain event so no sequential dependency.
+        market_result, price_result, fee_result = await asyncio.gather(
+            client.get_market("", token_id=token_id),
+            client.get_best_price(token_id, force_refresh=True),
+            client.get_taker_fee_async(token_id),
+            return_exceptions=True,
+        )
+
+        market_info: dict = market_result if isinstance(market_result, dict) else {}
+        live_price = price_result if isinstance(price_result, float) else None
+        taker_fee_bps = fee_result if isinstance(fee_result, int) else 1000
 
         condition_id = market_info.get("conditionId") or market_info.get("condition_id") or ""
         question = market_info.get("question") or market_info.get("title") or ""
         tokens = market_info.get("tokens") or []
+
+        # Fallback: fetch full market by condition_id if token list was absent
         if not tokens and condition_id:
-            try:
+            with contextlib.suppress(Exception):
                 full = await client.get_market(condition_id) or {}
                 tokens = full.get("tokens") or []
-            except Exception:
-                pass
 
         outcome = "YES"
         for tok in tokens:
@@ -605,14 +669,6 @@ class WhaleChainMonitor:
         trade["conditionId"] = condition_id
         trade["question"] = question
         trade["outcome"] = outcome
-
-        price_result, fee_result = await asyncio.gather(
-            client.get_best_price(token_id, force_refresh=True),
-            client.get_taker_fee_async(token_id),
-            return_exceptions=True,
-        )
-        live_price = price_result if isinstance(price_result, float) else None
-        taker_fee_bps = fee_result if isinstance(fee_result, int) else 1000
 
         log.info(
             "WhaleChainMonitor: opening position whale=%s token=%s...%s "
