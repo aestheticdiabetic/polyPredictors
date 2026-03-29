@@ -92,6 +92,17 @@ class WhaleChainMonitor:
         self._whale_map: dict[str, str] = {}
         self._whale_map_ts: datetime | None = None
 
+        # Active WS subscription IDs (one for maker filter, one for taker filter)
+        self._sub_ids: list[str] = []
+        # Whale address set at last subscription — used to detect list changes
+        self._subscribed_whales: frozenset[str] = frozenset()
+        # Monotonic timestamp (time.monotonic) of last resubscribe check
+        self._last_resubscribe_check: float = 0.0
+
+        # Block timestamp cache keyed by block number — avoids repeat eth_getBlock
+        # for the rare whale events (multiple events in the same block share a timestamp)
+        self._block_ts_cache: dict[int, int] = {}
+
         log.info(
             "WhaleChainMonitor initialized (WS=%s..., sig=%s...)",
             self._ws_url[:50],
@@ -173,46 +184,118 @@ class WhaleChainMonitor:
                     await self._backfill(self._last_block + 1, current_block)
                 self._last_block = current_block
 
-            # Subscribe to OrderFilled on both CTF contracts
-            sub_id = await self._subscribe(ws)
-            if not sub_id:
-                raise RuntimeError("eth_subscribe returned no subscription ID")
-            log.info("WhaleChainMonitor: subscribed (id=%s...)", sub_id[:12])
+            # Subscribe to OrderFilled filtered by whale addresses (two subs: maker + taker)
+            sub_ids = await self._subscribe(ws)
+            if not sub_ids:
+                raise RuntimeError("eth_subscribe returned no subscription IDs")
 
             async for raw_msg in ws:
                 if not self._running:
                     return
-                await self._handle_message(raw_msg)
+                await self._handle_message(raw_msg, ws)
 
-    async def _subscribe(self, ws) -> str | None:
-        """Subscribe to all OrderFilled logs on both CTF contracts. Returns subscription ID."""
-        await ws.send(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "eth_subscribe",
-                    "params": [
-                        "logs",
-                        {
-                            "address": [
-                                Web3.to_checksum_address(CTF_EXCHANGE),
-                                Web3.to_checksum_address(NEG_RISK_CTF_EXCHANGE),
-                            ],
-                            "topics": [self._event_sig],
-                        },
-                    ],
-                }
+    async def _subscribe(self, ws) -> list[str]:
+        """Subscribe to OrderFilled logs filtered by tracked whale addresses.
+
+        Creates two subscriptions — one for whale-as-maker (topics[2]) and one for
+        whale-as-taker (topics[3]). Alchemy only delivers events where a tracked whale
+        is involved, eliminating credit burn from the ~3,000+ unrelated trades/minute
+        on the CTF Exchange contracts.
+
+        Returns list of two subscription IDs.
+        """
+        await self._maybe_refresh_whale_map()
+        if not self._whale_map:
+            raise RuntimeError("No whales configured — cannot subscribe")
+
+        contract_addrs = [
+            Web3.to_checksum_address(CTF_EXCHANGE),
+            Web3.to_checksum_address(NEG_RISK_CTF_EXCHANGE),
+        ]
+        # Pad each address to 32 bytes as required by topics filter spec
+        padded = ["0x" + addr.lower().replace("0x", "").zfill(64) for addr in self._whale_map]
+
+        sub_ids = []
+        for req_id, topics in enumerate(
+            [
+                [self._event_sig, None, padded],  # whale is maker
+                [self._event_sig, None, None, padded],  # whale is taker
+            ],
+            start=1,
+        ):
+            await ws.send(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "method": "eth_subscribe",
+                        "params": ["logs", {"address": contract_addrs, "topics": topics}],
+                    }
+                )
             )
+            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10.0))
+            sub_id = resp.get("result")
+            if not sub_id:
+                raise RuntimeError(f"eth_subscribe (id={req_id}) returned no ID: {resp}")
+            sub_ids.append(sub_id)
+
+        self._sub_ids = sub_ids
+        self._subscribed_whales = frozenset(self._whale_map)
+        log.info(
+            "WhaleChainMonitor: subscribed (%d whale(s), ids=%s.../%s...)",
+            len(self._whale_map),
+            sub_ids[0][:10],
+            sub_ids[1][:10],
         )
-        resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10.0))
-        return resp.get("result")
+        return sub_ids
+
+    async def _resubscribe_if_needed(self, ws):
+        """Periodically check if the whale list changed; if so, update subscriptions.
+
+        Costs zero credits when the whale list is unchanged.
+        Only unsubscribes + resubscribes when a whale is added or removed.
+        """
+        import time
+
+        if time.monotonic() - self._last_resubscribe_check < self._WHALE_MAP_TTL_S:
+            return
+        self._last_resubscribe_check = time.monotonic()
+
+        await self._maybe_refresh_whale_map()
+        if frozenset(self._whale_map) == self._subscribed_whales:
+            return
+
+        log.info(
+            "WhaleChainMonitor: whale list changed (%d→%d) — resubscribing",
+            len(self._subscribed_whales),
+            len(self._whale_map),
+        )
+
+        # Unsubscribe old filters
+        for sub_id in self._sub_ids:
+            with contextlib.suppress(Exception):
+                await ws.send(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 99,
+                            "method": "eth_unsubscribe",
+                            "params": [sub_id],
+                        }
+                    )
+                )
+                await asyncio.wait_for(ws.recv(), timeout=5.0)
+
+        await self._subscribe(ws)
 
     # ------------------------------------------------------------------
     # Message handler
     # ------------------------------------------------------------------
 
-    async def _handle_message(self, raw_msg: str):
+    async def _handle_message(self, raw_msg: str, ws):
+        # Periodically resubscribe if whale list changed (zero-cost when unchanged)
+        await self._resubscribe_if_needed(ws)
+
         try:
             msg = json.loads(raw_msg)
         except Exception:
@@ -229,7 +312,6 @@ class WhaleChainMonitor:
         if block_num > self._last_block:
             self._last_block = block_num
 
-        await self._maybe_refresh_whale_map()
         if not self._whale_map:
             return
 
@@ -237,19 +319,24 @@ class WhaleChainMonitor:
         if raw_log is None:
             return
 
-        # Fetch block timestamp async before decode so decode methods need no RPC
+        # Fetch block timestamp async before decode; cache avoids repeat eth_getBlock
+        # for multiple whale events landing in the same block
         block_ts = await self._get_block_timestamp(block_num)
-        block_ts_cache = {block_num: block_ts}
+        self._block_ts_cache[block_num] = block_ts
 
         loop = asyncio.get_event_loop()
         whale_map_snapshot = self._whale_map.copy()
 
         buys, sells = await asyncio.gather(
             loop.run_in_executor(
-                None, self._decode_whale_buys, [raw_log], whale_map_snapshot, block_ts_cache
+                None, self._decode_whale_buys, [raw_log], whale_map_snapshot, self._block_ts_cache
             ),
             loop.run_in_executor(
-                None, self._decode_whale_sells, [raw_log], whale_map_snapshot, dict(block_ts_cache)
+                None,
+                self._decode_whale_sells,
+                [raw_log],
+                whale_map_snapshot,
+                dict(self._block_ts_cache),
             ),
         )
 
@@ -429,10 +516,14 @@ class WhaleChainMonitor:
             return None
 
     async def _get_block_timestamp(self, block_num: int) -> int:
+        if block_num in self._block_ts_cache:
+            return self._block_ts_cache[block_num]
         loop = asyncio.get_event_loop()
         try:
             block = await loop.run_in_executor(None, lambda: self._http_w3.eth.get_block(block_num))
-            return int(block["timestamp"])
+            ts = int(block["timestamp"])
+            self._block_ts_cache[block_num] = ts
+            return ts
         except Exception:
             return int(datetime.now(UTC).timestamp())
 
