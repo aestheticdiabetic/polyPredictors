@@ -122,17 +122,19 @@ class Settings:
         os.getenv("REDEMPTION_CHECK_INTERVAL_SECONDS", "300")
     )
 
-    # Polygon RPC URL used for on-chain redemption transactions.
+    # Polygon RPC URL used for on-chain redemption transactions and backfill eth_getLogs.
     POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
 
-    # On-chain exit monitoring via Polygon eth_getLogs (CTF Exchange OrderFilled events).
-    # When true, replaces activity-API exit polling with block-native detection.
-    # Requires a reliable POLYGON_RPC_URL — default public RPC may have rate limits.
-    CHAIN_EXIT_ENABLED: bool = os.getenv("CHAIN_EXIT_ENABLED", "false").lower() == "true"
+    # WebSocket URL for on-chain exit monitoring (eth_subscribe).
+    # If unset, derived from POLYGON_RPC_URL by replacing https:// with wss://.
+    # Alchemy example: wss://polygon-mainnet.g.alchemy.com/v2/<key>
+    # dRPC example:    wss://polygon.drpc.org
+    POLYGON_WS_URL: str = os.getenv("POLYGON_WS_URL", "")
 
-    # Poll interval for on-chain exit monitoring. Polygon blocks confirm every ~2s,
-    # so 2s gives ~4s worst-case detection latency (poll wait + block time).
-    CHAIN_EXIT_POLL_INTERVAL_SECONDS: int = int(os.getenv("CHAIN_EXIT_POLL_INTERVAL_SECONDS", "2"))
+    # On-chain exit monitoring via WebSocket eth_subscribe (CTF Exchange OrderFilled events).
+    # When true, replaces activity-API exit polling with block-native detection (~200ms latency).
+    # Requires a WebSocket-capable POLYGON_WS_URL or POLYGON_RPC_URL.
+    CHAIN_EXIT_ENABLED: bool = os.getenv("CHAIN_EXIT_ENABLED", "false").lower() == "true"
 
     # Blocks to look back on first start (Polygon ~2s/block → 150 blocks ≈ 5 min).
     CHAIN_EXIT_LOOKBACK_BLOCKS: int = int(os.getenv("CHAIN_EXIT_LOOKBACK_BLOCKS", "150"))

@@ -1,267 +1,422 @@
 """
-On-chain exit monitoring via Polygon eth_getLogs.
+On-chain exit monitoring via WebSocket eth_subscribe (Polygon).
 
-Polls the CTF Exchange contracts for OrderFilled events to detect whale sells.
-Replaces activity-API exit polling (poll_exits_only) when CHAIN_EXIT_ENABLED=true.
+Subscribes to OrderFilled events on both CTF Exchange contracts.
+Replaces the APScheduler poll() approach with a persistent asyncio Task,
+giving ~200ms detection latency vs ~4s for the previous polling approach.
 
-Detection latency: ~4s worst case (2s poll interval + 2s Polygon block time).
-Signal persistence: block number is monotonic — exits can never be skipped.
+Gap recovery: on (re)connect, eth_getLogs backfills any blocks missed
+during disconnection so exits are never silently dropped.
+
+Architecture:
+  - start() creates an asyncio.Task on the FastAPI/uvicorn event loop.
+  - Async HTTP work (market lookups, price fetches) runs on the event loop.
+  - Sync work (DB writes, CLOB order placement) runs in thread executor.
+  - Reconnects with exponential backoff on any connection failure.
 """
 
 import asyncio
 import contextlib
+import json
 import logging
 from datetime import UTC, datetime
 
+import websockets
+from hexbytes import HexBytes
+from sqlalchemy.exc import IntegrityError
 from web3 import Web3
+from web3.datastructures import AttributeDict
 
 from backend.config import settings
-from backend.database import CopiedBet, MonitoringSession, SessionLocal, Whale
+from backend.database import CopiedBet, MonitoringSession, SessionLocal, Whale, WhaleBet
 from backend.redemption import CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE, ORDER_FILLED_ABI
 
 log = logging.getLogger(__name__)
 
+# Exponential backoff delays (seconds) for reconnect attempts
+_RECONNECT_DELAYS = [1, 2, 4, 8, 16, 30, 60]
+
+
+_dispatch_tasks: set = set()  # strong references to prevent GC of fire-and-forget tasks
+
 
 class WhaleChainMonitor:
     """
-    Polls Polygon CTF Exchange contracts for OrderFilled events.
-    Detects whale sells by matching maker/taker addresses against tracked whales.
-    Thread-safe; designed to run as an APScheduler job every 2s.
+    Subscribes to Polygon CTF Exchange OrderFilled events via WebSocket.
+    Runs as a persistent asyncio Task started from main.py lifespan.
+
+    On connect  : backfills missed blocks since _last_block via eth_getLogs.
+    On event    : decodes log → dispatches entry/exit as concurrent Tasks.
+    On disconnect: reconnects with exponential backoff; gap is backfilled on next connect.
     """
+
+    _MAX_BACKFILL_BLOCKS = 500  # cap gap backfill after long downtime
+    _MAX_BLOCKS_PER_QUERY = 100  # eth_getLogs chunk size (free-tier safe)
+    _WHALE_MAP_TTL_S = 30  # seconds between whale list refreshes
 
     def __init__(self, bet_engine, whale_monitor):
         self._bet_engine = bet_engine
         self._whale_monitor = whale_monitor
         self._last_block: int = 0
+        self._running = False
+        self._task: asyncio.Task | None = None
 
-        # Bypass the application-level HTTP proxy (set globally from PROXY_URL in config.py).
-        # The VPN tunnel already routes all traffic at the network level via
-        # network_mode:service:gluetun, so routing through gluetun's HTTP proxy on top
-        # is a redundant double-hop that adds significant latency to every RPC call.
-        self._w3 = Web3(
+        # WS URL: use POLYGON_WS_URL if set, else derive from POLYGON_RPC_URL
+        rpc_url = settings.POLYGON_WS_URL or settings.POLYGON_RPC_URL
+        self._ws_url = rpc_url.replace("https://", "wss://").replace("http://", "ws://")
+
+        # Separate HTTP provider for backfill + block timestamp fetches.
+        # Proxy is explicitly bypassed — the VPN tunnel already handles routing at
+        # the network level; going through gluetun's HTTP proxy would double-hop.
+        self._http_w3 = Web3(
             Web3.HTTPProvider(
                 settings.POLYGON_RPC_URL,
                 request_kwargs={"proxies": {"http": None, "https": None}},
             )
         )
 
-        ctf_addr = Web3.to_checksum_address(CTF_EXCHANGE)
-        neg_addr = Web3.to_checksum_address(NEG_RISK_CTF_EXCHANGE)
-        self._ctf_contract = self._w3.eth.contract(address=ctf_addr, abi=ORDER_FILLED_ABI)
-        self._neg_contract = self._w3.eth.contract(address=neg_addr, abi=ORDER_FILLED_ABI)
-
-        sig_bytes = self._w3.keccak(
+        # OrderFilled event signature hash
+        sig_bytes = self._http_w3.keccak(
             text="OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)"
         )
         sig_hex = sig_bytes.hex()
         self._event_sig = "0x" + sig_hex if not sig_hex.startswith("0x") else sig_hex
 
+        # Contracts for ABI-based log decoding
+        ctf_addr = Web3.to_checksum_address(CTF_EXCHANGE)
+        neg_addr = Web3.to_checksum_address(NEG_RISK_CTF_EXCHANGE)
+        self._ctf_contract = self._http_w3.eth.contract(address=ctf_addr, abi=ORDER_FILLED_ABI)
+        self._neg_contract = self._http_w3.eth.contract(address=neg_addr, abi=ORDER_FILLED_ABI)
+
+        # Whale address cache {lowercase: original} — refreshed every _WHALE_MAP_TTL_S
+        self._whale_map: dict[str, str] = {}
+        self._whale_map_ts: datetime | None = None
+
         log.info(
-            "WhaleChainMonitor initialized (RPC=%s, sig=%s...)",
-            settings.POLYGON_RPC_URL[:40],
+            "WhaleChainMonitor initialized (WS=%s..., sig=%s...)",
+            self._ws_url[:50],
             self._event_sig[:18],
         )
 
     # ------------------------------------------------------------------
-    # Scheduler entry point
+    # Lifecycle
     # ------------------------------------------------------------------
 
-    def poll(self):
-        """Synchronous entry point — called by APScheduler in a background thread."""
-        try:
-            asyncio.run(self._poll_async())
-        except Exception as exc:
-            log.warning("WhaleChainMonitor.poll error: %s", exc)
+    def start(self) -> asyncio.Task:
+        """Create and return a persistent asyncio Task. Called from main.py lifespan."""
+        self._running = True
+        self._task = asyncio.create_task(self._run(), name="whale_chain_monitor")
+        return self._task
+
+    def stop(self):
+        """Signal the Task to stop and cancel it."""
+        self._running = False
+        if self._task and not self._task.done():
+            self._task.cancel()
 
     # ------------------------------------------------------------------
-    # Core polling logic
+    # Main run loop
     # ------------------------------------------------------------------
 
-    async def _poll_async(self):
-        db = SessionLocal()
+    async def _run(self):
+        attempt = 0
+        while self._running:
+            try:
+                await self._connect_and_stream()
+                attempt = 0  # clean disconnect resets backoff
+            except asyncio.CancelledError:
+                log.info("WhaleChainMonitor: task cancelled — stopping")
+                return
+            except Exception as exc:
+                delay = _RECONNECT_DELAYS[min(attempt, len(_RECONNECT_DELAYS) - 1)]
+                log.warning(
+                    "WhaleChainMonitor: connection lost (%s) — reconnecting in %ds",
+                    exc,
+                    delay,
+                )
+                attempt += 1
+                await asyncio.sleep(delay)
+
+    async def _connect_and_stream(self):
+        log.info("WhaleChainMonitor: connecting to %s...", self._ws_url[:60])
+
+        async with websockets.connect(
+            self._ws_url,
+            ping_interval=30,
+            ping_timeout=10,
+            close_timeout=5,
+        ) as ws:
+            log.info("WhaleChainMonitor: WebSocket connected")
+
+            # Backfill any blocks missed since last connection
+            current_block = await self._get_block_number()
+            if current_block:
+                if self._last_block == 0:
+                    self._last_block = max(0, current_block - settings.CHAIN_EXIT_LOOKBACK_BLOCKS)
+                    log.info(
+                        "WhaleChainMonitor: starting from block %d (lookback=%d)",
+                        self._last_block,
+                        settings.CHAIN_EXIT_LOOKBACK_BLOCKS,
+                    )
+                elif current_block > self._last_block:
+                    gap = current_block - self._last_block
+                    log.info(
+                        "WhaleChainMonitor: backfilling %d block gap (%d→%d)",
+                        gap,
+                        self._last_block,
+                        current_block,
+                    )
+                    await self._backfill(self._last_block + 1, current_block)
+                self._last_block = current_block
+
+            # Subscribe to OrderFilled on both CTF contracts
+            sub_id = await self._subscribe(ws)
+            if not sub_id:
+                raise RuntimeError("eth_subscribe returned no subscription ID")
+            log.info("WhaleChainMonitor: subscribed (id=%s...)", sub_id[:12])
+
+            async for raw_msg in ws:
+                if not self._running:
+                    return
+                await self._handle_message(raw_msg)
+
+    async def _subscribe(self, ws) -> str | None:
+        """Subscribe to all OrderFilled logs on both CTF contracts. Returns subscription ID."""
+        await ws.send(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_subscribe",
+                    "params": [
+                        "logs",
+                        {
+                            "address": [
+                                Web3.to_checksum_address(CTF_EXCHANGE),
+                                Web3.to_checksum_address(NEG_RISK_CTF_EXCHANGE),
+                            ],
+                            "topics": [self._event_sig],
+                        },
+                    ],
+                }
+            )
+        )
+        resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10.0))
+        return resp.get("result")
+
+    # ------------------------------------------------------------------
+    # Message handler
+    # ------------------------------------------------------------------
+
+    async def _handle_message(self, raw_msg: str):
         try:
-            rows = db.query(Whale.address).filter_by(is_active=True).all()
-        except Exception as exc:
-            log.error("WhaleChainMonitor: failed to load whales: %s", exc)
-            return
-        finally:
-            db.close()
-
-        if not rows:
+            msg = json.loads(raw_msg)
+        except Exception:
             return
 
-        # Map lowercase → original stored address (DB may store checksummed)
-        address_map: dict[str, str] = {row[0].lower(): row[0] for row in rows}
-
-        poll_start = datetime.now(UTC)
-        try:
-            latest_block = self._w3.eth.block_number
-        except Exception as exc:
-            log.warning("WhaleChainMonitor: block_number RPC error: %s", exc)
+        if msg.get("method") != "eth_subscription":
             return
 
-        if self._last_block == 0:
-            self._last_block = max(0, latest_block - settings.CHAIN_EXIT_LOOKBACK_BLOCKS)
+        result = (msg.get("params") or {}).get("result")
+        if not result or result.get("removed"):
+            return
+
+        block_num = int(result.get("blockNumber", "0x0"), 16)
+        if block_num > self._last_block:
+            self._last_block = block_num
+
+        await self._maybe_refresh_whale_map()
+        if not self._whale_map:
+            return
+
+        raw_log = self._normalize_log(result)
+        if raw_log is None:
+            return
+
+        # Fetch block timestamp async before decode so decode methods need no RPC
+        block_ts = await self._get_block_timestamp(block_num)
+        block_ts_cache = {block_num: block_ts}
+
+        loop = asyncio.get_event_loop()
+        whale_map_snapshot = self._whale_map.copy()
+
+        buys, sells = await asyncio.gather(
+            loop.run_in_executor(
+                None, self._decode_whale_buys, [raw_log], whale_map_snapshot, block_ts_cache
+            ),
+            loop.run_in_executor(
+                None, self._decode_whale_sells, [raw_log], whale_map_snapshot, dict(block_ts_cache)
+            ),
+        )
+
+        now = datetime.now(UTC)
+        for trade, whale_address in buys:
+            lag_s = now.timestamp() - block_ts
             log.info(
-                "WhaleChainMonitor: initialized at block %d (lookback=%d)",
-                self._last_block,
-                settings.CHAIN_EXIT_LOOKBACK_BLOCKS,
+                "WhaleChainMonitor: ENTRY detected whale=%s lag=%.1fs",
+                whale_address[:10],
+                lag_s,
             )
+            task = asyncio.create_task(self._dispatch_entry(trade, whale_address))
+            _dispatch_tasks.add(task)
+            task.add_done_callback(_dispatch_tasks.discard)
 
-        if latest_block <= self._last_block:
-            return  # No new blocks since last poll
-
-        from_block = max(self._last_block + 1, latest_block - 500)  # cap gap after downtime
-        to_block = latest_block
-
-        whale_addresses = list(address_map.keys())  # lowercase
-
-        try:
-            logs = await self._fetch_logs(from_block, to_block, whale_addresses)
-        except Exception as exc:
-            log.warning(
-                "WhaleChainMonitor: eth_getLogs failed (blocks %d→%d): %s",
-                from_block,
-                to_block,
-                exc,
+        for trade, whale_address in sells:
+            lag_s = now.timestamp() - block_ts
+            log.info(
+                "WhaleChainMonitor: EXIT detected whale=%s lag=%.1fs",
+                whale_address[:10],
+                lag_s,
             )
+            task = asyncio.create_task(self._dispatch_exit(trade, whale_address))
+            _dispatch_tasks.add(task)
+            task.add_done_callback(_dispatch_tasks.discard)
+
+    # ------------------------------------------------------------------
+    # Backfill (on reconnect)
+    # ------------------------------------------------------------------
+
+    async def _backfill(self, from_block: int, to_block: int):
+        """Fetch and process all missed events via HTTP eth_getLogs."""
+        await self._maybe_refresh_whale_map()
+        if not self._whale_map:
             return
 
-        buys = self._decode_whale_buys(logs, address_map)
-        sells = self._decode_whale_sells(logs, address_map)
-        log.debug(
-            "WhaleChainMonitor: blocks %d→%d, %d event(s), %d whale buy(s), %d whale sell(s)",
+        # Cap range to avoid massive queries after extended downtime
+        from_block = max(from_block, to_block - self._MAX_BACKFILL_BLOCKS)
+
+        loop = asyncio.get_event_loop()
+        all_logs = await loop.run_in_executor(None, self._fetch_logs_http, from_block, to_block)
+        if not all_logs:
+            return
+
+        whale_map_snapshot = self._whale_map.copy()
+        buys = self._decode_whale_buys(all_logs, whale_map_snapshot, {})
+        sells = self._decode_whale_sells(all_logs, whale_map_snapshot, {})
+        log.info(
+            "WhaleChainMonitor: backfill %d→%d — %d log(s), %d buy(s), %d sell(s)",
             from_block,
             to_block,
-            len(logs),
+            len(all_logs),
             len(buys),
             len(sells),
         )
 
-        if buys or sells:
-            detected_at = datetime.now(UTC)
-            for trade, whale_address in buys:
-                block_ts = trade.get("timestamp")
-                if block_ts:
-                    block_dt = datetime.fromtimestamp(block_ts, tz=UTC)
-                    lag_s = (detected_at - block_dt).total_seconds()
-                    log.info(
-                        "WhaleChainMonitor: ENTRY detected for %s — block ts %s, detected at %s, lag=%.1fs",
-                        whale_address[:10],
-                        block_dt.strftime("%H:%M:%S"),
-                        detected_at.strftime("%H:%M:%S"),
-                        lag_s,
-                    )
-                try:
-                    await self._dispatch_entry(trade, whale_address)
-                except Exception as exc:
-                    log.error(
-                        "WhaleChainMonitor: entry dispatch error for %s: %s",
-                        whale_address[:10],
-                        exc,
-                    )
+        # Backfill dispatches run sequentially to preserve event ordering
+        for trade, whale_address in buys:
+            await self._dispatch_entry(trade, whale_address)
+        for trade, whale_address in sells:
+            await self._dispatch_exit(trade, whale_address)
 
-            for trade, whale_address in sells:
-                block_ts = trade.get("timestamp")
-                if block_ts:
-                    block_dt = datetime.fromtimestamp(block_ts, tz=UTC)
-                    lag_s = (detected_at - block_dt).total_seconds()
-                    log.info(
-                        "WhaleChainMonitor: EXIT detected for %s — block ts %s, detected at %s, lag=%.1fs",
-                        whale_address[:10],
-                        block_dt.strftime("%H:%M:%S"),
-                        detected_at.strftime("%H:%M:%S"),
-                        lag_s,
-                    )
-                try:
-                    await self._dispatch_exit(trade, whale_address)
-                except Exception as exc:
-                    log.error(
-                        "WhaleChainMonitor: dispatch error for %s: %s",
-                        whale_address[:10],
-                        exc,
-                    )
-
-        self._last_block = to_block
-        poll_ms = (datetime.now(UTC) - poll_start).total_seconds() * 1000
-        if poll_ms > 3000:
-            log.warning(
-                "WhaleChainMonitor: slow poll %.0fms (blocks %d→%d)", poll_ms, from_block, to_block
-            )
-
-    # ------------------------------------------------------------------
-    # Log fetching
-    # ------------------------------------------------------------------
-
-    # Maximum blocks per eth_getLogs request. Free-tier RPCs typically cap at 100-2000.
-    # 100 is conservative and works across Ankr, Infura, Alchemy free tiers.
-    _MAX_BLOCKS_PER_QUERY = 100
-
-    async def _fetch_logs(self, from_block: int, to_block: int, whale_addresses: list[str]) -> list:
-        """Fetch OrderFilled logs filtered by whale addresses.
-
-        Topics layout (all indexed):
-          [0] event signature
-          [1] orderHash  (skip — any)
-          [2] maker      (topic position for whale-as-maker filter)
-          [3] taker      (topic position for whale-as-taker filter)
-
-        Maker and taker queries run concurrently via asyncio.gather to halve wall-clock
-        latency per chunk — each RPC call takes ~1s through the VPN, so parallel dispatch
-        brings a 2-query chunk from ~2s down to ~1s.
-        Large block ranges are split into chunks to stay within provider limits.
-        """
-        loop = asyncio.get_event_loop()
-
-        # Pad each address to 32 bytes as required by eth_getLogs topic filtering
-        padded = ["0x" + addr.lower().replace("0x", "").zfill(64) for addr in whale_addresses]
-
+    def _fetch_logs_http(self, from_block: int, to_block: int) -> list:
+        """Synchronous eth_getLogs over HTTP. Safe to run in thread executor."""
+        contract_addrs = [
+            Web3.to_checksum_address(CTF_EXCHANGE),
+            Web3.to_checksum_address(NEG_RISK_CTF_EXCHANGE),
+        ]
         logs = []
-        # Both exchanges are queried: NegRisk handles binary "Up or Down" markets;
-        # standard CTF_EXCHANGE handles other conditional token markets.
-        for contract_addr in (NEG_RISK_CTF_EXCHANGE, CTF_EXCHANGE):
-            checksum = Web3.to_checksum_address(contract_addr)
-
-            # Split into chunks to respect provider block range limits
-            chunk_start = from_block
-            while chunk_start <= to_block:
-                chunk_end = min(chunk_start + self._MAX_BLOCKS_PER_QUERY - 1, to_block)
-                base = {"fromBlock": chunk_start, "toBlock": chunk_end, "address": checksum}
-
-                # Fire maker and taker queries concurrently — both are blocking I/O so
-                # run_in_executor offloads each to a thread, gather awaits both at once.
-                maker_filter = {**base, "topics": [self._event_sig, None, padded]}
-                taker_filter = {**base, "topics": [self._event_sig, None, None, padded]}
-
-                maker_result, taker_result = await asyncio.gather(
-                    loop.run_in_executor(None, self._w3.eth.get_logs, maker_filter),
-                    loop.run_in_executor(None, self._w3.eth.get_logs, taker_filter),
+        chunk = from_block
+        while chunk <= to_block:
+            end = min(chunk + self._MAX_BLOCKS_PER_QUERY - 1, to_block)
+            try:
+                logs.extend(
+                    self._http_w3.eth.get_logs(
+                        {
+                            "fromBlock": chunk,
+                            "toBlock": end,
+                            "address": contract_addrs,
+                            "topics": [self._event_sig],
+                        }
+                    )
                 )
-                logs.extend(maker_result)
-                logs.extend(taker_result)
-
-                chunk_start = chunk_end + 1
-
+            except Exception as exc:
+                log.warning("WhaleChainMonitor: getLogs error blocks %d→%d: %s", chunk, end, exc)
+            chunk = end + 1
         return logs
 
     # ------------------------------------------------------------------
+    # Whale map
+    # ------------------------------------------------------------------
+
+    async def _maybe_refresh_whale_map(self):
+        now = datetime.now(UTC)
+        if (
+            self._whale_map_ts is not None
+            and (now - self._whale_map_ts).total_seconds() < self._WHALE_MAP_TTL_S
+        ):
+            return
+        loop = asyncio.get_event_loop()
+
+        def _load():
+            db = SessionLocal()
+            try:
+                rows = db.query(Whale.address).filter_by(is_active=True).all()
+                return {r[0].lower(): r[0] for r in rows}
+            finally:
+                db.close()
+
+        self._whale_map = await loop.run_in_executor(None, _load)
+        self._whale_map_ts = now
+
+    # ------------------------------------------------------------------
+    # RPC helpers (all run in executor — no sync RPC on the event loop)
+    # ------------------------------------------------------------------
+
+    async def _get_block_number(self) -> int | None:
+        loop = asyncio.get_event_loop()
+        try:
+            return await loop.run_in_executor(None, lambda: self._http_w3.eth.block_number)
+        except Exception as exc:
+            log.warning("WhaleChainMonitor: block_number error: %s", exc)
+            return None
+
+    async def _get_block_timestamp(self, block_num: int) -> int:
+        loop = asyncio.get_event_loop()
+        try:
+            block = await loop.run_in_executor(None, lambda: self._http_w3.eth.get_block(block_num))
+            return int(block["timestamp"])
+        except Exception:
+            return int(datetime.now(UTC).timestamp())
+
+    # ------------------------------------------------------------------
+    # Log normalization: WS JSON (hex strings) → web3 AttributeDict
+    # ------------------------------------------------------------------
+
+    def _normalize_log(self, result: dict) -> AttributeDict | None:
+        """Convert raw WebSocket log fields to the format web3 process_log expects."""
+        try:
+            return AttributeDict(
+                {
+                    "address": Web3.to_checksum_address(result["address"]),
+                    "topics": [HexBytes(t) for t in result.get("topics", [])],
+                    "data": HexBytes(result.get("data", "0x")),
+                    "blockNumber": int(result["blockNumber"], 16),
+                    "transactionHash": HexBytes(result["transactionHash"]),
+                    "logIndex": int(result.get("logIndex", "0x0"), 16),
+                    "blockHash": HexBytes(result.get("blockHash", "0x" + "0" * 64)),
+                    "transactionIndex": int(result.get("transactionIndex", "0x0"), 16),
+                    "removed": result.get("removed", False),
+                }
+            )
+        except Exception as exc:
+            log.debug("WhaleChainMonitor: normalize_log error: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------
     # Log decoding
+    # block_ts_cache is pre-populated for WS events (avoids RPC on event loop);
+    # empty dict is passed for backfill (runs in executor, RPC is fine there).
     # ------------------------------------------------------------------
 
     def _decode_whale_sells(
-        self, logs: list, address_map: dict[str, str]
+        self,
+        logs: list,
+        address_map: dict[str, str],
+        block_ts_cache: dict[int, int],
     ) -> list[tuple[dict, str]]:
-        """
-        Decode OrderFilled logs and return (trade_dict, original_whale_address)
-        for each event where a tracked whale is SELLING conditional tokens.
-
-        Asset ID convention:  0 = USDC,  non-zero = conditional token.
-        Case A (whale is maker): whale gives conditional tokens → makerAssetId != 0
-        Case B (whale is taker): whale gives conditional tokens → takerAssetId != 0
-        """
-        whale_addrs_lower = set(address_map.keys())
+        """Decode OrderFilled logs and return (trade_dict, whale_address) for whale sells."""
+        whale_addrs = set(address_map.keys())
         sells: list[tuple[dict, str]] = []
-        block_ts_cache: dict[int, int] = {}
 
         for raw_log in logs:
             try:
@@ -269,7 +424,6 @@ class WhaleChainMonitor:
                 contract = (
                     self._ctf_contract if log_addr == CTF_EXCHANGE.lower() else self._neg_contract
                 )
-
                 event = contract.events.OrderFilled().process_log(raw_log)
                 args = event["args"]
 
@@ -280,19 +434,17 @@ class WhaleChainMonitor:
                 maker_amount = args["makerAmountFilled"]
                 taker_amount = args["takerAmountFilled"]
 
-                whale_lower = None
-                token_id = None
-                share_amount = 0.0
-                usdc_amount = 0.0
+                whale_lower = token_id = None
+                share_amount = usdc_amount = 0.0
 
-                # Case A: whale is maker, selling conditional tokens for USDC
-                if maker in whale_addrs_lower and maker_asset != 0:
+                # Whale is maker, selling conditional tokens for USDC
+                if maker in whale_addrs and maker_asset != 0:
                     whale_lower = maker
                     token_id = str(maker_asset)
                     share_amount = maker_amount / 1e6
                     usdc_amount = taker_amount / 1e6
-                # Case B: whale is taker, giving conditional tokens (gets USDC)
-                elif taker in whale_addrs_lower and taker_asset != 0:
+                # Whale is taker, giving conditional tokens (receives USDC)
+                elif taker in whale_addrs and taker_asset != 0:
                     whale_lower = taker
                     token_id = str(taker_asset)
                     share_amount = taker_amount / 1e6
@@ -302,47 +454,48 @@ class WhaleChainMonitor:
                     continue
 
                 price = usdc_amount / max(share_amount, 0.000001)
-
                 block_num = raw_log["blockNumber"]
                 if block_num not in block_ts_cache:
                     try:
-                        block = self._w3.eth.get_block(block_num)
+                        block = self._http_w3.eth.get_block(block_num)
                         block_ts_cache[block_num] = int(block["timestamp"])
                     except Exception:
                         block_ts_cache[block_num] = int(datetime.now(UTC).timestamp())
 
-                trade = {
-                    "transactionHash": raw_log["transactionHash"].hex(),
-                    "side": "SELL",
-                    "asset": token_id,
-                    "conditionId": "",  # enriched in _dispatch_exit from CopiedBet
-                    "price": price,
-                    "usdcSize": usdc_amount,
-                    "shares": share_amount,
-                    "timestamp": block_ts_cache[block_num],
-                    "outcome": "",  # enriched in _dispatch_exit from CopiedBet
-                    "question": "",  # enriched in _dispatch_exit from CopiedBet
-                }
+                tx_hash = raw_log["transactionHash"]
+                tx_hex = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
 
-                sells.append((trade, address_map[whale_lower]))
-
+                sells.append(
+                    (
+                        {
+                            "transactionHash": tx_hex,
+                            "side": "SELL",
+                            "asset": token_id,
+                            "conditionId": "",
+                            "price": price,
+                            "usdcSize": usdc_amount,
+                            "shares": share_amount,
+                            "timestamp": block_ts_cache[block_num],
+                            "outcome": "",
+                            "question": "",
+                        },
+                        address_map[whale_lower],
+                    )
+                )
             except Exception as exc:
-                log.debug("WhaleChainMonitor: log decode error: %s", exc)
+                log.debug("WhaleChainMonitor: sell decode error: %s", exc)
 
         return sells
 
-    def _decode_whale_buys(self, logs: list, address_map: dict[str, str]) -> list[tuple[dict, str]]:
-        """
-        Decode OrderFilled logs and return (trade_dict, original_whale_address)
-        for each event where a tracked whale is BUYING conditional tokens.
-
-        Asset ID convention:  0 = USDC,  non-zero = conditional token.
-        Case A (whale is maker): whale gives USDC → makerAssetId == 0, takerAssetId != 0
-        Case B (whale is taker): whale gives USDC → takerAssetId == 0, makerAssetId != 0
-        """
-        whale_addrs_lower = set(address_map.keys())
+    def _decode_whale_buys(
+        self,
+        logs: list,
+        address_map: dict[str, str],
+        block_ts_cache: dict[int, int],
+    ) -> list[tuple[dict, str]]:
+        """Decode OrderFilled logs and return (trade_dict, whale_address) for whale buys."""
+        whale_addrs = set(address_map.keys())
         buys: list[tuple[dict, str]] = []
-        block_ts_cache: dict[int, int] = {}
 
         for raw_log in logs:
             try:
@@ -350,7 +503,6 @@ class WhaleChainMonitor:
                 contract = (
                     self._ctf_contract if log_addr == CTF_EXCHANGE.lower() else self._neg_contract
                 )
-
                 event = contract.events.OrderFilled().process_log(raw_log)
                 args = event["args"]
 
@@ -361,19 +513,17 @@ class WhaleChainMonitor:
                 maker_amount = args["makerAmountFilled"]
                 taker_amount = args["takerAmountFilled"]
 
-                whale_lower = None
-                token_id = None
-                share_amount = 0.0
-                usdc_amount = 0.0
+                whale_lower = token_id = None
+                share_amount = usdc_amount = 0.0
 
-                # Case A: whale is maker, gives USDC, receives conditional tokens
-                if maker in whale_addrs_lower and maker_asset == 0 and taker_asset != 0:
+                # Whale is maker, gives USDC, receives conditional tokens
+                if maker in whale_addrs and maker_asset == 0 and taker_asset != 0:
                     whale_lower = maker
                     token_id = str(taker_asset)
                     usdc_amount = maker_amount / 1e6
                     share_amount = taker_amount / 1e6
-                # Case B: whale is taker, gives USDC, receives conditional tokens
-                elif taker in whale_addrs_lower and taker_asset == 0 and maker_asset != 0:
+                # Whale is taker, gives USDC, receives conditional tokens
+                elif taker in whale_addrs and taker_asset == 0 and maker_asset != 0:
                     whale_lower = taker
                     token_id = str(maker_asset)
                     usdc_amount = taker_amount / 1e6
@@ -383,73 +533,66 @@ class WhaleChainMonitor:
                     continue
 
                 price = usdc_amount / max(share_amount, 0.000001)
-
                 block_num = raw_log["blockNumber"]
                 if block_num not in block_ts_cache:
                     try:
-                        block = self._w3.eth.get_block(block_num)
+                        block = self._http_w3.eth.get_block(block_num)
                         block_ts_cache[block_num] = int(block["timestamp"])
                     except Exception:
                         block_ts_cache[block_num] = int(datetime.now(UTC).timestamp())
 
-                trade = {
-                    "transactionHash": raw_log["transactionHash"].hex(),
-                    "side": "BUY",
-                    "asset": token_id,
-                    "conditionId": "",  # resolved in _dispatch_entry via Gamma API
-                    "price": price,
-                    "usdcSize": usdc_amount,
-                    "shares": share_amount,
-                    "timestamp": block_ts_cache[block_num],
-                    "outcome": "",  # resolved in _dispatch_entry via Gamma API
-                    "question": "",  # resolved in _dispatch_entry via Gamma API
-                }
+                tx_hash = raw_log["transactionHash"]
+                tx_hex = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
 
-                buys.append((trade, address_map[whale_lower]))
-
+                buys.append(
+                    (
+                        {
+                            "transactionHash": tx_hex,
+                            "side": "BUY",
+                            "asset": token_id,
+                            "conditionId": "",
+                            "price": price,
+                            "usdcSize": usdc_amount,
+                            "shares": share_amount,
+                            "timestamp": block_ts_cache[block_num],
+                            "outcome": "",
+                            "question": "",
+                        },
+                        address_map[whale_lower],
+                    )
+                )
             except Exception as exc:
-                log.debug("WhaleChainMonitor: buy log decode error: %s", exc)
+                log.debug("WhaleChainMonitor: buy decode error: %s", exc)
 
         return buys
 
     # ------------------------------------------------------------------
     # Entry dispatch
+    # Phase 1: async HTTP (market lookup, live price) — runs on event loop
+    # Phase 2: sync DB + CLOB order placement — runs in thread executor
     # ------------------------------------------------------------------
 
     async def _dispatch_entry(self, trade: dict, whale_address: str):
-        """
-        Open a copied position for a whale's on-chain buy.
-
-        Phase 1 (no DB held): resolve all market metadata and live price via HTTP.
-        Phase 2 (brief DB transaction): persist WhaleBet + CopiedBet and commit.
-
-        Keeping HTTP and DB work separate ensures the write lock is never held
-        during async network calls, preventing 'database is locked' errors.
-        """
         token_id = trade["asset"]
-        whale_lower = whale_address.lower()
-
         client = getattr(self._whale_monitor, "_client", None)
         if not client:
             log.warning("WhaleChainMonitor: no client for entry dispatch")
             return
 
-        # Phase 1: ALL async HTTP — no DB connection open
-        # Resolve market metadata — cached 1 hr after first hit.
-        market_info = {}
+        # Phase 1: async HTTP
+        market_info: dict = {}
         try:
             market_info = await client.get_market("", token_id=token_id) or {}
         except Exception as exc:
-            log.debug("WhaleChainMonitor: market lookup failed for %s: %s", token_id[:16], exc)
+            log.debug("WhaleChainMonitor: market lookup failed %s: %s", token_id[:16], exc)
 
         condition_id = market_info.get("conditionId") or market_info.get("condition_id") or ""
         question = market_info.get("question") or market_info.get("title") or ""
-
         tokens = market_info.get("tokens") or []
         if not tokens and condition_id:
             try:
-                full_market = await client.get_market(condition_id) or {}
-                tokens = full_market.get("tokens") or []
+                full = await client.get_market(condition_id) or {}
+                tokens = full.get("tokens") or []
             except Exception:
                 pass
 
@@ -463,7 +606,6 @@ class WhaleChainMonitor:
         trade["question"] = question
         trade["outcome"] = outcome
 
-        # Fetch live price and taker fee before opening DB
         price_result, fee_result = await asyncio.gather(
             client.get_best_price(token_id, force_refresh=True),
             client.get_taker_fee_async(token_id),
@@ -474,39 +616,77 @@ class WhaleChainMonitor:
 
         log.info(
             "WhaleChainMonitor: opening position whale=%s token=%s...%s "
-            "outcome=%s shares=%.4f on-chain-price=%.4f usdc=%.2f",
+            "outcome=%s price=%.4f usdc=%.2f",
             whale_address[:10],
             token_id[:10],
             token_id[-6:],
             outcome,
-            trade["shares"],
             trade["price"],
             trade["usdcSize"],
         )
 
-        # Phase 2: brief DB transaction — writes only, no HTTP calls
+        # Phase 2: sync DB + bet_engine in executor
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            self._sync_open_position,
+            trade,
+            whale_address,
+            market_info,
+            live_price,
+            taker_fee_bps,
+        )
+
+    def _sync_open_position(
+        self,
+        trade: dict,
+        whale_address: str,
+        market_info: dict,
+        live_price: float | None,
+        taker_fee_bps: int,
+    ):
+        """Sync DB work for entry dispatch. Runs in thread executor."""
+        whale_lower = whale_address.lower()
         db = SessionLocal()
         try:
             whale_rec = db.query(Whale).filter(Whale.address.ilike(whale_lower)).first()
             if not whale_rec:
                 log.warning(
-                    "WhaleChainMonitor: no Whale record for %s — skipping entry",
+                    "WhaleChainMonitor: no Whale record %s — skipping entry",
                     whale_address[:10],
                 )
                 return
 
             ts = datetime.fromtimestamp(trade["timestamp"], tz=UTC)
-            whale_bet = await self._whale_monitor._save_whale_bet(trade, whale_rec, ts, db)
-            if not whale_bet:
-                log.debug(
-                    "WhaleChainMonitor: duplicate entry tx for token=%s — skipping",
-                    token_id[:16],
-                )
+            tx_hash = trade.get("transactionHash", "")
+            if tx_hash.startswith("0x"):
+                tx_hash = tx_hash[2:]
+
+            whale_bet = WhaleBet(
+                whale_id=whale_rec.id,
+                market_id=trade.get("conditionId", ""),
+                token_id=trade.get("asset", ""),
+                question=trade.get("question", ""),
+                side="BUY",
+                outcome=trade.get("outcome", "YES"),
+                price=trade.get("price", 0.5),
+                size_usdc=trade.get("usdcSize", 0.0),
+                size_shares=trade.get("shares", 0.0),
+                timestamp=ts,
+                tx_hash=tx_hash or None,
+                bet_type="OPEN",
+            )
+            db.add(whale_bet)
+            try:
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+                log.debug("WhaleChainMonitor: duplicate entry tx %s — skipping", tx_hash[:16])
                 return
 
             active_sessions = db.query(MonitoringSession).filter_by(is_active=True).all()
             if not active_sessions:
-                log.debug("WhaleChainMonitor: no active sessions for entry dispatch")
+                db.commit()
                 return
 
             for session in active_sessions:
@@ -518,7 +698,6 @@ class WhaleChainMonitor:
                     live_price=live_price,
                     taker_fee_bps=taker_fee_bps,
                 )
-
             db.commit()
         except Exception:
             db.rollback()
@@ -528,24 +707,55 @@ class WhaleChainMonitor:
 
     # ------------------------------------------------------------------
     # Exit dispatch
+    # Phase 1: sync DB read (load open position) — runs in executor
+    # Phase 2: async HTTP (live exit price) — runs on event loop
+    # Phase 3: sync DB write + CLOB sell — runs in executor
     # ------------------------------------------------------------------
 
     async def _dispatch_exit(self, trade: dict, whale_address: str):
-        """
-        Close our position matching the whale's on-chain sell.
-
-        Phase 1 (brief DB read): load open positions and position metadata.
-        Phase 2 (no DB held): fetch live exit price via HTTP.
-        Phase 3 (brief DB write): persist WhaleBet exit + close CopiedBet.
-        """
         token_id = trade["asset"]
         whale_lower = whale_address.lower()
 
-        # Phase 1: brief read — extract what we need then close session
+        # Phase 1: sync DB read in executor
+        loop = asyncio.get_event_loop()
+        pos_data = await loop.run_in_executor(None, self._sync_load_position, token_id, whale_lower)
+        if pos_data is None:
+            return
+
+        trade["conditionId"], trade["outcome"], trade["question"], pos_mode = pos_data
+
+        # Phase 2: async HTTP — fetch live exit price
+        live_exit_price: float | None = None
+        client = getattr(self._whale_monitor, "_client", None)
+        if client:
+            with contextlib.suppress(Exception):
+                live_exit_price = await client.get_best_price(token_id, side="SELL")
+
+        log.info(
+            "WhaleChainMonitor: closing position whale=%s token=%s...%s price=%.4f",
+            whale_address[:10],
+            token_id[:10],
+            token_id[-6:],
+            trade["price"],
+        )
+
+        # Phase 3: sync DB write + bet_engine in executor
+        await loop.run_in_executor(
+            None,
+            self._sync_close_position,
+            trade,
+            whale_address,
+            pos_mode,
+            live_exit_price,
+        )
+
+    def _sync_load_position(
+        self, token_id: str, whale_lower: str
+    ) -> tuple[str, str, str, str] | None:
+        """Load open position metadata. Returns (condition_id, outcome, question, mode) or None."""
         db = SessionLocal()
-        pos_mode: str | None = None
         try:
-            open_positions = (
+            open_pos = (
                 db.query(CopiedBet)
                 .filter(
                     CopiedBet.status == "OPEN",
@@ -553,68 +763,75 @@ class WhaleChainMonitor:
                     CopiedBet.whale_address.ilike(whale_lower),
                 )
                 .order_by(CopiedBet.opened_at.asc())
-                .all()
+                .first()
             )
-
-            if not open_positions:
+            if not open_pos:
                 sample = (
-                    db.query(CopiedBet.token_id, CopiedBet.whale_address, CopiedBet.market_id)
+                    db.query(CopiedBet.token_id, CopiedBet.whale_address)
                     .filter_by(status="OPEN")
                     .limit(5)
                     .all()
                 )
                 log.warning(
-                    "WhaleChainMonitor: EXIT no match — searched token=%s whale=%s | "
-                    "DB open positions (up to 5): %s",
+                    "WhaleChainMonitor: EXIT no match — token=%s whale=%s | open positions: %s",
                     token_id,
                     whale_lower,
                     [(r[0], r[1][:10] if r[1] else None) for r in sample],
                 )
-                return
-
-            open_pos = open_positions[0]
-            trade["conditionId"] = open_pos.market_id or ""
-            trade["outcome"] = getattr(open_pos, "outcome", "") or ""
-            trade["question"] = getattr(open_pos, "question", "") or ""
-            pos_mode = open_pos.mode
+                return None
+            return (
+                open_pos.market_id or "",
+                getattr(open_pos, "outcome", "") or "",
+                getattr(open_pos, "question", "") or "",
+                open_pos.mode,
+            )
         finally:
             db.close()
 
-        # Phase 2: HTTP — fetch live exit price with no DB session held
-        live_exit_price = None
-        client = getattr(self._whale_monitor, "_client", None)
-        if client and token_id:
-            with contextlib.suppress(Exception):
-                live_exit_price = await client.get_best_price(token_id, side="SELL")
-
-        log.info(
-            "WhaleChainMonitor: closing position whale=%s token=%s...%s "
-            "shares=%.4f on-chain-price=%.4f",
-            whale_address[:10],
-            token_id[:10],
-            token_id[-6:],
-            trade["shares"],
-            trade["price"],
-        )
-
-        # Phase 3: brief write transaction
+    def _sync_close_position(
+        self,
+        trade: dict,
+        whale_address: str,
+        pos_mode: str,
+        live_exit_price: float | None,
+    ):
+        """Sync DB work for exit dispatch. Runs in thread executor."""
+        whale_lower = whale_address.lower()
         db = SessionLocal()
         try:
             whale_rec = db.query(Whale).filter(Whale.address.ilike(whale_lower)).first()
             if not whale_rec:
                 log.warning(
-                    "WhaleChainMonitor: no Whale record for %s — skipping",
+                    "WhaleChainMonitor: no Whale record %s — skipping exit",
                     whale_address[:10],
                 )
                 return
 
             ts = datetime.fromtimestamp(trade["timestamp"], tz=UTC)
-            whale_bet = await self._whale_monitor._save_whale_bet(trade, whale_rec, ts, db)
-            if not whale_bet:
-                log.debug(
-                    "WhaleChainMonitor: duplicate tx_hash for token=%s — already processed",
-                    token_id[:16],
-                )
+            tx_hash = trade.get("transactionHash", "")
+            if tx_hash.startswith("0x"):
+                tx_hash = tx_hash[2:]
+
+            whale_bet = WhaleBet(
+                whale_id=whale_rec.id,
+                market_id=trade.get("conditionId", ""),
+                token_id=trade.get("asset", ""),
+                question=trade.get("question", ""),
+                side="SELL",
+                outcome=trade.get("outcome", "YES"),
+                price=trade.get("price", 0.5),
+                size_usdc=trade.get("usdcSize", 0.0),
+                size_shares=trade.get("shares", 0.0),
+                timestamp=ts,
+                tx_hash=tx_hash or None,
+                bet_type="EXIT",
+            )
+            db.add(whale_bet)
+            try:
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+                log.debug("WhaleChainMonitor: duplicate exit tx %s — skipping", tx_hash[:16])
                 return
 
             session = (
@@ -624,10 +841,7 @@ class WhaleChainMonitor:
                 .first()
             )
             if not session:
-                log.debug(
-                    "WhaleChainMonitor: no session for mode=%s — skipping",
-                    pos_mode,
-                )
+                db.commit()
                 return
 
             exit_result = self._bet_engine._handle_exit(
@@ -639,7 +853,7 @@ class WhaleChainMonitor:
                 log.warning(
                     "WhaleChainMonitor: sell FOK cancelled for token=%s — "
                     "orphan checker will retry in ~60s",
-                    token_id[:16],
+                    trade["asset"][:16],
                 )
         except Exception:
             db.rollback()

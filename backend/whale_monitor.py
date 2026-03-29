@@ -92,18 +92,9 @@ class WhaleMonitor:
             from backend.whale_chain_monitor import WhaleChainMonitor
 
             self._chain_monitor = WhaleChainMonitor(self._bet_engine, self)
-            self._resolution_scheduler.add_job(
-                func=self._chain_monitor.poll,
-                trigger=IntervalTrigger(seconds=settings.CHAIN_EXIT_POLL_INTERVAL_SECONDS),
-                id="chain_exit_monitor",
-                replace_existing=True,
-                max_instances=1,
-                coalesce=True,
-            )
             logger.info(
-                "On-chain exit monitor registered (every %ds) — "
-                "activity-API exit polling suppressed",
-                settings.CHAIN_EXIT_POLL_INTERVAL_SECONDS,
+                "On-chain exit monitor initialised (WebSocket) — "
+                "call start_chain_monitor_task() from lifespan to activate"
             )
 
         self._resolution_scheduler.add_job(
@@ -284,9 +275,23 @@ class WhaleMonitor:
 
         logger.info("Whale monitor stopped (resolution checker still running)")
 
+    def start_chain_monitor_task(self) -> "asyncio.Task | None":
+        """Start the WebSocket chain monitor as an asyncio Task. Call from lifespan."""
+        if not settings.CHAIN_EXIT_ENABLED:
+            return None
+        monitor = getattr(self, "_chain_monitor", None)
+        if monitor is None:
+            return None
+        task = monitor.start()
+        logger.info("On-chain exit monitor WebSocket task started")
+        return task
+
     def shutdown(self):
         """Full shutdown including the permanent resolution scheduler."""
         self.stop_monitoring()
+        monitor = getattr(self, "_chain_monitor", None)
+        if monitor is not None:
+            monitor.stop()
         if self._resolution_scheduler.running:
             self._resolution_scheduler.shutdown(wait=False)
             logger.info("Permanent resolution checker stopped")

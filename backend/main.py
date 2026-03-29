@@ -101,11 +101,12 @@ whale_monitor._stop_loss_monitor = stop_loss_monitor
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start Discord bot task; clean up on shutdown."""
+    """Start Discord bot and chain monitor tasks; clean up on shutdown."""
     discord_task: asyncio.Task | None = None
     if discord_bot is not None:
         discord_task = asyncio.create_task(discord_bot.start())
         logger.info("Discord bot task started")
+    whale_monitor.start_chain_monitor_task()
     yield
     # Graceful shutdown
     if discord_bot is not None:
