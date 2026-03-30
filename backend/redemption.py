@@ -244,7 +244,7 @@ async def redeem_position(position: dict) -> dict:
             args=[
                 Web3.to_checksum_address(USDC_POLYGON),
                 ZERO_BYTES32,
-                bytes.fromhex(condition_id.lstrip("0x")),
+                bytes.fromhex(condition_id.removeprefix("0x")),
                 index_sets,
             ],
         )

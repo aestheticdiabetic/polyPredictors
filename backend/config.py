@@ -145,6 +145,13 @@ class Settings:
     # A trader averaging $5 per prediction needs $100,000 vol for ~20,000 predictions.
     MIN_WHALE_VOLUME_USDC: float = float(os.getenv("MIN_WHALE_VOLUME_USDC", "1000000"))
 
+    # Proactive CLOB API rate limit (requests per second).  Enforced client-side
+    # via a token bucket so the VPS IP never triggers Polymarket's nginx rate
+    # limiter.  Lower = safer but slower; 5 is a conservative default that
+    # comfortably handles concurrent buys + sell retries without hitting the
+    # undocumented ~10-20 req/s nginx threshold.
+    CLOB_MAX_RATE_PER_SEC: float = float(os.getenv("CLOB_MAX_RATE_PER_SEC", "5.0"))
+
     # Maximum number of IOC retry attempts before declaring a sell exhausted.
     # Default 3. Increase if your markets are thin and orders frequently cancel.
     SELL_MAX_FOK_RETRIES: int = int(os.getenv("SELL_MAX_FOK_RETRIES", "3"))
@@ -163,7 +170,7 @@ class Settings:
     SELL_CLOSE_RETRIES: int = int(os.getenv("SELL_CLOSE_RETRIES", "4"))
 
     # Seconds to wait between sell retry attempts. Default 3.
-    SELL_CLOSE_RETRY_DELAY_SECONDS: int = int(os.getenv("SELL_CLOSE_RETRY_DELAY_SECONDS", "1"))
+    SELL_CLOSE_RETRY_DELAY_SECONDS: int = int(os.getenv("SELL_CLOSE_RETRY_DELAY_SECONDS", "3"))
 
     # MATIC/USD conversion rate used to convert Polygon gas fees to USDC for P&L tracking.
     # Update when MATIC price drifts significantly. Gas costs are small (< $0.05/tx)

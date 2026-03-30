@@ -6,11 +6,43 @@ All methods are async using httpx.
 import contextlib
 import json
 import logging
+import threading
 import time
 
 import httpx
 
 from backend.config import settings
+
+
+class _TokenBucket:
+    """Thread-safe token bucket for client-side CLOB rate limiting.
+
+    Allows up to ``rate`` tokens per second with a burst capacity of
+    ``burst`` tokens.  Callers block in ``acquire()`` until a token is
+    available, so request throughput is smoothed to ``rate`` req/s and
+    Polymarket's nginx rate limiter is never triggered.
+    """
+
+    def __init__(self, rate: float, burst: int = 3) -> None:
+        self._rate = rate
+        self._burst = float(burst)
+        self._tokens = float(burst)
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        """Block until a token is available, then consume one."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(self._burst, self._tokens + (now - self._last) * self._rate)
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self._rate
+            time.sleep(wait)
+
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +86,8 @@ class PolymarketClient:
         self._clob_client = None
         # {token_id: taker_fee_bps} — cached taker fees fetched from CLOB /markets
         self._taker_fee_cache: dict = {}
+        # Proactive CLOB rate limiter — prevents nginx 400 bursts
+        self._clob_limiter = _TokenBucket(rate=settings.CLOB_MAX_RATE_PER_SEC, burst=3)
 
     async def close(self):
         await self._http.aclose()
@@ -579,6 +613,7 @@ class PolymarketClient:
             signed_order = c.create_market_order(
                 order_args, PartialCreateOrderOptions(neg_risk=neg_risk)
             )
+            self._clob_limiter.acquire()
             resp = c.post_order(signed_order)
             return resp if isinstance(resp, dict) else {"status": "ok", "response": str(resp)}
 
@@ -712,6 +747,7 @@ class PolymarketClient:
             # FAK (Fill-and-Kill): fill as much as possible immediately, cancel unfilled remainder.
             # Handles fractional position overages (e.g. 29.11 vs whale's 29) without
             # retrying — fills what the book offers and discards the dust instantly.
+            self._clob_limiter.acquire()
             resp = client.post_order(signed_order, OrderType.FAK)
             return resp if isinstance(resp, dict) else {"status": "ok", "response": str(resp)}
 

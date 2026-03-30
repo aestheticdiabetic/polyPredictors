@@ -156,6 +156,12 @@ python run.py
 | `SELL_CLOSE_RETRIES` | `4` | Transient-failure retries before waiting for the next poll cycle |
 | `SELL_CLOSE_RETRY_DELAY_SECONDS` | `1` | Seconds between sell retry attempts |
 
+### Rate Limiting
+
+| Variable | Default | Description |
+|---|---|---|
+| `CLOB_MAX_RATE_PER_SEC` | `5.0` | Client-side CLOB request rate cap (req/s). Lower = safer; Polymarket's nginx threshold is ~10–20 req/s |
+
 ### Polling & Scheduling
 
 | Variable | Default | Description |
@@ -212,6 +218,43 @@ docker compose -f docker-compose.vpn.yml down
 ```
 
 Add `PROXY_URL=http://localhost:8888` to `.env`. Comment it out to run without the proxy (e.g. if a system VPN is already active).
+
+## Performance & Limitations
+
+### Typical Response Times
+
+| Event | Latency | Notes |
+|---|---|---|
+| Whale buy detected | 2–4 s | API polling interval (default 2 s) + processing |
+| Whale sell detected (on-chain) | ~4 s | `eth_getLogs` monitor at 2 s poll, ~2-block finality |
+| Whale sell detected (API polling) | 2–10 s | Fallback when `CHAIN_EXIT_ENABLED=false` |
+| Drift check | < 100 ms | Background pre-fetch keeps prices fresh |
+| Order placed (buy or sell) | 1–3 s | CLOB API round-trip; token-bucket rate limiter adds ≤ 0.2 s at 5 req/s |
+| Sell retry exhaustion | up to ~12 s | `SELL_CLOSE_RETRIES=4` × `SELL_CLOSE_RETRY_DELAY_SECONDS=3` |
+| Market resolution check | 60 s | Configurable; triggers auto-redemption in REAL mode |
+| Rate-limit back-off (sell) | +15 s | Applied automatically on nginx 400 HTML responses |
+
+End-to-end copy latency from whale fill → your fill is typically **3–8 seconds** under normal API conditions. On-chain exit monitoring reduces sell detection to ~4 s regardless of API polling.
+
+### Strengths
+
+- **Low-latency sell detection** — on-chain `OrderFilled` monitor fires in ~4 s, well ahead of most API-polling copiers
+- **Drift guards protect entry quality** — asymmetric thresholds skip bets where the price has moved unfavourably while still allowing fills at a better price than the whale paid
+- **Near-miss recovery** — drift retry watchlist gives skipped bets a second chance over a configurable window rather than dropping them permanently
+- **Conviction scaling** — bet size rewards high-conviction whale trades convexly, reducing exposure on low-confidence signals
+- **Client-side rate limiting** — token bucket prevents IP throttling before it occurs; graceful 400 HTML detection skips or backs off rather than hammering the API
+- **Auto-redemption** — resolved positions are redeemed on-chain automatically; no manual claiming required
+- **Simulation parity** — optional fee simulation makes sim-mode P&L directly comparable to real-mode returns
+
+### Weaknesses & Known Limitations
+
+- **Inherent copy lag** — even at 2 s polling there is a structural delay vs. the whale's fill; fast-moving markets may have drifted past the drift cap by the time a copy order fires
+- **Market order slippage** — orders execute at the best available ask/bid, not the whale's fill price; thin order books can produce significant slippage on larger sizes
+- **Single exchange** — only Polymarket CLOB; no cross-venue arbitrage or hedging
+- **Whale quality is volume-only** — whales are filtered by raw trading volume, not profitability or edge; a high-volume losing trader will be copied faithfully
+- **Blind exit following** — sells are triggered by whale sell events rather than independent position management; if the whale sells at a bad time (panic, rebalance) the bot follows
+- **SQLite concurrency** — a single SQLite file is fine for one bot instance but will not scale to multiple concurrent writers
+- **No position netting** — multiple tranches in the same market accumulate separately; the bot does not consolidate or net positions across whales
 
 ## Disclaimer
 

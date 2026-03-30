@@ -706,6 +706,25 @@ class BetEngine:
                 except ImportError:
                     _is_poly_exc = "PolyApiException" in type(exc).__name__
                 if _is_poly_exc and mode not in ("SIMULATION", "HEDGE_SIM"):
+                    # 400 HTML = nginx/CDN rate limit; retrying immediately worsens
+                    # the situation — skip the buy instead of hammering the API.
+                    _is_rate_limited = (
+                        getattr(exc, "status_code", None) == 400 and "<html>" in str(exc).lower()
+                    )
+                    if _is_rate_limited:
+                        logger.warning(
+                            "PolyApiException 400 HTML (rate limit) on whale_bet %d — skipping buy",
+                            whale_bet.id,
+                        )
+                        return self._create_skipped_bet(
+                            whale_bet=whale_bet,
+                            session=session,
+                            bet_size_usdc=bet_size_usdc,
+                            risk_factor=risk_factor,
+                            whale_avg=whale_avg,
+                            skip_reason="Rate limited (400 HTML)",
+                            db=db,
+                        )
                     retry_price_ok, retry_price_reason = risk_calc.check_price_staleness(
                         whale_price=whale_bet.price,
                         live_price=live_price,
@@ -1267,7 +1286,13 @@ class BetEngine:
             except Exception as exc:
                 _log_retry(f"exception: {exc}")
                 if not last:
-                    _time.sleep(delay)
+                    # 400 HTML = nginx/CDN rate limit; back off substantially
+                    # rather than retrying at the normal 1-3s cadence, which
+                    # would keep the IP throttled and delay recovery.
+                    _is_rate_limited = (
+                        getattr(exc, "status_code", None) == 400 and "<html>" in str(exc).lower()
+                    )
+                    _time.sleep(15 if _is_rate_limited else delay)
                     continue
                 return None, None
 
