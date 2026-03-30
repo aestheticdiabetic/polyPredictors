@@ -103,6 +103,14 @@ class WhaleChainMonitor:
         # for the rare whale events (multiple events in the same block share a timestamp)
         self._block_ts_cache: dict[int, int] = {}
 
+        # Serialise the DB-write phase across concurrent dispatch tasks.
+        # Multiple _dispatch_entry/_dispatch_exit tasks can be created simultaneously
+        # for trades in the same block. Their Phase-1 HTTP work runs concurrently, but
+        # Phase-2 (run_in_executor → SQLite INSERT) must be serialised because SQLite
+        # only allows one writer at a time. Without this lock the concurrent writes race
+        # and raise OperationalError("database is locked") even with WAL mode enabled.
+        self._db_write_lock: asyncio.Lock = asyncio.Lock()
+
         log.info(
             "WhaleChainMonitor initialized (WS=%s..., sig=%s...)",
             self._ws_url[:50],
@@ -772,17 +780,19 @@ class WhaleChainMonitor:
             trade["usdcSize"],
         )
 
-        # Phase 2: sync DB + bet_engine in executor
+        # Phase 2: sync DB + bet_engine in executor — serialised via lock so
+        # concurrent same-block dispatches don't race on the SQLite write lock.
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            self._sync_open_position,
-            trade,
-            whale_address,
-            market_info,
-            live_price,
-            taker_fee_bps,
-        )
+        async with self._db_write_lock:
+            await loop.run_in_executor(
+                None,
+                self._sync_open_position,
+                trade,
+                whale_address,
+                market_info,
+                live_price,
+                taker_fee_bps,
+            )
 
     def _sync_open_position(
         self,
@@ -886,15 +896,16 @@ class WhaleChainMonitor:
             trade["price"],
         )
 
-        # Phase 3: sync DB write + bet_engine in executor
-        await loop.run_in_executor(
-            None,
-            self._sync_close_position,
-            trade,
-            whale_address,
-            pos_mode,
-            live_exit_price,
-        )
+        # Phase 3: sync DB write + bet_engine in executor — serialised via lock.
+        async with self._db_write_lock:
+            await loop.run_in_executor(
+                None,
+                self._sync_close_position,
+                trade,
+                whale_address,
+                pos_mode,
+                live_exit_price,
+            )
 
     def _sync_load_position(
         self, token_id: str, whale_lower: str
