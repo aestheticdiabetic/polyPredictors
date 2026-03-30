@@ -33,6 +33,35 @@ logger = logging.getLogger(__name__)
 risk_calc = RiskCalculator()
 
 
+def asset_id_matches(asset_val: str, token_id: str) -> bool:
+    """
+    Compare two asset IDs for equality, handling format differences.
+
+    Normalizes for:
+    - String stripping and whitespace
+    - Leading-zero padding differences (int comparison)
+    - Hex (0x...) vs decimal formats
+
+    Used when comparing Data API asset IDs against stored token_ids.
+    """
+    a = str(asset_val).strip()
+    t = token_id.strip()
+    if a == t:
+        return True
+    # Handle leading-zero padding differences between decimal representations
+    try:
+        return int(a) == int(t)
+    except (ValueError, TypeError):
+        pass
+    # Handle hex vs decimal
+    try:
+        a_dec = str(int(a, 16)) if a.startswith("0x") else a
+        t_dec = str(int(t, 16)) if t.startswith("0x") else t
+        return a_dec == t_dec
+    except (ValueError, TypeError):
+        return False
+
+
 @dataclass
 class _WatchItem:
     """Tracks a drift-skipped bet on a near-expiry market for fast retry."""
@@ -112,7 +141,7 @@ class BetEngine:
                 whale_bet.question = market_info.get("question") or market_info.get("title") or ""
             if not whale_bet.outcome:
                 for tok in market_info.get("tokens") or []:
-                    if str(tok.get("token_id", "")) == whale_bet.token_id:
+                    if asset_id_matches(tok.get("token_id", ""), whale_bet.token_id):
                         whale_bet.outcome = (tok.get("outcome") or "Yes").upper()
                         break
             if whale_bet.market_id or whale_bet.question:
@@ -2267,11 +2296,11 @@ class BetEngine:
                     )
                     continue
 
-                # Tokens the whale currently holds (size > 0)
+                # Tokens the whale currently holds (size > 0).
+                # Use _asset_id_matches to normalize for format differences (hex vs decimal,
+                # leading zeros, etc.) so we correctly detect when whales exit positions.
                 whale_held = {
-                    str(p.get("asset", "")).strip()
-                    for p in whale_positions
-                    if float(p.get("size", 0) or 0) > 0
+                    p.get("asset", "") for p in whale_positions if float(p.get("size", 0) or 0) > 0
                 }
 
                 for bet in bets:
@@ -2295,7 +2324,11 @@ class BetEngine:
                         )
                         continue
 
-                    if bet.token_id not in whale_held:
+                    # Check if whale still holds this token using normalized asset ID comparison
+                    whale_still_holds = any(
+                        asset_id_matches(asset, bet.token_id) for asset in whale_held
+                    )
+                    if not whale_still_holds:
                         # Case 1: whale no longer holds the token at all
                         needs_close = True
                     elif whale_obj is not None:
@@ -3440,27 +3473,8 @@ class BetEngine:
                     p.get("size"),
                 )
 
-            # Try exact match first, then strip/normalise for robustness
-            def _matches(asset_val: str) -> bool:
-                a = str(asset_val).strip()
-                t = token_id.strip()
-                if a == t:
-                    return True
-                # Handle leading-zero padding differences between decimal representations
-                try:
-                    return int(a) == int(t)
-                except (ValueError, TypeError):
-                    pass
-                # Handle hex vs decimal
-                try:
-                    a_dec = str(int(a, 16)) if a.startswith("0x") else a
-                    t_dec = str(int(t, 16)) if t.startswith("0x") else t
-                    return a_dec == t_dec
-                except (ValueError, TypeError):
-                    return False
-
             pos = next(
-                (p for p in positions if _matches(p.get("asset", ""))),
+                (p for p in positions if asset_id_matches(p.get("asset", ""), token_id)),
                 None,
             )
             if pos is not None:

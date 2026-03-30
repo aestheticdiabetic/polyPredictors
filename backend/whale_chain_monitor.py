@@ -27,6 +27,7 @@ from sqlalchemy.exc import IntegrityError
 from web3 import Web3
 from web3.datastructures import AttributeDict
 
+from backend.bet_engine import asset_id_matches
 from backend.config import settings
 from backend.database import CopiedBet, MonitoringSession, SessionLocal, Whale, WhaleBet
 from backend.redemption import CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE, ORDER_FILLED_ABI
@@ -761,7 +762,7 @@ class WhaleChainMonitor:
 
         outcome = "YES"
         for tok in tokens:
-            if str(tok.get("token_id", "")) == token_id:
+            if asset_id_matches(tok.get("token_id", ""), token_id):
                 outcome = (tok.get("outcome") or "Yes").upper()
                 break
 
