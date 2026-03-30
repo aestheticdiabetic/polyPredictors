@@ -590,6 +590,12 @@ class WhaleMonitor:
 
     async def _poll_exits_async(self, addresses: list):
         """Fetch recent activity for all whales in parallel, then handle exits."""
+        # Reset the shared httpx client so its internal transports/locks bind to
+        # the current per-thread event loop.  poll_exits_only runs on a scheduler
+        # thread that may not have used the client before, causing
+        # "bound to a different event loop" errors if the client was initialised
+        # (or last used) on a different thread's loop.
+        await self._client.reset_http_client()
         fetch_results = await asyncio.gather(
             *[self._client.get_user_activity(addr, limit=100) for addr in addresses],
             return_exceptions=True,
