@@ -596,8 +596,12 @@ class WhaleMonitor:
         # "bound to a different event loop" errors if the client was initialised
         # (or last used) on a different thread's loop.
         await self._client.reset_http_client()
+        # Only fetch one page (100 trades) per whale — we poll every 5s so at
+        # most a handful of trades will be new.  The DESC sort means recent
+        # trades are always on page 1, and _handle_exit_trades breaks on the
+        # first trade older than last_seen.
         fetch_results = await asyncio.gather(
-            *[self._client.get_user_activity(addr, limit=100) for addr in addresses],
+            *[self._client.get_user_activity(addr, limit=100, max_pages=1) for addr in addresses],
             return_exceptions=True,
         )
         for address, trades in zip(addresses, fetch_results, strict=False):
@@ -625,8 +629,10 @@ class WhaleMonitor:
                 continue
             if (now_utc - ts).total_seconds() > max_age_seconds:
                 continue
+            # Trades arrive newest-first (DESC).  Once we reach a trade at or
+            # before last_seen all subsequent trades are also older — stop early.
             if last_seen is not None and ts <= last_seen:
-                continue
+                break
             side = (trade.get("side") or trade.get("type") or "").upper()
             if side != "SELL":
                 continue
