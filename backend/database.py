@@ -26,11 +26,13 @@ Path(settings.DATABASE_URL.replace("sqlite:///", "")).parent.mkdir(parents=True,
 
 engine = create_engine(
     settings.DATABASE_URL,
-    # timeout=30: SQLite busy-wait — retry for up to 30s when another thread
+    # timeout=180: SQLite busy-wait — retry for up to 180s when another thread
     # holds the write lock instead of immediately raising OperationalError.
     # Needed because the chain monitor (2s interval) + activity API (5s) +
-    # resolution checker all write from separate APScheduler threads.
-    connect_args={"check_same_thread": False, "timeout": 60},
+    # resolution checker + bet engine all write from separate threads.
+    # Increased from 60s to 180s to prevent lock contention when multiple
+    # background tasks compete for database writes.
+    connect_args={"check_same_thread": False, "timeout": 180},
     echo=False,
 )
 
