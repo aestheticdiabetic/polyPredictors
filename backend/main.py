@@ -107,6 +107,25 @@ async def lifespan(app: FastAPI):
         discord_task = asyncio.create_task(discord_bot.start())
         logger.info("Discord bot task started")
     whale_monitor.start_chain_monitor_task()
+
+    # Stage 1: Pre-warm CLOB authentication to avoid first-request delay
+    if settings.credentials_valid():
+        try:
+            poly_client._get_clob_client()
+            logger.info("CLOB client auth pre-warmed")
+        except Exception as exc:
+            logger.warning("CLOB auth pre-warm failed: %s", exc)
+
+    # Stage 4: Seed slippage register from DB
+    if settings.SLIPPAGE_TRACKING_ENABLED:
+        try:
+            db = next(get_db())
+            bet_engine._seed_slippage_register(db)
+            db.close()
+            logger.info("Slippage register seeded")
+        except Exception as exc:
+            logger.warning("Failed to seed slippage register: %s", exc)
+
     yield
     # Graceful shutdown
     if discord_bot is not None:

@@ -118,6 +118,13 @@ class WhaleMonitor:
             id="stop_loss_snapshot",
         )
 
+        # Stage 3: Harvest and soft exit jobs — run on resolution scheduler
+        self._resolution_scheduler.add_job(
+            func=self._harvest_and_soft_exit_wrapper,
+            trigger=IntervalTrigger(seconds=settings.RESOLUTION_CHECK_INTERVAL_SECONDS),
+            id="harvest_and_soft_exit",
+        )
+
         self._resolution_scheduler.start()
         logger.info(
             "Permanent background scheduler started (resolution every %ds, exit polling every %ds)",
@@ -492,17 +499,19 @@ class WhaleMonitor:
                         or ""
                     )
 
-                    # Fetch market metadata, live price, and taker fee in parallel
+                    # Fetch market metadata, live price, taker fee, and order book in parallel
                     # BEFORE the DB flush so no lock is held during network I/O.
-                    market_result, price_result, fee_result = await asyncio.gather(
+                    market_result, price_result, fee_result, book_result = await asyncio.gather(
                         self._client.get_market(trade_market_id, token_id=trade_token_id),
                         self._client.get_best_price(trade_token_id, force_refresh=True),
                         self._client.get_taker_fee_async(trade_token_id),
+                        self._client.get_order_book(trade_token_id),
                         return_exceptions=True,
                     )
                     market_info = market_result if isinstance(market_result, dict) else {}
                     live_price = price_result if isinstance(price_result, float) else None
                     taker_fee_bps = fee_result if isinstance(fee_result, int) else 1000
+                    order_book = book_result if isinstance(book_result, dict) else None
 
                     # Now save to DB (flush takes RESERVED lock — network already done).
                     whale_bet = await self._save_whale_bet(
@@ -520,6 +529,7 @@ class WhaleMonitor:
                                 market_info=market_info,
                                 live_price=live_price,
                                 taker_fee_bps=taker_fee_bps,
+                                order_book=order_book,
                             )
                             # If this is an EXIT and the CLOB sell failed, don't advance
                             # _last_seen — the next poll will retry the close automatically.
@@ -974,6 +984,17 @@ class WhaleMonitor:
             _run_async(self._stop_loss_monitor.snapshot_async())
         except Exception as exc:
             logger.error("stop_loss_snapshot error: %s", exc)
+
+    def _harvest_and_soft_exit_wrapper(self):
+        """Stage 3: Check for harvest opportunities and pending exit confirmations."""
+        db = SessionLocal()
+        try:
+            self._bet_engine.check_and_harvest_positions(db)
+            self._bet_engine._check_pending_exits(db)
+        except Exception as exc:
+            logger.error("harvest_and_soft_exit error: %s", exc)
+        finally:
+            db.close()
 
     def _auto_redemption_job(self):
         """Periodically redeem resolved positions on-chain. Runs in permanent scheduler."""

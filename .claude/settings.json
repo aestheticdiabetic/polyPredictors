@@ -39,7 +39,13 @@
       "Bash(powershell -command \"Get-Process -Id 43196 | Select-Object Name, Id, Path\")",
       "Bash(curl -s https://raw.githubusercontent.com/Polymarket/py-clob-client/main/py_clob_client/clob_types.py)",
       "Bash(curl -s https://raw.githubusercontent.com/Polymarket/py-clob-client/main/py_clob_client/constants.py)",
-      "Bash(curl -s https://raw.githubusercontent.com/Polymarket/py-clob-client/main/py_clob_client/order_builder/constants.py)"
+      "Bash(curl -s https://raw.githubusercontent.com/Polymarket/py-clob-client/main/py_clob_client/order_builder/constants.py)",
+      "Bash(gh search:*)",
+      "WebSearch",
+      "Bash(grep -r \"entry price\\\\|exit.*different\\\\|different.*entry\\\\|multiple.*tranche\\\\|FIFO\\\\|tranch\" /x/CODING/polymarket-copier/docs/ --include=*.md)",
+      "Bash(curl -s \"https://clob.polymarket.com/token?token_id=53515826093545540131999150841813441507292684724290272288562716574462407795372\")",
+      "WebFetch(domain:polygonscan.com)",
+      "Read(//home/angus/**)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Angus\\.claude"

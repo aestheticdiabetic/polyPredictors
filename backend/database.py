@@ -324,6 +324,31 @@ class AddToPositionSignal(Base):
         }
 
 
+class TokenSlippageRecord(Base):
+    """Stage 4: Records slippage (fill vs mid price) for every entry/exit."""
+
+    __tablename__ = "token_slippage_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    token_id = Column(String(128), nullable=False, index=True)
+    recorded_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    fill_price = Column(Float, nullable=False)  # actual fill price
+    mid_price = Column(Float, nullable=False)  # mid-market price at time of fill
+    slippage_pct = Column(Float, nullable=False)  # calculated slippage percentage
+    mode = Column(String(20), nullable=False)  # ENTRY or EXIT
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "token_id": self.token_id,
+            "recorded_at": self.recorded_at.isoformat(),
+            "fill_price": round(self.fill_price, 4),
+            "mid_price": round(self.mid_price, 4),
+            "slippage_pct": round(self.slippage_pct, 4),
+            "mode": self.mode,
+        }
+
+
 class MonitoringSession(Base):
     """Tracks each monitoring session (renamed to avoid conflict with sqlalchemy Session)."""
 
@@ -439,6 +464,7 @@ def _migrate():
         ("copied_bets", "gas_fees_usdc", "FLOAT"),
         ("whales", "follow_add_signals", "BOOLEAN NOT NULL DEFAULT 0"),
         ("copied_bets", "followed_signal_id", "INTEGER REFERENCES add_to_position_signals(id)"),
+        ("whales", "win_rate_window_json", "TEXT"),
     ]
     sa = __import__("sqlalchemy")
     with engine.connect() as conn:

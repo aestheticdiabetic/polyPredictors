@@ -26,6 +26,7 @@ class RiskCalculator:
         whale_bet_usdc: float,
         whale_avg_bet_usdc: float,
         conviction_exponent: float = 1.0,
+        whale_performance_multiplier: float = 1.0,
     ) -> float:
         """
         Compute risk factor as ratio of current bet to whale's average bet.
@@ -43,6 +44,9 @@ class RiskCalculator:
             else:
                 risk_factor = max(conviction, MIN_RISK_FACTOR)
 
+        Stage 6: whale_performance_multiplier (default 1.0) scales the final
+        result based on the whale's historical win rate before clamping.
+
         If whale average is zero or unknown, returns 1.0 (neutral).
         """
         if whale_avg_bet_usdc <= 0:
@@ -59,15 +63,21 @@ class RiskCalculator:
         else:
             raw = max(conviction, _MIN_RISK_FACTOR)
 
+        # Stage 6: Apply whale performance multiplier, then clamp
+        result = raw * whale_performance_multiplier
+        result = min(max(result, _MIN_RISK_FACTOR), _MAX_RISK_FACTOR)
+
         logger.debug(
-            "Risk factor: %.2f / %.2f = conviction %.3f -> rf %.3f (exponent=%.2f)",
+            "Risk factor: %.2f / %.2f = conviction %.3f -> rf %.3f (exponent=%.2f, perf_mult=%.2f -> %.3f)",
             whale_bet_usdc,
             whale_avg_bet_usdc,
             conviction,
             raw,
             conviction_exponent,
+            whale_performance_multiplier,
+            result,
         )
-        return raw
+        return result
 
     def calculate_bet_size(
         self,

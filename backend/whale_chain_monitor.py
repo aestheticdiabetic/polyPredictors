@@ -737,18 +737,20 @@ class WhaleChainMonitor:
             log.warning("WhaleChainMonitor: no client for entry dispatch")
             return
 
-        # Phase 1: fire market lookup, live price, and taker fee in parallel.
+        # Phase 1: fire market lookup, live price, taker fee, and order book in parallel.
         # token_id is known from the on-chain event so no sequential dependency.
-        market_result, price_result, fee_result = await asyncio.gather(
+        market_result, price_result, fee_result, book_result = await asyncio.gather(
             client.get_market("", token_id=token_id),
             client.get_best_price(token_id, force_refresh=True),
             client.get_taker_fee_async(token_id),
+            client.get_order_book(token_id),
             return_exceptions=True,
         )
 
         market_info: dict = market_result if isinstance(market_result, dict) else {}
         live_price = price_result if isinstance(price_result, float) else None
         taker_fee_bps = fee_result if isinstance(fee_result, int) else 1000
+        order_book = book_result if isinstance(book_result, dict) else None
 
         condition_id = market_info.get("conditionId") or market_info.get("condition_id") or ""
         question = market_info.get("question") or market_info.get("title") or ""
@@ -793,6 +795,7 @@ class WhaleChainMonitor:
                 market_info,
                 live_price,
                 taker_fee_bps,
+                order_book,
             )
 
     def _sync_open_position(
@@ -802,6 +805,7 @@ class WhaleChainMonitor:
         market_info: dict,
         live_price: float | None,
         taker_fee_bps: int,
+        order_book: dict | None = None,
     ):
         """Sync DB work for entry dispatch. Runs in thread executor."""
         whale_lower = whale_address.lower()
@@ -855,6 +859,7 @@ class WhaleChainMonitor:
                     market_info=market_info,
                     live_price=live_price,
                     taker_fee_bps=taker_fee_bps,
+                    order_book=order_book,
                 )
             db.commit()
         except Exception:

@@ -197,6 +197,49 @@ class Settings:
     )
     STOP_LOSS_COOLDOWN_HOURS: int = int(os.getenv("STOP_LOSS_COOLDOWN_HOURS", "4"))
 
+    # Whale performance tracking — rolling window of recent bet outcomes for adaptive sizing
+    WHALE_PERF_WINDOW: int = int(os.getenv("WHALE_PERF_WINDOW", "50"))
+
+    # Stage 2: Pre-entry risk filters
+    # Order book depth check — ensure sufficient liquidity before entry
+    ORDER_BOOK_CHECK_ENABLED: bool = (
+        os.getenv("ORDER_BOOK_CHECK_ENABLED", "false").lower() == "true"
+    )
+    MIN_BOOK_DEPTH_USDC: float = float(os.getenv("MIN_BOOK_DEPTH_USDC", "50.0"))
+    MAX_BOOK_SLIPPAGE_PCT: float = float(os.getenv("MAX_BOOK_SLIPPAGE_PCT", "0.03"))
+
+    # Wash trade detection — skip if whale recently exited same token
+    WASH_TRADE_DETECTION_ENABLED: bool = (
+        os.getenv("WASH_TRADE_DETECTION_ENABLED", "false").lower() == "true"
+    )
+    WASH_TRADE_WINDOW_MINUTES: int = int(os.getenv("WASH_TRADE_WINDOW_MINUTES", "30"))
+
+    # Stage 3: Independent exit logic (harvest + soft exit confirmation)
+    HARVEST_ENABLED: bool = os.getenv("HARVEST_ENABLED", "false").lower() == "true"
+    HARVEST_MULTIPLIER: float = float(os.getenv("HARVEST_MULTIPLIER", "1.8"))
+    HARVEST_NEAR_CLOSE_HOURS: float = float(os.getenv("HARVEST_NEAR_CLOSE_HOURS", "2.0"))
+    HARVEST_NEAR_CLOSE_MIN_MULTIPLIER: float = float(
+        os.getenv("HARVEST_NEAR_CLOSE_MIN_MULTIPLIER", "1.3")
+    )
+    EXIT_CONFIRMATION_ENABLED: bool = (
+        os.getenv("EXIT_CONFIRMATION_ENABLED", "false").lower() == "true"
+    )
+    EXIT_CONFIRMATION_BUFFER: float = float(os.getenv("EXIT_CONFIRMATION_BUFFER", "0.05"))
+    EXIT_CONFIRMATION_TIMEOUT_SECONDS: int = int(
+        os.getenv("EXIT_CONFIRMATION_TIMEOUT_SECONDS", "300")
+    )
+
+    # Stage 4: Slippage tracking and entry gate
+    SLIPPAGE_TRACKING_ENABLED: bool = (
+        os.getenv("SLIPPAGE_TRACKING_ENABLED", "false").lower() == "true"
+    )
+    MAX_HISTORICAL_SLIPPAGE_PCT: float = float(os.getenv("MAX_HISTORICAL_SLIPPAGE_PCT", "0.05"))
+
+    # Stage 6: Adaptive whale sizing based on rolling win rate
+    ADAPTIVE_SIZING_ENABLED: bool = os.getenv("ADAPTIVE_SIZING_ENABLED", "false").lower() == "true"
+    WHALE_PERF_MIN_MULTIPLIER: float = float(os.getenv("WHALE_PERF_MIN_MULTIPLIER", "0.5"))
+    WHALE_PERF_MAX_MULTIPLIER: float = float(os.getenv("WHALE_PERF_MAX_MULTIPLIER", "1.5"))
+
     # API endpoints
     DATA_API_BASE: str = "https://data-api.polymarket.com"
     GAMMA_API_BASE: str = "https://gamma-api.polymarket.com"

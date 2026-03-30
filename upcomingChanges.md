@@ -317,9 +317,6 @@ The flat rolling window in Stage 6 (last 50 bets equally weighted) is a reasonab
 ### 2. Partial Exit Laddering
 Rather than all-or-nothing harvest exits (Stage 3), the most profitable approach is laddering out: sell 50% at the harvest threshold to lock in profit, hold 50% for potential resolution at 1.0. This requires no structural change to the close machinery — just add a `harvest_fraction` config param (default 1.0) to `check_and_harvest_positions()`. At 1.0 it's full close (current plan); at 0.5 it closes half the shares.
 
-### 3. Corroborating Signal Aggregation
-When 2+ tracked whales enter the same token within a short window, that's a materially stronger signal than one whale alone — yet the bot currently treats each independently. A simple corroboration counter on `AddToPositionSignal` or a new in-memory dict could boost sizing when multiple distinct whales are piling in. Low implementation complexity, potentially high edge.
-
 ### 4. Maker vs Taker Detection for Signal Quality
 A whale placing a limit order (maker) is exhibiting patience and likely entered early. A whale using a market order (taker) is urgent and may already be chasing price. Polymarket CLOB events distinguish maker from taker. In `whale_chain_monitor._dispatch_entry()`, the event already includes maker/taker fields. Tagging `WhaleBet` with `is_taker: bool` and slightly discounting taker signals (or skipping entirely above a drift threshold) could filter out late reactive whales.
 

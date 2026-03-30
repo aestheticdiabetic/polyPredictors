@@ -78,6 +78,16 @@ class _WatchItem:
     expires_at: float  # time.monotonic() deadline
 
 
+@dataclass
+class _PendingExit:
+    """Tracks a position pending whale exit confirmation (Stage 3)."""
+
+    copied_bet_id: int
+    whale_exit_price: float
+    entered_at_monotonic: float
+    session_id: int
+
+
 class BetEngine:
     """Processes whale bets and manages our copied positions."""
 
@@ -100,6 +110,447 @@ class BetEngine:
         # Hot tokens (price >= 0.85 or <= 0.15, or near expiry) use a 90s TTL.
         # Cold tokens (price 0.15-0.85, far from expiry) use a 600s TTL.
         self._resolution_cache: dict[str, tuple[float | None, datetime | None, bool, datetime]] = {}
+        # Stage 3: Pending exits — positions deferred for confirmation (soft exit logic)
+        self._pending_exits: dict[int, _PendingExit] = {}
+        self._pending_exits_lock = threading.Lock()
+        # Stage 4: Slippage tracking — in-memory rolling window per token (last 20 records)
+        from collections import defaultdict, deque
+
+        self._slippage_register: dict[str, deque] = defaultdict(lambda: deque(maxlen=20))
+
+    # ------------------------------------------------------------------
+    # Whale performance tracking (Stage 1)
+    # ------------------------------------------------------------------
+
+    def _update_whale_stats(self, whale_address: str, pnl_usdc: float, db: DBSession) -> None:
+        """
+        Update whale's win_count, total_bets_tracked, and win_rate_window_json.
+        Called after every position close (SIMULATION, REAL, any mode).
+        Wraps in try/except so a DB error never blocks the close operation.
+        """
+        try:
+            whale = db.query(Whale).filter(Whale.address.ilike(whale_address.lower())).first()
+            if not whale:
+                return
+
+            whale.total_bets_tracked = (whale.total_bets_tracked or 0) + 1
+
+            # Track win/loss as 1/0 in rolling window
+            is_win = 1 if pnl_usdc > 0.01 else 0
+            whale.win_count = (whale.win_count or 0) + is_win
+
+            # Maintain JSON deque of last N outcomes (1=win, 0=loss)
+            try:
+                window = json.loads(whale.win_rate_window_json or "[]")
+            except (json.JSONDecodeError, TypeError):
+                window = []
+
+            window.append(is_win)
+            # Keep only the last WHALE_PERF_WINDOW entries
+            if len(window) > settings.WHALE_PERF_WINDOW:
+                window = window[-settings.WHALE_PERF_WINDOW :]
+
+            whale.win_rate_window_json = json.dumps(window)
+            db.add(whale)
+            db.flush()
+
+            logger.debug(
+                "Updated whale %s: total_bets=%d win_count=%d win_rate_window_len=%d",
+                whale_address[:10],
+                whale.total_bets_tracked,
+                whale.win_count,
+                len(window),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to update whale stats for %s: %s (continuing anyway)",
+                whale_address[:10],
+                exc,
+            )
+
+    # ------------------------------------------------------------------
+    # Stage 2: Entry guards (order book depth + wash trade detection)
+    # ------------------------------------------------------------------
+
+    def _check_order_book_depth(
+        self, order_book: dict | None, live_price: float | None, bet_size_usdc: float
+    ) -> tuple[bool, str]:
+        """
+        Verify sufficient liquidity in the order book to fill our bet.
+        Sums ask-side USDC up to price (live_price * (1 + MAX_BOOK_SLIPPAGE_PCT)).
+        Returns (True, "") if depth OK; (False, reason) if too thin.
+        """
+        if not order_book or not live_price:
+            return True, ""
+
+        asks = order_book.get("asks", [])
+        if not asks:
+            return False, "No ask orders in book"
+
+        max_slippage_price = live_price * (1 + settings.MAX_BOOK_SLIPPAGE_PCT)
+        usdc_sum = 0.0
+
+        for ask in asks:
+            try:
+                price = float(ask.get("price", 0))
+                size = float(ask.get("size", 0))
+                if price > max_slippage_price:
+                    break
+                usdc_sum += size * price
+            except (ValueError, TypeError):
+                pass
+
+        if usdc_sum < settings.MIN_BOOK_DEPTH_USDC:
+            return (
+                False,
+                f"Thin book: only ${usdc_sum:.2f} depth available "
+                f"(min ${settings.MIN_BOOK_DEPTH_USDC:.2f})",
+            )
+
+        return True, ""
+
+    def _check_wash_trade(
+        self, whale_address: str, token_id: str, db: DBSession
+    ) -> tuple[bool, str]:
+        """
+        Detect wash trades: if whale recently exited this token, skip new entry.
+        Returns (True, "") if no wash trade detected; (False, reason) if suspicious.
+        """
+        try:
+            from datetime import timedelta
+
+            now = datetime.utcnow()
+            window_start = now - timedelta(minutes=settings.WASH_TRADE_WINDOW_MINUTES)
+
+            # Check if whale has a recent SELL for this token within the window
+            recent_sell = (
+                db.query(WhaleBet)
+                .filter(
+                    WhaleBet.whale.has(Whale.address.ilike(whale_address.lower())),
+                    WhaleBet.token_id == token_id,
+                    WhaleBet.side == "SELL",
+                    WhaleBet.timestamp >= window_start,
+                )
+                .first()
+            )
+
+            if recent_sell:
+                return (
+                    False,
+                    f"Wash trade suspected: whale exited {token_id[:16]}... "
+                    f"at {recent_sell.timestamp.isoformat()} "
+                    f"(within {settings.WASH_TRADE_WINDOW_MINUTES}min window)",
+                )
+
+            return True, ""
+        except Exception as exc:
+            logger.warning("Wash trade check failed for %s: %s", whale_address[:10], exc)
+            # Fail open: if check fails, allow the bet
+            return True, ""
+
+    # ------------------------------------------------------------------
+    # Stage 3: Independent exit logic (harvest + soft exit)
+    # ------------------------------------------------------------------
+
+    def check_and_harvest_positions(self, db: DBSession) -> None:
+        """
+        Run on scheduler: close profitable positions that meet harvest criteria.
+        - Feature 3a: Harvest threshold — close if price > entry * HARVEST_MULTIPLIER
+        - Feature 8: Near-close harvest — close if market closes soon and profitable
+        Wraps in try/except so scheduler failures are isolated.
+        """
+        try:
+            if not settings.HARVEST_ENABLED:
+                return
+
+            from datetime import datetime as dt
+
+            now_utc = dt.utcnow()
+
+            # Fetch all OPEN copied bets
+            open_bets = db.query(CopiedBet).filter(CopiedBet.status == "OPEN").all()
+
+            for bet in open_bets:
+                try:
+                    # Get current price from cache or fetch fresh
+                    current_price = None
+                    cache_entry = self._resolution_cache.get(bet.token_id)
+                    if cache_entry:
+                        current_price, _, _, _ = cache_entry
+                    if current_price is None and self._client:
+                        current_price = self._client._get_clob_client().get_best_price_sync(
+                            bet.token_id
+                        )
+
+                    if current_price is None:
+                        continue
+
+                    # Feature 3a: Harvest threshold
+                    if (
+                        settings.HARVEST_ENABLED
+                        and current_price > bet.price_at_entry * settings.HARVEST_MULTIPLIER
+                    ):
+                        logger.info(
+                            "Harvest threshold triggered for bet %d: price %.4f > entry %.4f * %.2f",
+                            bet.id,
+                            current_price,
+                            bet.price_at_entry,
+                            settings.HARVEST_MULTIPLIER,
+                        )
+                        self._close_bet(
+                            bet,
+                            current_price,
+                            bet.session,
+                            db,
+                            close_reason=f"Harvest threshold (price {current_price:.4f} > {bet.price_at_entry * settings.HARVEST_MULTIPLIER:.4f})",
+                        )
+                        db.commit()
+                        continue
+
+                    # Feature 8: Near-close harvest
+                    if bet.market_close_at is not None:
+                        hours_to_close = (bet.market_close_at - now_utc).total_seconds() / 3600.0
+                        if (
+                            0 < hours_to_close < settings.HARVEST_NEAR_CLOSE_HOURS
+                            and current_price
+                            > bet.price_at_entry * settings.HARVEST_NEAR_CLOSE_MIN_MULTIPLIER
+                        ):
+                            logger.info(
+                                "Near-close harvest triggered for bet %d: closes in %.1fh, price %.4f > entry %.4f * %.2f",
+                                bet.id,
+                                hours_to_close,
+                                current_price,
+                                bet.price_at_entry,
+                                settings.HARVEST_NEAR_CLOSE_MIN_MULTIPLIER,
+                            )
+                            self._close_bet(
+                                bet,
+                                current_price,
+                                bet.session,
+                                db,
+                                close_reason=f"Near-close harvest ({hours_to_close:.1f}h to close)",
+                            )
+                            db.commit()
+
+                except Exception as exc:
+                    logger.warning(
+                        "Error checking harvest for bet %d: %s (continuing)",
+                        bet.id,
+                        exc,
+                    )
+                    db.rollback()
+
+        except Exception as exc:
+            logger.warning("check_and_harvest_positions failed: %s (continuing)", exc)
+            db.rollback()
+
+    def _check_pending_exits(self, db: DBSession) -> None:
+        """
+        Check pending exits (soft exit confirmation): either timeout or price drop.
+        If timeout exceeded OR price dropped below buffer: close immediately.
+        Runs on scheduler cycle.
+        """
+        try:
+            if not settings.EXIT_CONFIRMATION_ENABLED:
+                return
+
+            now_mono = time.monotonic()
+
+            with self._pending_exits_lock:
+                expired_ids = []
+
+                for copied_bet_id, pending_exit in self._pending_exits.items():
+                    try:
+                        elapsed = now_mono - pending_exit.entered_at_monotonic
+
+                        # Fetch current bet and session
+                        bet = db.query(CopiedBet).filter_by(id=copied_bet_id).first()
+                        if not bet:
+                            expired_ids.append(copied_bet_id)
+                            continue
+
+                        # Get current price
+                        current_price = None
+                        cache_entry = self._resolution_cache.get(bet.token_id)
+                        if cache_entry:
+                            current_price, _, _, _ = cache_entry
+                        if current_price is None and self._client:
+                            current_price = self._client._get_clob_client().get_best_price_sync(
+                                bet.token_id
+                            )
+
+                        if current_price is None:
+                            continue
+
+                        # Check conditions for closing
+                        timeout_exceeded = elapsed > settings.EXIT_CONFIRMATION_TIMEOUT_SECONDS
+                        buffer_price = bet.price_at_entry * (1 + settings.EXIT_CONFIRMATION_BUFFER)
+                        price_dropped = current_price < buffer_price
+
+                        if timeout_exceeded or price_dropped:
+                            reason = ""
+                            if timeout_exceeded:
+                                reason = f"Soft exit timeout ({elapsed:.0f}s)"
+                            elif price_dropped:
+                                reason = f"Soft exit price dropped below {buffer_price:.4f}"
+
+                            logger.info(
+                                "Closing pending exit for bet %d: %s (price %.4f)",
+                                copied_bet_id,
+                                reason,
+                                current_price,
+                            )
+
+                            session = bet.session
+                            self._close_bet(bet, current_price, session, db, close_reason=reason)
+                            db.commit()
+                            expired_ids.append(copied_bet_id)
+
+                    except Exception as exc:
+                        logger.warning(
+                            "Error checking pending exit %d: %s (continuing)",
+                            copied_bet_id,
+                            exc,
+                        )
+                        db.rollback()
+
+                # Remove expired entries
+                for cid in expired_ids:
+                    self._pending_exits.pop(cid, None)
+
+        except Exception as exc:
+            logger.warning("_check_pending_exits failed: %s (continuing)", exc)
+            db.rollback()
+
+    # ------------------------------------------------------------------
+    # Stage 4: Slippage tracking
+    # ------------------------------------------------------------------
+
+    def _record_slippage(
+        self, token_id: str, fill_price: float, mid_price: float, mode: str, db: DBSession
+    ) -> None:
+        """
+        Record slippage for a trade. Appends to in-memory register and writes to DB.
+        mode: "ENTRY" or "EXIT"
+        """
+        try:
+            if mid_price <= 0:
+                return
+
+            slippage_pct = abs(fill_price - mid_price) / mid_price * 100
+
+            # Record to DB
+            from backend.database import TokenSlippageRecord
+
+            record = TokenSlippageRecord(
+                token_id=token_id,
+                fill_price=fill_price,
+                mid_price=mid_price,
+                slippage_pct=slippage_pct,
+                mode=mode,
+            )
+            db.add(record)
+
+            # Append to in-memory register
+            self._slippage_register[token_id].append(slippage_pct)
+
+            logger.debug(
+                "Slippage recorded for %s (%s): fill=%.4f mid=%.4f slippage=%.3f%%",
+                token_id[:16],
+                mode,
+                fill_price,
+                mid_price,
+                slippage_pct,
+            )
+        except Exception as exc:
+            logger.warning("Failed to record slippage for %s: %s", token_id[:16], exc)
+
+    def _get_avg_slippage(self, token_id: str) -> float | None:
+        """Get average historical slippage for a token, or None if no data."""
+        register = self._slippage_register.get(token_id)
+        if not register:
+            return None
+        return sum(register) / len(register) if register else None
+
+    def _seed_slippage_register(self, db: DBSession) -> None:
+        """On startup, load last 20 slippage records per token from DB."""
+        try:
+            from backend.database import TokenSlippageRecord
+
+            # Get list of unique token_ids with slippage data
+            tokens = (
+                db.query(TokenSlippageRecord.token_id)
+                .distinct()
+                .order_by(TokenSlippageRecord.token_id)
+                .all()
+            )
+
+            for (token_id,) in tokens:
+                # Get last 20 records for this token, ordered oldest first
+                records = (
+                    db.query(TokenSlippageRecord)
+                    .filter_by(token_id=token_id)
+                    .order_by(TokenSlippageRecord.recorded_at.desc())
+                    .limit(20)
+                    .all()
+                )
+
+                for record in reversed(records):  # oldest first
+                    self._slippage_register[token_id].append(record.slippage_pct)
+
+            logger.info("Seeded slippage register with %d tokens", len(self._slippage_register))
+        except Exception as exc:
+            logger.warning("Failed to seed slippage register: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Stage 6: Adaptive sizing based on whale performance
+    # ------------------------------------------------------------------
+
+    def _compute_whale_performance_multiplier(self, whale: Whale | None) -> float:
+        """
+        Compute dynamic sizing multiplier based on whale's rolling win rate.
+        Returns 1.0 if insufficient data or feature disabled.
+        Linear interpolation: 0% win → MIN_MULTIPLIER, 50% → 1.0x, 100% → MAX_MULTIPLIER
+        """
+        if not settings.ADAPTIVE_SIZING_ENABLED or not whale:
+            return 1.0
+
+        try:
+            window_str = whale.win_rate_window_json or "[]"
+            window = json.loads(window_str)
+
+            # Need at least half of the window size
+            if len(window) < settings.WHALE_PERF_WINDOW / 2:
+                return 1.0
+
+            if not window:
+                return 1.0
+
+            win_rate = sum(window) / len(window)  # 0.0 to 1.0
+
+            # Linear interpolation
+            if win_rate <= 0.5:
+                # 0% → MIN_MULTIPLIER, 50% → 1.0x
+                multiplier = settings.WHALE_PERF_MIN_MULTIPLIER + (
+                    (1.0 - settings.WHALE_PERF_MIN_MULTIPLIER) * (win_rate / 0.5)
+                )
+            else:
+                # 50% → 1.0x, 100% → MAX_MULTIPLIER
+                multiplier = 1.0 + (
+                    (settings.WHALE_PERF_MAX_MULTIPLIER - 1.0) * ((win_rate - 0.5) / 0.5)
+                )
+
+            logger.debug(
+                "Whale performance multiplier: %s win_rate=%.1f%% multiplier=%.2f",
+                whale.address[:10],
+                win_rate * 100,
+                multiplier,
+            )
+            return multiplier
+
+        except Exception as exc:
+            logger.warning("Error computing whale performance multiplier: %s", exc)
+            return 1.0
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -113,6 +564,7 @@ class BetEngine:
         market_info: dict | None = None,
         live_price: float | None = None,
         taker_fee_bps: int = 1000,
+        order_book: dict | None = None,
     ) -> CopiedBet | None:
         """
         Decide what to do with a newly detected whale bet and create
@@ -320,10 +772,13 @@ class BetEngine:
                 )
             else:
                 whale_avg = whale.avg_bet_size_usdc if whale else 0.0
+                # Stage 6: Compute whale performance multiplier for adaptive sizing
+                perf_mult = self._compute_whale_performance_multiplier(whale)
                 risk_factor = risk_calc.calculate_risk_factor(
                     whale_bet.size_usdc,
                     whale_avg,
                     conviction_exponent=settings.CONVICTION_EXPONENT,
+                    whale_performance_multiplier=perf_mult,
                 )
                 bet_size_usdc = risk_calc.calculate_bet_size(
                     session_balance=session.current_balance_usdc,
@@ -568,6 +1023,56 @@ class BetEngine:
                         risk_factor=risk_factor,
                         whale_avg=whale_avg,
                         skip_reason=viability_reason,
+                        db=db,
+                    )
+
+            # Stage 2: Order book depth check — ensure sufficient liquidity
+            if settings.ORDER_BOOK_CHECK_ENABLED:
+                depth_ok, depth_reason = self._check_order_book_depth(
+                    order_book=order_book,
+                    live_price=live_price,
+                    bet_size_usdc=bet_size_usdc,
+                )
+                if not depth_ok:
+                    return self._create_skipped_bet(
+                        whale_bet=whale_bet,
+                        session=session,
+                        bet_size_usdc=bet_size_usdc,
+                        risk_factor=risk_factor,
+                        whale_avg=whale_avg,
+                        skip_reason=depth_reason,
+                        db=db,
+                    )
+
+            # Stage 2: Wash trade detection — skip if whale recently exited this token
+            if settings.WASH_TRADE_DETECTION_ENABLED:
+                wash_ok, wash_reason = self._check_wash_trade(
+                    whale_address=whale.address if whale else "",
+                    token_id=whale_bet.token_id,
+                    db=db,
+                )
+                if not wash_ok:
+                    return self._create_skipped_bet(
+                        whale_bet=whale_bet,
+                        session=session,
+                        bet_size_usdc=bet_size_usdc,
+                        risk_factor=risk_factor,
+                        whale_avg=whale_avg,
+                        skip_reason=wash_reason,
+                        db=db,
+                    )
+
+            # Stage 4: Slippage check — skip if historical slippage too high
+            if settings.SLIPPAGE_TRACKING_ENABLED:
+                avg_slippage = self._get_avg_slippage(whale_bet.token_id)
+                if avg_slippage is not None and avg_slippage > settings.MAX_HISTORICAL_SLIPPAGE_PCT:
+                    return self._create_skipped_bet(
+                        whale_bet=whale_bet,
+                        session=session,
+                        bet_size_usdc=bet_size_usdc,
+                        risk_factor=risk_factor,
+                        whale_avg=whale_avg,
+                        skip_reason=f"High historical slippage: {avg_slippage:.3f}% (max {settings.MAX_HISTORICAL_SLIPPAGE_PCT:.3f}%)",
                         db=db,
                     )
 
@@ -1065,6 +1570,19 @@ class BetEngine:
         db.add(copied_bet)
         db.add(session)
 
+        # Update whale stats after position is closed (Stage 1)
+        self._update_whale_stats(copied_bet.whale_address, pnl, db)
+
+        # Stage 4: Record slippage (simulation fills at current price, so slippage = 0)
+        if settings.SLIPPAGE_TRACKING_ENABLED:
+            self._record_slippage(
+                token_id=copied_bet.token_id,
+                fill_price=current_price,
+                mid_price=current_price,
+                mode="EXIT",
+                db=db,
+            )
+
         logger.info(
             "SIM SELL: %.4f shares @ %.4f = $%.2f (pnl $%.2f) | balance -> $%.2f",
             copied_bet.size_shares,
@@ -1129,6 +1647,30 @@ class BetEngine:
 
         for attempt in range(max_attempts):
             last = attempt + 1 >= max_attempts
+
+            # Refresh price hint before each retry (avoid stale whale_price anchoring)
+            if attempt > 0:
+                try:
+                    clob = self._client._get_clob_client()
+                    fresh_price_resp = clob.get_price(copied_bet.token_id, "BUY")
+                    if isinstance(fresh_price_resp, dict) and fresh_price_resp.get("price"):
+                        fresh_whale_price = float(fresh_price_resp["price"])
+                        logger.info(
+                            "Real sell bet %d: refreshed whale_price hint %.4f → %.4f (attempt %d/%d)",
+                            copied_bet.id,
+                            whale_price,
+                            fresh_whale_price,
+                            attempt + 1,
+                            max_attempts,
+                        )
+                        whale_price = fresh_whale_price
+                except Exception as exc:
+                    logger.warning(
+                        "Real sell bet %d: failed to refresh price hint: %s — continuing with current price %.4f",
+                        copied_bet.id,
+                        exc,
+                        whale_price,
+                    )
 
             def _log_retry(reason: str, _attempt: int = attempt, _last: bool = last) -> None:
                 if not _last:
@@ -1434,6 +1976,9 @@ class BetEngine:
 
         db.add(copied_bet)
         db.add(session)
+
+        # Update whale stats after position is closed (Stage 1)
+        self._update_whale_stats(copied_bet.whale_address, pnl, db)
 
         logger.info(
             "REAL SELL (resolution): bet %d %.4f shares @ %.4f = $%.2f pnl=$%.2f | balance -> $%.2f",
@@ -2733,6 +3278,28 @@ class BetEngine:
         exit_reason = (
             f"Whale exited ({whale_alias} sold @ {exit_price:.3f}, we sold @ {sim_exit_price:.3f})"
         )
+
+        # Stage 3: Soft exit confirmation — defer close if price still favorable
+        if settings.EXIT_CONFIRMATION_ENABLED and live_exit_price is not None:
+            for pos in open_positions:
+                # Only apply soft exit to BUY positions (not to exit orders)
+                buffer_price = pos.price_at_entry * (1 + settings.EXIT_CONFIRMATION_BUFFER)
+                if live_exit_price > buffer_price:
+                    logger.info(
+                        "Soft exit pending for bet %d: price %.4f > buffer %.4f (will timeout in %ds or close if price drops)",
+                        pos.id,
+                        live_exit_price,
+                        buffer_price,
+                        settings.EXIT_CONFIRMATION_TIMEOUT_SECONDS,
+                    )
+                    with self._pending_exits_lock:
+                        self._pending_exits[pos.id] = _PendingExit(
+                            copied_bet_id=pos.id,
+                            whale_exit_price=exit_price,
+                            entered_at_monotonic=time.monotonic(),
+                            session_id=session.id,
+                        )
+                    return None  # Don't close yet, wait for confirmation
 
         close_ok: bool
         if len(open_positions) == 1:
