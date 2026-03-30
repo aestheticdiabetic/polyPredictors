@@ -494,9 +494,18 @@ class PolymarketClient:
                 to_token_decimals,
             )
 
-            def _fixed_get_market_order_amounts(
-                self_builder, amount, price, round_config, *args, **kwargs
-            ):
+            def _fixed_get_market_order_amounts(self_builder, *args, **kwargs):
+                # Two calling conventions exist across py-clob-client versions:
+                #   Old (≤0.34.6 local): (amount, price, round_config) → (maker, taker)
+                #   New (GitHub main):   (side, amount, price, round_config) → (side, maker, taker)
+                # Detect by checking whether the first arg is a string (side).
+                if args and isinstance(args[0], str):
+                    side, amount, price, round_config = args[0], args[1], args[2], args[3]
+                    new_convention = True
+                else:
+                    amount, price, round_config = args[0], args[1], args[2]
+                    new_convention = False
+
                 raw_price = round_normal(price, round_config.price)
                 # API enforces: taker (shares) max 2dp, maker (USDC) max 4dp.
                 # Compute shares first, then derive USDC so maker = taker * price
@@ -517,7 +526,11 @@ class PolymarketClient:
                         raw_maker_amt = round_up(raw_maker_amt, round_config.amount + 4)
                         if decimal_places(raw_maker_amt) > round_config.amount:
                             raw_maker_amt = round_down(raw_maker_amt, round_config.amount)
-                return to_token_decimals(raw_maker_amt), to_token_decimals(raw_taker_amt)
+                maker = to_token_decimals(raw_maker_amt)
+                taker = to_token_decimals(raw_taker_amt)
+                if new_convention:
+                    return side, maker, taker
+                return maker, taker
 
             self._clob_client.builder.get_market_order_amounts = types.MethodType(
                 _fixed_get_market_order_amounts, self._clob_client.builder
