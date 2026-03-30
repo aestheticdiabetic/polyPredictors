@@ -874,22 +874,29 @@ class WhaleChainMonitor:
         token_id = trade["asset"]
         whale_lower = whale_address.lower()
 
-        # Phase 0.5: fetch market info to enable fallback matching by condition_id+outcome
-        # (in case on-chain token_id doesn't match CLOB token_id in database)
-        client = getattr(self._whale_monitor, "_client", None)
-        market_info = {}
-        if client:
-            with contextlib.suppress(Exception):
-                # Try fetching by token_id first
-                market_result = await client.get_market("", token_id=token_id)
-                if market_result:
-                    market_info = market_result
-
-        # Phase 1: sync DB read in executor (now with market_info for fallback matching)
+        # Phase 1: sync DB read in executor (first try direct token_id match)
         loop = asyncio.get_event_loop()
         pos_data = await loop.run_in_executor(
-            None, self._sync_load_position, token_id, whale_lower, market_info
+            None, self._sync_load_position, token_id, whale_lower, None
         )
+
+        # Phase 1b: If direct match failed, try fallback with market_info
+        if pos_data is None:
+            client = getattr(self._whale_monitor, "_client", None)
+            market_info = {}
+            if client:
+                with contextlib.suppress(Exception):
+                    # Fetch market info only as fallback (on-chain token_id format mismatch)
+                    market_result = await client.get_market("", token_id=token_id)
+                    if market_result:
+                        market_info = market_result
+
+            # Retry position lookup with market_info for condition_id+outcome matching
+            if market_info:
+                pos_data = await loop.run_in_executor(
+                    None, self._sync_load_position, token_id, whale_lower, market_info
+                )
+
         if pos_data is None:
             return
 
