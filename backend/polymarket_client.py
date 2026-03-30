@@ -494,7 +494,9 @@ class PolymarketClient:
                 to_token_decimals,
             )
 
-            def _fixed_get_market_order_amounts(self_builder, amount, price, round_config):
+            def _fixed_get_market_order_amounts(
+                self_builder, amount, price, round_config, *args, **kwargs
+            ):
                 raw_price = round_normal(price, round_config.price)
                 # API enforces: taker (shares) max 2dp, maker (USDC) max 4dp.
                 # Compute shares first, then derive USDC so maker = taker * price
