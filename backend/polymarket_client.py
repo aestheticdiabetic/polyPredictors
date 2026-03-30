@@ -554,6 +554,7 @@ class PolymarketClient:
             order_args = MarketOrderArgs(
                 token_id=token_id,
                 amount=round(amount_usdc, 2),
+                side="BUY",
                 fee_rate_bps=fee_bps,
             )
             signed_order = c.create_market_order(

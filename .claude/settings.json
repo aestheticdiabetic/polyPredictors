@@ -1,0 +1,72 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sqlite3 /c/Users/Angus/polymarket-copier/data/polymarket_copier.db \"SELECT id, token_id, market_question, outcome, entry_price, size_usdc, size_shares, resolution_price, pnl_usdc, close_reason, opened_at, closed_at FROM copied_bets WHERE status=''CLOSED_LOSS'';\")",
+      "Bash(python3 -c \":*)",
+      "Bash(docker compose:*)",
+      "Bash(curl -s -x http://localhost:8888 https://api.ipify.org?format=json)",
+      "Bash(curl -s -x http://localhost:8888 \"https://ipinfo.io/json\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f''''IP: {d[\"\"ip\"\"]}  Country: {d[\"\"country\"\"]}  Region: {d[\"\"region\"\"]}  City: {d[\"\"city\"\"]}''''\\)\")",
+      "Bash(python -c \"import sys,json; h=json.load\\(sys.stdin\\); print\\(''''Status:'''', h[''''Status'''']\\); [print\\(f''''  [{l[\"\"Start\"\"]}] exit={l[\"\"ExitCode\"\"]}: {l[\"\"Output\"\"][:200]}''''\\) for l in h.get\\(''''Log'''',[]\\)]\")",
+      "Bash(python -c \"import sys,json; h=json.load\\(sys.stdin\\); print\\(''''Status:'''', h[''''Status'''']\\); [print\\(f''''  exit={l[\"\"ExitCode\"\"]}: {l[\"\"Output\"\"][:300]}''''\\) for l in h.get\\(''''Log'''',[]\\)]\")",
+      "Bash(docker exec:*)",
+      "Bash(venvScriptspython.exe -m pytest tests/ -v)",
+      "Bash(docker cp:*)",
+      "Bash(docker restart:*)",
+      "Bash(sqlite3 data/polymarket_copier.db \"SELECT address FROM whales WHERE alias = ''Crypto'' LIMIT 1;\")",
+      "Bash(Move-Item \"C:\\\\Users\\\\Angus\\\\polymarket-copier\" \"X:\\\\CODING\\\\polymarket-copier\")",
+      "Bash(docker ps:*)",
+      "Bash(docker-compose -f docker-compose.vpn.yml build polymarket-app)",
+      "Bash(docker-compose -f docker-compose.vpn.yml up -d polymarket-app)",
+      "Bash(python -c \"from backend.bet_engine import BetEngine; from backend.polymarket_client import PolymarketClient; print\\(''OK''\\)\")",
+      "Bash(python test_close_tranches.py)",
+      "Bash(sqlite3 data/polymarket_copier.db \".tables\")",
+      "Bash(curl -v --max-time 5 http://127.0.0.1:8000/)",
+      "Bash(bash .claude/hooks/lint_python.sh)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(ruff check:*)",
+      "Bash(docker compose -f docker-compose.vpn.yml exec polymarket-app python -c \":*)",
+      "Bash(python3:*)",
+      "Bash(find . -name *.log -o -name *.txt)",
+      "Bash(ls *.yml *.yaml docker-compose*)",
+      "Bash(timeout 30 grep -E \"EXIT no match|orphaned exit|EXIT detected|closing position|ENTRY detected\")",
+      "Bash(sqlite3 x:/CODING/polymarket-copier/data/polymarket_copier.db \"SELECT name FROM sqlite_master WHERE type=''table'';\")",
+      "Bash(printf '{\"\"\"\"tool_name\"\"\"\":\"\"\"\"Edit\"\"\"\",\"\"\"\"tool_input\"\"\"\":{\"\"\"\"file_path\"\"\"\":\"\"\"\"backend/bet_engine.py\"\"\"\",\"\"\"\"old_string\"\"\"\":\"\"\"\"foo\"\"\"\",\"\"\"\"new_string\"\"\"\":\"\"\"\"bar\"\"\"\"}}')",
+      "Bash(grep -h \"taker_fee\\\\|taker fee\\\\|fee_rate\\\\|feeRateBps\\\\|fee.*REAL\\\\|REAL.*fee\" x:/CODING/polymarket-copier/logs/app.log x:/CODING/polymarket-copier/logs/app.log.*)",
+      "Bash(netstat -ano)",
+      "Bash(findstr \":8081\")",
+      "Bash(tasklist /FI \"PID eq 43196\")",
+      "Bash(powershell -command \"Get-Process -Id 43196 | Select-Object Name, Id, Path\")",
+      "Bash(curl -s https://raw.githubusercontent.com/Polymarket/py-clob-client/main/py_clob_client/clob_types.py)",
+      "Bash(curl -s https://raw.githubusercontent.com/Polymarket/py-clob-client/main/py_clob_client/constants.py)",
+      "Bash(curl -s https://raw.githubusercontent.com/Polymarket/py-clob-client/main/py_clob_client/order_builder/constants.py)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\Angus\\.claude"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/lint_python.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/protect_configs.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
