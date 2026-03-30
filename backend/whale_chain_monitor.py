@@ -874,9 +874,22 @@ class WhaleChainMonitor:
         token_id = trade["asset"]
         whale_lower = whale_address.lower()
 
-        # Phase 1: sync DB read in executor
+        # Phase 0.5: fetch market info to enable fallback matching by condition_id+outcome
+        # (in case on-chain token_id doesn't match CLOB token_id in database)
+        client = getattr(self._whale_monitor, "_client", None)
+        market_info = {}
+        if client:
+            with contextlib.suppress(Exception):
+                # Try fetching by token_id first
+                market_result = await client.get_market("", token_id=token_id)
+                if market_result:
+                    market_info = market_result
+
+        # Phase 1: sync DB read in executor (now with market_info for fallback matching)
         loop = asyncio.get_event_loop()
-        pos_data = await loop.run_in_executor(None, self._sync_load_position, token_id, whale_lower)
+        pos_data = await loop.run_in_executor(
+            None, self._sync_load_position, token_id, whale_lower, market_info
+        )
         if pos_data is None:
             return
 
@@ -909,11 +922,23 @@ class WhaleChainMonitor:
             )
 
     def _sync_load_position(
-        self, token_id: str, whale_lower: str
+        self,
+        token_id: str,
+        whale_lower: str,
+        market_info: dict | None = None,
     ) -> tuple[str, str, str, str] | None:
-        """Load open position metadata. Returns (condition_id, outcome, question, mode) or None."""
+        """
+        Load open position metadata. Returns (condition_id, outcome, question, mode) or None.
+
+        On-chain token_ids may differ from stored CLOB token_ids in format. This function:
+        1. First tries direct token_id match (for same-format matches)
+        2. If no match, uses market_info to find by condition_id + outcome instead
+
+        market_info should contain: conditionId (or condition_id), tokens list with outcomes
+        """
         db = SessionLocal()
         try:
+            # Try direct token_id match first (fast path when formats match)
             open_pos = (
                 db.query(CopiedBet)
                 .filter(
@@ -924,26 +949,68 @@ class WhaleChainMonitor:
                 .order_by(CopiedBet.opened_at.asc())
                 .first()
             )
-            if not open_pos:
-                sample = (
-                    db.query(CopiedBet.token_id, CopiedBet.whale_address)
-                    .filter_by(status="OPEN")
-                    .limit(5)
-                    .all()
+
+            if open_pos:
+                return (
+                    open_pos.market_id or "",
+                    getattr(open_pos, "outcome", "") or "",
+                    getattr(open_pos, "question", "") or "",
+                    open_pos.mode,
                 )
-                log.warning(
-                    "WhaleChainMonitor: EXIT no match — token=%s whale=%s | open positions: %s",
-                    token_id,
-                    whale_lower,
-                    [(r[0], r[1][:10] if r[1] else None) for r in sample],
+
+            # Fallback: match by market condition_id + outcome if market_info provided
+            if market_info:
+                condition_id = (
+                    market_info.get("conditionId") or market_info.get("condition_id") or ""
                 )
-                return None
-            return (
-                open_pos.market_id or "",
-                getattr(open_pos, "outcome", "") or "",
-                getattr(open_pos, "question", "") or "",
-                open_pos.mode,
+                if condition_id:
+                    # Find outcome for this token from market_info
+                    outcome = "YES"
+                    for tok in market_info.get("tokens") or []:
+                        if asset_id_matches(tok.get("token_id", ""), token_id):
+                            outcome = (tok.get("outcome") or "Yes").upper()
+                            break
+
+                    # Now look for position by condition_id + outcome instead of token_id
+                    open_pos = (
+                        db.query(CopiedBet)
+                        .filter(
+                            CopiedBet.status == "OPEN",
+                            CopiedBet.market_id == condition_id,
+                            CopiedBet.outcome == outcome,
+                            CopiedBet.whale_address.ilike(whale_lower),
+                        )
+                        .order_by(CopiedBet.opened_at.asc())
+                        .first()
+                    )
+                    if open_pos:
+                        log.debug(
+                            "WhaleChainMonitor: matched position by condition_id+outcome "
+                            "(on-chain token %s didn't match stored token %s)",
+                            token_id[:16],
+                            open_pos.token_id[:16] if open_pos.token_id else "?",
+                        )
+                        return (
+                            condition_id,
+                            outcome,
+                            getattr(open_pos, "question", "") or "",
+                            open_pos.mode,
+                        )
+
+            # No match found via either method
+            sample = (
+                db.query(CopiedBet.token_id, CopiedBet.whale_address)
+                .filter_by(status="OPEN")
+                .limit(5)
+                .all()
             )
+            log.warning(
+                "WhaleChainMonitor: EXIT no match — token=%s whale=%s | open positions: %s",
+                token_id,
+                whale_lower,
+                [(r[0], r[1][:10] if r[1] else None) for r in sample],
+            )
+            return None
         finally:
             db.close()
 
