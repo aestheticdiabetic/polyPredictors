@@ -51,6 +51,16 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     # NORMAL: flush after each WAL checkpoint rather than every write.
     # Safe with WAL — durability is maintained by the WAL file itself.
     cursor.execute("PRAGMA synchronous=NORMAL")
+    # WAL checkpoint tuning: reduce lock contention during concurrent writes.
+    # wal_autocheckpoint=10000: delay automatic checkpoints until WAL reaches
+    # 10,000 pages. Default is 1000, which causes frequent checkpoint pauses that
+    # block writers. Increasing this lets the WAL grow larger between checkpoints,
+    # reducing pause frequency (trades off disk space for lower lock contention).
+    cursor.execute("PRAGMA wal_autocheckpoint=10000")
+    # busy_timeout=5000: when a checkpoint blocks writers, retry for up to 5
+    # seconds instead of immediately failing. Prevents "database is locked" errors
+    # during high-concurrency periods (chain monitor + activity poller both writing).
+    cursor.execute("PRAGMA busy_timeout=5000")
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 
