@@ -611,12 +611,14 @@ class PolymarketClient:
         whale_price: the price at which the whale exited (used as the drift anchor).
 
         create_market_order only supports BUY, so we use create_order with
-        side="SELL" + OrderType.FOK so the order fills immediately or is
-        cancelled (never left as a live GTC order in the book).
+        side="SELL" + OrderType.IOC so the order fills as much as possible
+        immediately and cancels any unfilled remainder (never left as a live
+        GTC order in the book).  IOC handles fractional position overages
+        (e.g. 29.11 shares vs whale's 29) without failing the whole order.
 
-        If a FOK is cancelled (price ticked between fetch and submit), we
-        re-fetch the best bid and retry up to MAX_FOK_RETRIES times as long
-        as the new price is within MAX_PRICE_DRIFT_PCT of the whale's exit price.
+        If an IOC is cancelled entirely (empty book), we re-fetch the best bid
+        and retry up to SELL_MAX_FOK_RETRIES times as long as the new price is
+        within MAX_PRICE_DRIFT_PCT of the whale's exit price.
         Once drift exceeds that threshold we return the cancelled response so
         the caller can leave the position OPEN for the next exit poll.
         """
@@ -687,8 +689,10 @@ class PolymarketClient:
             signed_order = client.create_order(
                 order_args, PartialCreateOrderOptions(neg_risk=neg_risk)
             )
-            # FOK: fill immediately in full or cancel — never leaves a live order.
-            resp = client.post_order(signed_order, OrderType.FOK)
+            # IOC: fill as much as possible immediately, cancel unfilled remainder.
+            # Handles fractional position overages (e.g. 29.11 vs whale's 29) without
+            # retrying — fills what the book offers and discards the dust instantly.
+            resp = client.post_order(signed_order, OrderType.IOC)
             return resp if isinstance(resp, dict) else {"status": "ok", "response": str(resp)}
 
         def _submit_with_fee_retry(price: float) -> dict:
@@ -774,7 +778,7 @@ class PolymarketClient:
                 return resp  # filled (or no_position / error)
 
             logger.warning(
-                "place_market_sell: FOK cancelled at %.4f (attempt %d/%d)%s",
+                "place_market_sell: IOC cancelled at %.4f (attempt %d/%d)%s",
                 current_price,
                 attempt + 1,
                 max_fok_retries,

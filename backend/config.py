@@ -145,18 +145,18 @@ class Settings:
     # A trader averaging $5 per prediction needs $100,000 vol for ~20,000 predictions.
     MIN_WHALE_VOLUME_USDC: float = float(os.getenv("MIN_WHALE_VOLUME_USDC", "1000000"))
 
-    # Maximum number of FOK retry attempts before declaring a sell exhausted.
+    # Maximum number of IOC retry attempts before declaring a sell exhausted.
     # Default 3. Increase if your markets are thin and orders frequently cancel.
     SELL_MAX_FOK_RETRIES: int = int(os.getenv("SELL_MAX_FOK_RETRIES", "3"))
 
-    # After FOK retry exhaustion, accept a fill at the current best bid regardless
+    # After IOC retry exhaustion, accept a fill at the current best bid regardless
     # of drift from the whale's exit price. Prevents positions staying open forever
     # when the market is moving fast. Default False = leave OPEN for next poll.
     SELL_ACCEPT_DEGRADED_FILL: bool = (
         os.getenv("SELL_ACCEPT_DEGRADED_FILL", "false").lower() == "true"
     )
 
-    # How many times to retry a sell that fails for a transient reason (FOK cancelled,
+    # How many times to retry a sell that fails for a transient reason (IOC cancelled,
     # zero-fill response, exception) before giving up and waiting for the next orphan
     # poll cycle. Each retry is separated by SELL_CLOSE_RETRY_DELAY_SECONDS.
     # Default 4. Set to 0 to disable (rely solely on the poll cycle).
