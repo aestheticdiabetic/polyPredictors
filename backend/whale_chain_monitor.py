@@ -938,23 +938,28 @@ class WhaleChainMonitor:
         Load open position metadata. Returns (condition_id, outcome, question, mode) or None.
 
         On-chain token_ids may differ from stored CLOB token_ids in format. This function:
-        1. First tries direct token_id match (for same-format matches)
+        1. First tries direct token_id match with normalized comparison (handles format differences)
         2. If no match, uses market_info to find by condition_id + outcome instead
 
         market_info should contain: conditionId (or condition_id), tokens list with outcomes
         """
         db = SessionLocal()
         try:
-            # Try direct token_id match first (fast path when formats match)
-            open_pos = (
+            # Try direct token_id match first (with normalized comparison for format differences)
+            open_positions = (
                 db.query(CopiedBet)
                 .filter(
                     CopiedBet.status == "OPEN",
-                    CopiedBet.token_id == token_id,
                     CopiedBet.whale_address.ilike(whale_lower),
                 )
                 .order_by(CopiedBet.opened_at.asc())
-                .first()
+                .all()
+            )
+
+            # Find match using normalized asset_id_matches() to handle format differences
+            open_pos = next(
+                (p for p in open_positions if asset_id_matches(p.token_id or "", token_id)),
+                None,
             )
 
             if open_pos:

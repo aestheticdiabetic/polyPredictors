@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(claude-flow:*)",
+      "Bash(python -m json.tool)",
+      "Bash(npx claude-flow:*)",
+      "Bash(npm list:*)",
+      "Skill(update-config)",
+      "Bash(claude mcp:*)",
+      "Bash(ls /X/CODING/polymarket-copier/*.cfg /X/CODING/polymarket-copier/*.ini /X/CODING/polymarket-copier/*.toml)",
+      "Bash(python:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(xargs grep:*)",
+      "Bash(sqlite3 data/polymarket_copier.db \"SELECT id, market_slug, mode, status, close_reason, price_at_entry, size_shares, size_usdc, resolution_price, closed_at FROM copied_bets WHERE mode=''REAL'' ORDER BY id DESC LIMIT 20;\")",
+      "Bash(pip show:*)",
+      "Bash(wc -l /c/Users/Angus/.claude/agents/*.md)",
+      "Bash(find /c/Users/Angus/.claude/rules -name *.md)",
+      "Bash(xargs wc:*)",
+      "Bash(grep -l description: /c/Users/Angus/.claude/agents/*.md)",
+      "Bash(for f:*)",
+      "Bash(do echo:*)",
+      "Read(//x/CODING/polymarket-copier/**)",
+      "Bash(done)",
+      "Bash(find /c/Users/Angus/.claude/rules/common -name *.md)",
+      "Bash(cd:*)",
+      "Bash(wc:*)"
+    ]
+  }
+}

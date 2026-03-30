@@ -2336,15 +2336,24 @@ class BetEngine:
                         # trade in our DB that occurred after we opened this position.
                         # If one exists, they exited (and we failed to copy it) then
                         # re-bought, so our original position is still orphaned.
-                        exit_after_open = (
+                        # Use normalized matching since WhaleBet.token_id is on-chain format
+                        # while bet.token_id is CLOB format.
+                        recent_exits = (
                             db.query(WhaleBet)
                             .filter(
                                 WhaleBet.whale_id == whale_obj.id,
-                                WhaleBet.token_id == bet.token_id,
                                 WhaleBet.bet_type == "EXIT",
                                 WhaleBet.timestamp > bet.opened_at,
                             )
-                            .first()
+                            .all()
+                        )
+                        exit_after_open = next(
+                            (
+                                e
+                                for e in recent_exits
+                                if asset_id_matches(e.token_id or "", bet.token_id)
+                            ),
+                            None,
                         )
                         if exit_after_open:
                             logger.info(
