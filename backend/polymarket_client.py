@@ -493,14 +493,18 @@ class PolymarketClient:
                 round_up,
                 to_token_decimals,
             )
+            from py_order_utils.model import BUY as UTILS_BUY
+            from py_order_utils.model import SELL as UTILS_SELL
 
             def _fixed_get_market_order_amounts(self_builder, *args, **kwargs):
                 # Two calling conventions exist across py-clob-client versions:
                 #   Old (≤0.34.6 local): (amount, price, round_config) → (maker, taker)
-                #   New (GitHub main):   (side, amount, price, round_config) → (side, maker, taker)
+                #   New (GitHub main):   (side, amount, price, round_config) → (utils_side, maker, taker)
+                #     where utils_side is UTILS_BUY=0 or UTILS_SELL=1 (integers from py_order_utils)
                 # Detect by checking whether the first arg is a string (side).
                 if args and isinstance(args[0], str):
-                    side, amount, price, round_config = args[0], args[1], args[2], args[3]
+                    side_str, amount, price, round_config = args[0], args[1], args[2], args[3]
+                    utils_side = UTILS_BUY if side_str == "BUY" else UTILS_SELL
                     new_convention = True
                 else:
                     amount, price, round_config = args[0], args[1], args[2]
@@ -529,7 +533,7 @@ class PolymarketClient:
                 maker = to_token_decimals(raw_maker_amt)
                 taker = to_token_decimals(raw_taker_amt)
                 if new_convention:
-                    return side, maker, taker
+                    return utils_side, maker, taker
                 return maker, taker
 
             self._clob_client.builder.get_market_order_amounts = types.MethodType(
