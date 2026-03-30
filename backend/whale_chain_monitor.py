@@ -989,6 +989,38 @@ class WhaleChainMonitor:
                 db.flush()
             except IntegrityError:
                 db.rollback()
+                # The activity API may have saved this WhaleBet first, and its
+                # close attempt may have failed (FOK cancelled).  Retrieve the
+                # existing record and retry _handle_exit so a prior failure gets
+                # another chance rather than silently falling through to the 60s
+                # orphan checker.
+                if tx_hash:
+                    existing = (
+                        db.query(WhaleBet).filter_by(tx_hash=tx_hash, bet_type="EXIT").first()
+                    )
+                    if existing:
+                        log.debug(
+                            "WhaleChainMonitor: duplicate exit tx %s — retrying close",
+                            tx_hash[:16],
+                        )
+                        session = (
+                            db.query(MonitoringSession)
+                            .filter_by(mode=pos_mode)
+                            .order_by(MonitoringSession.id.desc())
+                            .first()
+                        )
+                        if session:
+                            exit_result = self._bet_engine._handle_exit(
+                                existing, session, db, live_exit_price=live_exit_price
+                            )
+                            db.commit()
+                            if exit_result is False:
+                                log.warning(
+                                    "WhaleChainMonitor: retry close also FOK-cancelled "
+                                    "for token=%s — orphan checker will retry in ~60s",
+                                    (existing.token_id or "?")[:16],
+                                )
+                        return
                 log.debug("WhaleChainMonitor: duplicate exit tx %s — skipping", tx_hash[:16])
                 return
 

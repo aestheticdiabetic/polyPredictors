@@ -508,11 +508,12 @@ class WhaleMonitor:
                     whale_bet = await self._save_whale_bet(
                         trade, whale, ts, db, market_info=market_info
                     )
+                    exit_close_failed = False
                     if whale_bet:
                         # Process the whale bet for every active session (supports
                         # simultaneous SIMULATION + HEDGE_SIM for side-by-side comparison)
                         for session in active_sessions:
-                            self._bet_engine.process_new_whale_bet(
+                            result = self._bet_engine.process_new_whale_bet(
                                 whale_bet=whale_bet,
                                 session=session,
                                 db=db,
@@ -520,8 +521,12 @@ class WhaleMonitor:
                                 live_price=live_price,
                                 taker_fee_bps=taker_fee_bps,
                             )
+                            # If this is an EXIT and the CLOB sell failed, don't advance
+                            # _last_seen — the next poll will retry the close automatically.
+                            if whale_bet.bet_type == "EXIT" and result is False:
+                                exit_close_failed = True
 
-                    if new_last_seen is None or ts > new_last_seen:
+                    if not exit_close_failed and (new_last_seen is None or ts > new_last_seen):
                         new_last_seen = ts
                 except Exception as exc:
                     logger.error("Error processing trade for %s: %s", address[:10], exc)
@@ -553,13 +558,13 @@ class WhaleMonitor:
 
         Skipped when the main scanner is active — it already handles exits
         as part of full trade processing.
-        Skipped when on-chain monitoring is active — chain monitor handles exits
-        with block-number deduplication and no _last_seen signal-loss risk.
+        Runs as a fallback even when the chain monitor is active: WS events
+        can be dropped silently (no reconnect = no backfill), so the activity
+        poll is a second line of defence.  tx_hash deduplication in
+        _sync_close_position prevents double-closes.
         """
         if self._running:
             return  # main scanner covers this
-        if settings.CHAIN_EXIT_ENABLED:
-            return  # chain monitor covers this
 
         db = SessionLocal()
         try:
