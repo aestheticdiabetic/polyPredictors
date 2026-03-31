@@ -235,7 +235,7 @@ async def start_session(body: SessionStartRequest, db: DBSession = Depends(get_d
         MonitoringSession.mode == body.mode,
         MonitoringSession.is_active == True,  # noqa: E712
     ).update({"is_active": False, "stopped_at": datetime.utcnow()})
-    db.commit()
+    synchronized_commit(db)
 
     starting_balance = (
         (await poly_client.get_wallet_balance() or 0.0)
@@ -250,7 +250,7 @@ async def start_session(body: SessionStartRequest, db: DBSession = Depends(get_d
         current_balance_usdc=starting_balance,
     )
     db.add(session)
-    db.commit()
+    synchronized_commit(db)
     db.refresh(session)
 
     # Start the monitor if it isn't already polling (it will pick up all active sessions)
@@ -299,7 +299,7 @@ async def stop_session(
         s.is_active = False
         s.stopped_at = datetime.utcnow()
         stopped = s
-    db.commit()
+    synchronized_commit(db)
 
     # Only stop the poller when no active sessions remain
     remaining = db.query(MonitoringSession).filter_by(is_active=True).count()
@@ -323,7 +323,7 @@ def _auto_stop_session(mode: str | None = None):
         for session in query.all():
             session.is_active = False
             session.stopped_at = datetime.utcnow()
-        db.commit()
+        synchronized_commit(db)
         remaining = db.query(MonitoringSession).filter_by(is_active=True).count()
     finally:
         db.close()
@@ -356,7 +356,7 @@ async def add_whale(body: WhaleAddRequest, db: DBSession = Depends(get_db)):
     alias = body.alias.strip() or f"Whale_{address[:6]}"
     whale = Whale(address=address, alias=alias)
     db.add(whale)
-    db.commit()
+    synchronized_commit(db)
     db.refresh(whale)
 
     # Add to monitor's last_seen (starts from now)
@@ -374,7 +374,7 @@ async def remove_whale(address: str, db: DBSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Whale not found")
 
     db.delete(whale)
-    db.commit()
+    synchronized_commit(db)
     whale_monitor.reset_last_seen(address)
     return {"message": "Whale removed"}
 
@@ -388,7 +388,7 @@ async def toggle_whale(address: str, db: DBSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Whale not found")
 
     whale.is_active = not whale.is_active
-    db.commit()
+    synchronized_commit(db)
     return {"whale": whale.to_dict()}
 
 
@@ -401,7 +401,7 @@ async def toggle_arb_mode(address: str, db: DBSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Whale not found")
 
     whale.arb_mode = not whale.arb_mode
-    db.commit()
+    synchronized_commit(db)
     return {"whale": whale.to_dict()}
 
 
@@ -413,7 +413,7 @@ async def toggle_follow_add_signals(address: str, db: DBSession = Depends(get_db
     if not whale:
         raise HTTPException(status_code=404, detail="Whale not found")
     whale.follow_add_signals = not whale.follow_add_signals
-    db.commit()
+    synchronized_commit(db)
     return {"whale": whale.to_dict()}
 
 
@@ -1093,7 +1093,7 @@ async def update_whale_categories(
     }
     whale.category_filters = _json.dumps(payload)
     db.add(whale)
-    db.commit()
+    synchronized_commit(db)
     return {"address": address, **payload}
 
 
