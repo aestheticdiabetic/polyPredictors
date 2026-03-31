@@ -13,3 +13,5 @@ vpn/credentials.txt
 vpn/*.key
 vpn/*.crt
 vpn/*.pem
+tests/test_mode_isolation.py
+.claude/settings.local.json

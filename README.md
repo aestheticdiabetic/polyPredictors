@@ -19,6 +19,15 @@ A web app that monitors high-volume Polymarket traders ("whales") and automatica
 - **Drift retry watchlist** — Near-miss bets are retried on a short interval for a configurable window instead of being dropped immediately
 - **Background price pre-fetching** — Keeps prices fresh for all open-position tokens so drift checks are near-instant when a whale bet fires
 - **On-chain exit detection** — Optional Polygon `eth_getLogs` monitor on the CTF Exchange contracts detects whale sells with ~4s latency, replacing activity-API polling
+- **CLOB WebSocket entry detection** — Optional CLOB WebSocket monitor (`wss://ws-subscriptions-clob.polymarket.com`) detects whale buys with ~100ms latency vs 2–4s HTTP polling; runs alongside polling as fallback
+- **Order book depth check** — Optional pre-entry gate rejects bets when ask-side USDC depth is insufficient relative to the intended bet size (fluid threshold scales with bet size)
+- **Wash trade filter** — Optional gate skips bets where the same whale sold the same token within a configurable rolling window
+- **Per-token slippage tracking** — Records fill vs mid-price slippage at every close; optional entry gate blocks tokens with historically high average slippage
+- **Harvest exits** — Optional scheduler closes positions independently of whale action when a configurable profit multiplier is reached
+- **Near-close harvest** — Optional secondary harvest that locks in profit when a market is within a configurable number of hours of closing
+- **Soft exit confirmation** — Optional delay before following a whale sell: if price stays above a buffer threshold for the confirmation window, the position is held
+- **Whale win rate tracking** — Tracks per-whale rolling win/loss outcomes; used by adaptive sizing to scale bet sizes up or down based on recent performance
+- **CLOB auth pre-warm** — CLOB session is initialized at startup to eliminate first-trade auth latency in REAL mode
 - **Auto-redemption** — Resolved positions are automatically redeemed on-chain (REAL mode only)
 - **Whale discovery** — Leaderboard browser with volume filtering to surface high-activity traders
 - **Whale analysis page** — Breakdown of whale activity by sport/category and bet type
@@ -43,10 +52,11 @@ A web app that monitors high-volume Polymarket traders ("whales") and automatica
 polymarket-copier/
 ├── backend/
 │   ├── main.py                # FastAPI app and all API routes
-│   ├── whale_monitor.py       # Background scheduler — polls whale activity
+│   ├── whale_monitor.py       # Background scheduler — polls whale activity; owns harvest scheduler
 │   ├── whale_chain_monitor.py # On-chain exit detection via Polygon eth_getLogs
-│   ├── bet_engine.py          # Bet evaluation, risk checks, order execution
-│   ├── risk_calculator.py     # Conviction-based bet sizing logic
+│   ├── clob_ws_monitor.py     # CLOB WebSocket entry detection (~100ms latency)
+│   ├── bet_engine.py          # Bet evaluation, risk checks, order execution, slippage tracking
+│   ├── risk_calculator.py     # Conviction-based bet sizing logic (whale perf multiplier hook)
 │   ├── redemption.py          # Auto-redemption of resolved positions on-chain
 │   ├── polymarket_client.py   # Polymarket API client wrapper
 │   ├── categorizer.py         # Sport/bet-type classification for markets
@@ -55,6 +65,8 @@ polymarket-copier/
 ├── frontend/
 │   ├── templates/index.html   # Jinja2 dashboard template
 │   └── static/                # CSS and JS
+├── tests/
+│   └── test_regressions.py   # Regression tests covering known past bugs
 ├── data/                      # SQLite database (gitignored)
 ├── logs/                      # Rotating log files (gitignored)
 ├── docker-compose.yml         # Production deployment (port 8081)
@@ -172,6 +184,51 @@ python run.py
 | `DRIFT_RETRY_INTERVAL_SECONDS` | `5` | How often to re-check near-miss drift skips |
 | `DRIFT_RETRY_WINDOW_SECONDS` | `120` | How long to retry a drift-skipped bet before giving up |
 
+### Order Book & Entry Filters (Stage 2)
+
+| Variable | Default | Description |
+|---|---|---|
+| `ORDER_BOOK_CHECK_ENABLED` | `false` | Reject bets when ask-side depth is below the fluid threshold |
+| `MIN_BOOK_DEPTH_USDC` | `50.0` | Minimum required USDC depth (scaled by bet size at runtime) |
+| `MAX_BOOK_SLIPPAGE_PCT` | `0.03` | How far above reference price to sum depth |
+| `WASH_TRADE_DETECTION_ENABLED` | `false` | Skip bets where the same whale sold the same token recently |
+| `WASH_TRADE_WINDOW_MINUTES` | `30` | Look-back window for detecting wash trades |
+
+### Harvest & Independent Exits (Stage 3)
+
+| Variable | Default | Description |
+|---|---|---|
+| `HARVEST_ENABLED` | `false` | Close positions independently when the profit multiplier is reached |
+| `HARVEST_MULTIPLIER` | `1.8` | Close when `current_price > entry_price × multiplier` |
+| `HARVEST_NEAR_CLOSE_HOURS` | `2.0` | Additional near-close harvest: hours before market close to trigger |
+| `HARVEST_NEAR_CLOSE_MIN_MULTIPLIER` | `1.3` | Minimum profit multiplier required for near-close harvest |
+| `EXIT_CONFIRMATION_ENABLED` | `false` | Delay whale-triggered sell if price is above the buffer threshold |
+| `EXIT_CONFIRMATION_BUFFER` | `0.05` | Price must be > `entry × (1 + buffer)` to trigger confirmation delay |
+| `EXIT_CONFIRMATION_TIMEOUT_SECONDS` | `300` | Seconds to wait before closing anyway if still above buffer |
+
+### Slippage Tracking (Stage 4)
+
+| Variable | Default | Description |
+|---|---|---|
+| `SLIPPAGE_TRACKING_ENABLED` | `false` | Record fill vs mid-price slippage and use as entry gate |
+| `MAX_HISTORICAL_SLIPPAGE_PCT` | `0.05` | Skip tokens whose rolling average slippage exceeds this |
+
+### CLOB WebSocket (Stage 5)
+
+| Variable | Default | Description |
+|---|---|---|
+| `CLOB_WS_ENABLED` | `false` | Enable CLOB WebSocket entry detection (~100ms vs 2–4s polling) |
+| `CLOB_WS_URL` | `wss://ws-subscriptions-clob.polymarket.com` | CLOB WebSocket endpoint |
+
+### Whale Performance & Adaptive Sizing (Stages 1 & 6)
+
+| Variable | Default | Description |
+|---|---|---|
+| `WHALE_PERF_WINDOW` | `50` | Rolling window of outcomes used to compute per-whale win rate |
+| `ADAPTIVE_SIZING_ENABLED` | `false` | Scale bet sizes by whale's recent win rate (requires populated win_rate data) |
+| `WHALE_PERF_MIN_MULTIPLIER` | `0.5` | Minimum size multiplier for a whale with 0% recent win rate |
+| `WHALE_PERF_MAX_MULTIPLIER` | `1.5` | Maximum size multiplier for a whale with 100% recent win rate |
+
 ### On-Chain (Polygon)
 
 | Variable | Default | Description |
@@ -225,36 +282,50 @@ Add `PROXY_URL=http://localhost:8888` to `.env`. Comment it out to run without t
 
 | Event | Latency | Notes |
 |---|---|---|
-| Whale buy detected | 2–4 s | API polling interval (default 2 s) + processing |
+| Whale buy detected (CLOB WebSocket) | ~100 ms | `CLOB_WS_ENABLED=true`; network round-trip + order signing dominate after this |
+| Whale buy detected (HTTP polling) | 2–4 s | Default; polling interval (2 s) + processing; runs as fallback alongside WS |
 | Whale sell detected (on-chain) | ~4 s | `eth_getLogs` monitor at 2 s poll, ~2-block finality |
 | Whale sell detected (API polling) | 2–10 s | Fallback when `CHAIN_EXIT_ENABLED=false` |
 | Drift check | < 100 ms | Background pre-fetch keeps prices fresh |
+| Order book depth check | ~50–100 ms | One extra concurrent HTTP call per entry evaluation |
 | Order placed (buy or sell) | 1–3 s | CLOB API round-trip; token-bucket rate limiter adds ≤ 0.2 s at 5 req/s |
+| Harvest / slippage check cycle | 60 s | Runs on resolution scheduler interval |
 | Sell retry exhaustion | up to ~12 s | `SELL_CLOSE_RETRIES=4` × `SELL_CLOSE_RETRY_DELAY_SECONDS=3` |
 | Market resolution check | 60 s | Configurable; triggers auto-redemption in REAL mode |
 | Rate-limit back-off (sell) | +15 s | Applied automatically on nginx 400 HTML responses |
 
-End-to-end copy latency from whale fill → your fill is typically **3–8 seconds** under normal API conditions. On-chain exit monitoring reduces sell detection to ~4 s regardless of API polling.
+**End-to-end copy latency** from whale fill → your fill:
+- **With CLOB WebSocket** (`CLOB_WS_ENABLED=true`): ~1–3 s (detection ~100 ms + CLOB order round-trip)
+- **HTTP polling only** (default): 3–8 s under normal API conditions
+
+On-chain exit monitoring reduces sell detection to ~4 s regardless of API polling.
 
 ### Strengths
 
+- **Ultra-low entry latency** — CLOB WebSocket detection (~100ms) cuts copy lag from 2–4s to sub-second; HTTP polling continues as a fallback
 - **Low-latency sell detection** — on-chain `OrderFilled` monitor fires in ~4 s, well ahead of most API-polling copiers
 - **Drift guards protect entry quality** — asymmetric thresholds skip bets where the price has moved unfavourably while still allowing fills at a better price than the whale paid
 - **Near-miss recovery** — drift retry watchlist gives skipped bets a second chance over a configurable window rather than dropping them permanently
+- **Order book depth protection** — fluid depth check scaled to bet size prevents entries into thin markets where slippage would negate any edge
+- **Per-token slippage tracking** — records historical fill vs mid-price slippage and can gate future entries on tokens with consistently poor fills
 - **Conviction scaling** — bet size rewards high-conviction whale trades convexly, reducing exposure on low-confidence signals
+- **Whale win-rate tracking** — rolling window of per-whale outcomes (last N closes) powers adaptive sizing; bad recent performers are down-sized automatically
+- **Independent profit harvesting** — harvest and near-close harvest exits lock in profit without waiting for the whale to sell; soft exit confirmation delays following a whale sell if the position is currently winning
+- **Wash trade detection** — skips bets that look like a whale cycling the same position for volume rather than edge
 - **Client-side rate limiting** — token bucket prevents IP throttling before it occurs; graceful 400 HTML detection skips or backs off rather than hammering the API
 - **Auto-redemption** — resolved positions are redeemed on-chain automatically; no manual claiming required
 - **Simulation parity** — optional fee simulation makes sim-mode P&L directly comparable to real-mode returns
 
 ### Weaknesses & Known Limitations
 
-- **Inherent copy lag** — even at 2 s polling there is a structural delay vs. the whale's fill; fast-moving markets may have drifted past the drift cap by the time a copy order fires
-- **Market order slippage** — orders execute at the best available ask/bid, not the whale's fill price; thin order books can produce significant slippage on larger sizes
+- **Residual copy lag** — even with WebSocket detection, CLOB order signing and network round-trip add ~1–3 s; fast-resolving events may have moved past the drift cap by then
+- **Market order slippage** — orders execute at the best available ask/bid, not the whale's fill price; the order book depth check mitigates but does not eliminate this on larger sizes
 - **Single exchange** — only Polymarket CLOB; no cross-venue arbitrage or hedging
-- **Whale quality is volume-only** — whales are filtered by raw trading volume, not profitability or edge; a high-volume losing trader will be copied faithfully
-- **Blind exit following** — sells are triggered by whale sell events rather than independent position management; if the whale sells at a bad time (panic, rebalance) the bot follows
+- **Whale quality partially volume-based** — discovery is still filtered by raw trading volume; win-rate adaptive sizing requires several closed positions before it meaningfully differentiates good from bad whales
+- **Harvest timing is approximate** — harvest checks run on the resolution scheduler interval (default 60 s), so actual close may lag the threshold crossing by up to that interval
 - **SQLite concurrency** — a single SQLite file is fine for one bot instance but will not scale to multiple concurrent writers
 - **No position netting** — multiple tranches in the same market accumulate separately; the bot does not consolidate or net positions across whales
+- **Win-rate cold start** — adaptive sizing (Stage 6) is meaningless until a whale has ≥ WHALE_PERF_WINDOW/2 recorded closes; newly tracked whales get 1.0× sizing regardless of past performance
 
 ## Disclaimer
 
