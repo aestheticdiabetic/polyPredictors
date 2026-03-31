@@ -1159,7 +1159,7 @@ class WhaleChainMonitor:
             )
             db.add(whale_bet)
             try:
-                db.flush()
+                synchronized_flush(db)
             except IntegrityError:
                 db.rollback()
                 # The activity API may have saved this WhaleBet first, and its
@@ -1186,7 +1186,7 @@ class WhaleChainMonitor:
                             exit_result = self._bet_engine._handle_exit(
                                 existing, session, db, live_exit_price=live_exit_price
                             )
-                            db.commit()
+                            synchronized_commit(db)
                             if exit_result is False:
                                 log.warning(
                                     "WhaleChainMonitor: retry close also FOK-cancelled "
@@ -1204,13 +1204,13 @@ class WhaleChainMonitor:
                 .first()
             )
             if not session:
-                db.commit()
+                synchronized_commit(db)
                 return
 
             exit_result = self._bet_engine._handle_exit(
                 whale_bet, session, db, live_exit_price=live_exit_price
             )
-            db.commit()
+            synchronized_commit(db)
 
             if exit_result is False:
                 log.warning(
