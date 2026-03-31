@@ -30,6 +30,7 @@ from backend.database import (
     get_db,
     init_db,
 )
+from backend.db_writer import synchronized_commit
 from backend.discord_bot import DiscordBot
 from backend.polymarket_client import PolymarketClient
 from backend.stop_loss import StopLossMonitor
@@ -1495,6 +1496,131 @@ async def soft_exit_stats(mode: str = Query("all"), db: DBSession = Depends(get_
         },
         "pnl": {
             "total_extra_pnl_estimate": total_extra_pnl,
+            "total_actual_pnl_usdc": total_actual_pnl,
+            "avg_actual_pnl_usdc": avg_actual_pnl,
+        },
+        "verdict": verdict,
+        "bets": per_bet,
+    }
+
+
+@app.get("/api/stats/harvest")
+async def harvest_stats(mode: str = Query("all"), db: DBSession = Depends(get_db)):
+    """
+    Analytics for the harvest exit feature (Stage 3a + Feature 8).
+
+    For every closed bet where close_reason starts with "Harvest", computes:
+    - Count by type (threshold vs near-close)
+    - Win/loss/neutral outcomes
+    - Avg price gain at exit (exit_price - entry_price)
+    - Total and avg actual PnL
+    - Verdict: positive / neutral / negative / insufficient_data
+    """
+    import re
+
+    query = db.query(CopiedBet).filter(
+        CopiedBet.close_reason.like("Harvest%"),
+        CopiedBet.status.in_(["CLOSED_WIN", "CLOSED_LOSS", "CLOSED_NEUTRAL"]),
+    )
+    query = _apply_mode_filter(query, mode)
+    bets = query.all()
+
+    total = len(bets)
+    threshold_count = 0
+    near_close_count = 0
+
+    win_count = 0
+    loss_count = 0
+    neutral_count = 0
+
+    price_gains: list[float] = []
+    actual_pnl: list[float] = []
+
+    # "Harvest threshold (price 0.7500 > 0.5000)"
+    threshold_exit_re = re.compile(r"Harvest threshold \(price ([\d.]+)")
+    # "Near-close harvest (1.5h to close)"
+    near_close_re = re.compile(r"Near-close harvest \(([\d.]+)h to close\)")
+
+    per_bet = []
+    for bet in bets:
+        reason = bet.close_reason or ""
+
+        is_threshold = reason.startswith("Harvest threshold")
+        is_near_close = reason.startswith("Near-close harvest")
+
+        if is_threshold:
+            threshold_count += 1
+        elif is_near_close:
+            near_close_count += 1
+
+        if bet.status == "CLOSED_WIN":
+            win_count += 1
+        elif bet.status == "CLOSED_LOSS":
+            loss_count += 1
+        else:
+            neutral_count += 1
+
+        exit_price = None
+        if is_threshold:
+            m = threshold_exit_re.search(reason)
+            if m:
+                exit_price = float(m.group(1))
+
+        gain = None
+        if exit_price is not None and bet.price_at_entry:
+            gain = exit_price - bet.price_at_entry
+            price_gains.append(gain)
+
+        if bet.pnl_usdc is not None:
+            actual_pnl.append(bet.pnl_usdc)
+
+        per_bet.append(
+            {
+                "id": bet.id,
+                "question": bet.question[:80] if bet.question else "",
+                "type": "threshold"
+                if is_threshold
+                else ("near_close" if is_near_close else "unknown"),
+                "status": bet.status,
+                "entry_price": round(bet.price_at_entry, 4) if bet.price_at_entry else None,
+                "exit_price": round(exit_price, 4) if exit_price is not None else None,
+                "price_gain": round(gain, 4) if gain is not None else None,
+                "pnl_usdc": round(bet.pnl_usdc, 2) if bet.pnl_usdc is not None else None,
+                "close_reason": reason,
+                "closed_at": bet.closed_at.isoformat() if bet.closed_at else None,
+            }
+        )
+
+    avg_price_gain = round(sum(price_gains) / len(price_gains), 4) if price_gains else None
+    total_actual_pnl = round(sum(actual_pnl), 2) if actual_pnl else None
+    avg_actual_pnl = round(sum(actual_pnl) / len(actual_pnl), 2) if actual_pnl else None
+    win_rate = round(win_count / total * 100, 1) if total > 0 else None
+
+    if total < 3 or total_actual_pnl is None:
+        verdict = "insufficient_data"
+    elif total_actual_pnl > 0.50:
+        verdict = "positive"
+    elif total_actual_pnl < -0.50:
+        verdict = "negative"
+    else:
+        verdict = "neutral"
+
+    return {
+        "total_harvest_exits": total,
+        "by_type": {
+            "threshold": threshold_count,
+            "near_close": near_close_count,
+        },
+        "outcomes": {
+            "win_count": win_count,
+            "loss_count": loss_count,
+            "neutral_count": neutral_count,
+            "win_rate_pct": win_rate,
+        },
+        "price_stats": {
+            "avg_price_gain": avg_price_gain,
+        },
+        "pnl": {
             "total_actual_pnl_usdc": total_actual_pnl,
             "avg_actual_pnl_usdc": avg_actual_pnl,
         },
