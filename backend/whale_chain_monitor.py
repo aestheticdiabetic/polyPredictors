@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 
 import websockets
 from hexbytes import HexBytes
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from web3 import Web3
 from web3.datastructures import AttributeDict
 
@@ -911,22 +911,27 @@ class WhaleChainMonitor:
                     return
                 raise
 
-            active_sessions = db.query(MonitoringSession).filter_by(is_active=True).all()
-            if not active_sessions:
-                synchronized_commit(db)
-                return
+            try:
+                active_sessions = db.query(MonitoringSession).filter_by(is_active=True).all()
+                if not active_sessions:
+                    synchronized_commit(db)
+                    return
 
-            for session in active_sessions:
-                self._bet_engine.process_new_whale_bet(
-                    whale_bet=whale_bet,
-                    session=session,
-                    db=db,
-                    market_info=market_info,
-                    live_price=live_price,
-                    taker_fee_bps=taker_fee_bps,
-                    order_book=order_book,
-                )
-            synchronized_commit(db)
+                for session in active_sessions:
+                    self._bet_engine.process_new_whale_bet(
+                        whale_bet=whale_bet,
+                        session=session,
+                        db=db,
+                        market_info=market_info,
+                        live_price=live_price,
+                        taker_fee_bps=taker_fee_bps,
+                        order_book=order_book,
+                    )
+                synchronized_commit(db)
+            except PendingRollbackError:
+                db.rollback()
+                log.warning("WhaleChainMonitor: session in pending rollback state, skipping bet")
+                return
         except Exception:
             db.rollback()
             raise
