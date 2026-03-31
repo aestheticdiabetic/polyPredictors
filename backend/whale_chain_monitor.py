@@ -756,13 +756,16 @@ class WhaleChainMonitor:
         if order_book:
             asks = order_book.get("asks", [])
             bids = order_book.get("bids", [])
-            log.debug(
-                "Order book for token %s: asks=%d, bids=%d, book keys=%s",
-                token_id[:16],
-                len(asks) if asks else 0,
-                len(bids) if bids else 0,
-                list(order_book.keys()) if order_book else [],
+            log.info(
+                "Order book for token %s...%s: asks=%d, bids=%d, book_structure=%s",
+                token_id[:10],
+                token_id[-6:],
+                len(asks) if isinstance(asks, list) else 0,
+                len(bids) if isinstance(bids, list) else 0,
+                str(order_book),
             )
+        else:
+            log.warning("Order book is None or not a dict for token %s", token_id[:16])
 
         condition_id = market_info.get("conditionId") or market_info.get("condition_id") or ""
         question = market_info.get("question") or market_info.get("title") or ""
