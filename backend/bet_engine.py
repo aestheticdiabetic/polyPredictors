@@ -120,6 +120,12 @@ class BetEngine:
         # interleaved retry loops and potential double-sells.
         self._closing_bet_ids: set[int] = set()
         self._closing_bet_lock = threading.Lock()
+        # Protects all read-modify-write updates to session.total_pnl_usdc,
+        # session.current_balance_usdc, and win/loss counters.
+        # Without this, concurrent bet closes (e.g. 6 bets all resolving at
+        # 10:30:10) each read the same value, add their own pnl, and write back,
+        # leaving only one update surviving (last-writer-wins).
+        self._session_stats_lock = threading.Lock()
         # Stage 4: Slippage tracking — in-memory rolling window per token (last 20 records)
         from collections import defaultdict, deque
 
@@ -1472,8 +1478,9 @@ class BetEngine:
                 copied_bet.resolution_price = _post_fill_sell_price
                 copied_bet.closed_at = datetime.utcnow()
                 copied_bet.close_reason = skip_reason_val
-                session.total_losses += 1
-                session.total_pnl_usdc = round(session.total_pnl_usdc + _post_fill_pnl, 4)
+                with self._session_stats_lock:
+                    session.total_losses += 1
+                    session.total_pnl_usdc = round(session.total_pnl_usdc + _post_fill_pnl, 4)
                 db.add(session)
 
             synchronized_commit(db)
@@ -1586,17 +1593,17 @@ class BetEngine:
         pnl = proceeds - copied_bet.size_usdc
 
         # Update session balance
-        session.current_balance_usdc += proceeds
-        session.total_pnl_usdc = round(session.total_pnl_usdc + pnl, 2)
-
-        if pnl > 0.01:
-            copied_bet.status = "CLOSED_WIN"
-            session.total_wins += 1
-        elif pnl < -0.01:
-            copied_bet.status = "CLOSED_LOSS"
-            session.total_losses += 1
-        else:
-            copied_bet.status = "CLOSED_NEUTRAL"
+        with self._session_stats_lock:
+            session.current_balance_usdc += proceeds
+            session.total_pnl_usdc = round(session.total_pnl_usdc + pnl, 2)
+            if pnl > 0.01:
+                copied_bet.status = "CLOSED_WIN"
+                session.total_wins += 1
+            elif pnl < -0.01:
+                copied_bet.status = "CLOSED_LOSS"
+                session.total_losses += 1
+            else:
+                copied_bet.status = "CLOSED_NEUTRAL"
 
         copied_bet.pnl_usdc = round(pnl, 2)
         copied_bet.resolution_price = current_price
@@ -1982,8 +1989,9 @@ class BetEngine:
                     "Real sell bet %d: size_shares=0 — buy was never filled, closing as neutral (full refund)",
                     copied_bet.id,
                 )
-                session.current_balance_usdc += copied_bet.size_usdc
-                session.total_pnl_usdc = round((session.total_pnl_usdc or 0.0), 2)
+                with self._session_stats_lock:
+                    session.current_balance_usdc += copied_bet.size_usdc
+                    session.total_pnl_usdc = round((session.total_pnl_usdc or 0.0), 2)
                 copied_bet.status = "CLOSED_NEUTRAL"
                 copied_bet.pnl_usdc = 0.0
                 copied_bet.resolution_price = copied_bet.price_at_entry
@@ -2033,17 +2041,17 @@ class BetEngine:
             proceeds = copied_bet.size_shares * fill_price
         pnl = proceeds - copied_bet.size_usdc
 
-        session.current_balance_usdc = max(0.0, session.current_balance_usdc + proceeds)
-        session.total_pnl_usdc = round((session.total_pnl_usdc or 0.0) + pnl, 2)
-
-        if pnl > 0.01:
-            copied_bet.status = "CLOSED_WIN"
-            session.total_wins += 1
-        elif pnl < -0.01:
-            copied_bet.status = "CLOSED_LOSS"
-            session.total_losses += 1
-        else:
-            copied_bet.status = "CLOSED_NEUTRAL"
+        with self._session_stats_lock:
+            session.current_balance_usdc = max(0.0, session.current_balance_usdc + proceeds)
+            session.total_pnl_usdc = round((session.total_pnl_usdc or 0.0) + pnl, 2)
+            if pnl > 0.01:
+                copied_bet.status = "CLOSED_WIN"
+                session.total_wins += 1
+            elif pnl < -0.01:
+                copied_bet.status = "CLOSED_LOSS"
+                session.total_losses += 1
+            else:
+                copied_bet.status = "CLOSED_NEUTRAL"
 
         copied_bet.pnl_usdc = round(pnl, 2)
         copied_bet.resolution_price = fill_price
@@ -2354,19 +2362,19 @@ class BetEngine:
             effective_cost = pos.size_usdc * fill_scale  # what we actually paid for real tokens
             pos_pnl = round(pos_proceeds - effective_cost, 2)
 
-            session.current_balance_usdc = max(
-                0.0, session.current_balance_usdc + pos_proceeds + refund
-            )
-            session.total_pnl_usdc = round((session.total_pnl_usdc or 0.0) + pos_pnl, 2)
-
-            if pos_pnl > 0.01:
-                pos.status = "CLOSED_WIN"
-                session.total_wins += 1
-            elif pos_pnl < -0.01:
-                pos.status = "CLOSED_LOSS"
-                session.total_losses += 1
-            else:
-                pos.status = "CLOSED_NEUTRAL"
+            with self._session_stats_lock:
+                session.current_balance_usdc = max(
+                    0.0, session.current_balance_usdc + pos_proceeds + refund
+                )
+                session.total_pnl_usdc = round((session.total_pnl_usdc or 0.0) + pos_pnl, 2)
+                if pos_pnl > 0.01:
+                    pos.status = "CLOSED_WIN"
+                    session.total_wins += 1
+                elif pos_pnl < -0.01:
+                    pos.status = "CLOSED_LOSS"
+                    session.total_losses += 1
+                else:
+                    pos.status = "CLOSED_NEUTRAL"
 
             pos.pnl_usdc = pos_pnl
             pos.resolution_price = fill_price
