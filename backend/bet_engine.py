@@ -189,16 +189,18 @@ class BetEngine:
             return False, "No ask orders in book"
 
         max_slippage_price = live_price * (1 + settings.MAX_BOOK_SLIPPAGE_PCT)
-        lowest_ask = float(asks[0].get("price", 0)) if asks else None
+        lowest_ask = None
         usdc_sum = 0.0
 
         for ask in asks:
             try:
                 price = float(ask.get("price", 0))
                 size = float(ask.get("size", 0))
-                if price > max_slippage_price:
-                    break
-                usdc_sum += size * price
+                if lowest_ask is None or price < lowest_ask:
+                    lowest_ask = price
+                # Accumulate depth up to max_slippage_price (no break, check all asks)
+                if price <= max_slippage_price:
+                    usdc_sum += size * price
             except (ValueError, TypeError):
                 pass
 
