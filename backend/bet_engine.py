@@ -419,9 +419,9 @@ class BetEngine:
                         if timeout_exceeded or price_dropped:
                             reason = ""
                             if timeout_exceeded:
-                                reason = f"Soft exit timeout ({elapsed:.0f}s)"
+                                reason = f"Soft exit timeout ({elapsed:.0f}s, whale sold @ {pending_exit.whale_exit_price:.4f}, we sold @ {current_price:.4f})"
                             elif price_dropped:
-                                reason = f"Soft exit price dropped below {buffer_price:.4f}"
+                                reason = f"Soft exit price dropped below {buffer_price:.4f} (whale sold @ {pending_exit.whale_exit_price:.4f}, we sold @ {current_price:.4f})"
 
                             logger.info(
                                 "Closing pending exit for bet %d: %s (price %.4f)",
