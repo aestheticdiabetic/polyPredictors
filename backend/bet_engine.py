@@ -2011,6 +2011,16 @@ class BetEngine:
         # Update whale stats after position is closed (Stage 1)
         self._update_whale_stats(copied_bet.whale_address, pnl, db)
 
+        # Stage 4: Record slippage (REAL mode uses actual fill_price vs current_price as mid)
+        if settings.SLIPPAGE_TRACKING_ENABLED and copied_bet.size_shares > 0:
+            self._record_slippage(
+                token_id=copied_bet.token_id,
+                fill_price=fill_price,
+                mid_price=current_price,
+                mode="EXIT",
+                db=db,
+            )
+
         logger.info(
             "REAL SELL (resolution): bet %d %.4f shares @ %.4f = $%.2f pnl=$%.2f | balance -> $%.2f",
             copied_bet.id,

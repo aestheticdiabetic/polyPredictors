@@ -30,6 +30,9 @@ docker compose up -d --build
 # Start without rebuilding
 docker compose up -d
 
+# Build image with no cache (fresh dependencies)
+docker build --no-cache -t polymarket-app .
+
 # Stop bot
 docker compose down
 
@@ -38,6 +41,21 @@ docker compose restart
 
 # Check container status
 docker compose ps
+```
+
+---
+
+## Git — Version & Deployment
+
+```bash
+# Check current commit (last deployed version)
+git log --oneline -1
+
+# View full commit hash
+git rev-parse HEAD
+
+# Show last 5 commits
+git log --oneline | head -5
 ```
 
 ---
