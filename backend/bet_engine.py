@@ -174,11 +174,20 @@ class BetEngine:
     # ------------------------------------------------------------------
 
     def _check_order_book_depth(
-        self, order_book: dict | None, live_price: float | None, bet_size_usdc: float
+        self,
+        order_book: dict | None,
+        live_price: float | None,
+        bet_size_usdc: float,
+        whale_price: float | None = None,
     ) -> tuple[bool, str]:
         """
         Verify sufficient liquidity in the order book to fill our bet.
-        Sums ask-side USDC up to price (live_price * (1 + MAX_BOOK_SLIPPAGE_PCT)).
+        Sums ask-side USDC up to price (reference_price * (1 + MAX_BOOK_SLIPPAGE_PCT)).
+
+        If whale_price is provided and lowest ask is very close to it (within 2%),
+        uses whale_price as reference — the whale just proved that price is achievable.
+        Otherwise uses live_price.
+
         Returns (True, "") if depth OK; (False, reason) if too thin.
         """
         if not order_book or not live_price:
@@ -188,17 +197,32 @@ class BetEngine:
         if not asks:
             return False, "No ask orders in book"
 
-        max_slippage_price = live_price * (1 + settings.MAX_BOOK_SLIPPAGE_PCT)
+        # Find lowest ask first to determine which reference price to use
         lowest_ask = None
+        for ask in asks:
+            try:
+                price = float(ask.get("price", 0))
+                if lowest_ask is None or price < lowest_ask:
+                    lowest_ask = price
+            except (ValueError, TypeError):
+                pass
+
+        # If whale price is provided and lowest ask is within 2% of it,
+        # use whale_price as reference (whale just proved it's achievable)
+        reference_price = live_price
+        if whale_price and lowest_ask:
+            price_diff_pct = abs(lowest_ask - whale_price) / whale_price if whale_price > 0 else 1.0
+            if price_diff_pct <= 0.02:  # Within 2% of whale price
+                reference_price = whale_price
+
+        max_slippage_price = reference_price * (1 + settings.MAX_BOOK_SLIPPAGE_PCT)
         usdc_sum = 0.0
 
         for ask in asks:
             try:
                 price = float(ask.get("price", 0))
                 size = float(ask.get("size", 0))
-                if lowest_ask is None or price < lowest_ask:
-                    lowest_ask = price
-                # Accumulate depth up to max_slippage_price (no break, check all asks)
+                # Accumulate depth up to max_slippage_price
                 if price <= max_slippage_price:
                     usdc_sum += size * price
             except (ValueError, TypeError):
@@ -207,7 +231,7 @@ class BetEngine:
         if usdc_sum < settings.MIN_BOOK_DEPTH_USDC:
             msg = (
                 f"Thin book: only ${usdc_sum:.2f} depth available (min ${settings.MIN_BOOK_DEPTH_USDC:.2f}) "
-                f"— live_price={live_price:.4f}, max_slippage={max_slippage_price:.4f}, "
+                f"— reference_price={reference_price:.4f}, max_slippage={max_slippage_price:.4f}, "
                 f"lowest_ask={lowest_ask:.4f}"
             )
             return False, msg
@@ -1038,6 +1062,7 @@ class BetEngine:
                     order_book=order_book,
                     live_price=live_price,
                     bet_size_usdc=bet_size_usdc,
+                    whale_price=whale_bet.price,
                 )
                 if not depth_ok:
                     return self._create_skipped_bet(
