@@ -92,6 +92,8 @@ class Whale(Base):
     # Stats
     total_bets_tracked = Column(Integer, default=0, nullable=False)
     win_count = Column(Integer, default=0, nullable=False)
+    # Stage 1: Rolling window of recent bet outcomes (1=win, 0=loss), max WHALE_PERF_WINDOW entries
+    win_rate_window_json = Column(Text, nullable=True)
 
     # Category filters — JSON: {"disabled_sports": [...], "disabled_bet_types": [...]}
     # null means follow all categories (opt-out model)
