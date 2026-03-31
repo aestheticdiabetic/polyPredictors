@@ -544,7 +544,7 @@ class WhaleMonitor:
 
             # Update whale stats
             whale.total_bets_tracked = db.query(WhaleBet).filter_by(whale_id=whale.id).count()
-            db.commit()
+            synchronized_commit(db)
 
             # Update in-memory last_seen
             with self._lock:
@@ -741,7 +741,7 @@ class WhaleMonitor:
                     exit_result = self._bet_engine._handle_exit(
                         whale_bet, session, db, live_exit_price=live_exit_price
                     )
-                    db.commit()  # safety net — _handle_exit commits internally
+                    synchronized_commit(db)  # safety net — _handle_exit commits internally
 
                 except Exception as exc:
                     logger.error("_handle_exit_trades error for %s: %s", address[:10], exc)
@@ -856,7 +856,7 @@ class WhaleMonitor:
         )
         db.add(whale_bet)
         try:
-            db.flush()  # Get ID without committing
+            synchronized_flush(db)  # Get ID without committing
         except IntegrityError:
             db.rollback()
             logger.debug("Duplicate tx_hash %s — skipping", tx_hash)
@@ -901,7 +901,7 @@ class WhaleMonitor:
                         exc,
                     )
 
-            db.commit()
+            synchronized_commit(db)
             logger.info("Refreshed risk profiles for %d whales", len(whales))
         except Exception as exc:
             logger.error("refresh_risk_profiles outer error: %s", exc)
@@ -941,7 +941,7 @@ class WhaleMonitor:
             if session:
                 old = session.current_balance_usdc
                 session.current_balance_usdc = balance
-                db.commit()
+                synchronized_commit(db)
                 logger.info(
                     "Balance sync: REAL session balance $%.2f → $%.2f (live wallet)",
                     old,
@@ -1059,7 +1059,7 @@ class WhaleMonitor:
                                 (session.total_gas_fees_usdc or 0.0) + total_gas_usdc, 6
                             )
                             db.add(session)
-                        db.commit()
+                        synchronized_commit(db)
                     except Exception as db_exc:
                         logger.error("Failed to record gas fees: %s", db_exc)
                         db.rollback()
@@ -1163,7 +1163,7 @@ class WhaleMonitor:
                 client.close()
 
             if updated_wb or updated_cb:
-                db.commit()
+                synchronized_commit(db)
                 logger.info(
                     "Backfill complete: %d whale_bet(s), %d copied_bet(s) updated",
                     updated_wb,

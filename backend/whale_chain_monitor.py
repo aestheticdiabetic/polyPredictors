@@ -887,7 +887,7 @@ class WhaleChainMonitor:
             )
             db.add(whale_bet)
             try:
-                db.flush()
+                synchronized_flush(db)
             except IntegrityError:
                 db.rollback()
                 log.debug("WhaleChainMonitor: duplicate entry tx %s — skipping", tx_hash[:16])
@@ -895,7 +895,7 @@ class WhaleChainMonitor:
 
             active_sessions = db.query(MonitoringSession).filter_by(is_active=True).all()
             if not active_sessions:
-                db.commit()
+                synchronized_commit(db)
                 return
 
             for session in active_sessions:
@@ -908,7 +908,7 @@ class WhaleChainMonitor:
                     taker_fee_bps=taker_fee_bps,
                     order_book=order_book,
                 )
-            db.commit()
+            synchronized_commit(db)
         except Exception:
             db.rollback()
             raise

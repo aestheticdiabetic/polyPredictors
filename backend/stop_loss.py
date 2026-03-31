@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 from backend.config import settings
 from backend.database import CopiedBet, MonitoringSession, PortfolioSnapshot, SessionLocal
+from backend.db_writer import synchronized_commit
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,7 @@ class StopLossMonitor:
                         total_portfolio_usdc=balance + open_val,
                     )
                     db.add(snap)
-                    db.commit()
+                    synchronized_commit(db)
                     logger.debug(
                         "Portfolio snapshot: session=%d balance=%.2f open=%.2f total=%.2f",
                         session.id,
@@ -140,7 +141,7 @@ class StopLossMonitor:
         """Stop the session in-place (session object already loaded)."""
         session.is_active = False
         session.stopped_at = datetime.utcnow()
-        db.commit()
+        synchronized_commit(db)
         # Stop whale poller if no other sessions remain
         remaining = db.query(MonitoringSession).filter_by(is_active=True).count()
         if remaining == 0:

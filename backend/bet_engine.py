@@ -152,7 +152,7 @@ class BetEngine:
 
             whale.win_rate_window_json = json.dumps(window)
             db.add(whale)
-            db.flush()
+            synchronized_flush(db)
 
             logger.debug(
                 "Updated whale %s: total_bets=%d win_count=%d win_rate_window_len=%d",
@@ -304,7 +304,7 @@ class BetEngine:
                             db,
                             close_reason=f"Harvest threshold (price {current_price:.4f} > {bet.price_at_entry * settings.HARVEST_MULTIPLIER:.4f})",
                         )
-                        db.commit()
+                        synchronized_commit(db)
                         continue
 
                     # Feature 8: Near-close harvest
@@ -330,7 +330,7 @@ class BetEngine:
                                 db,
                                 close_reason=f"Near-close harvest ({hours_to_close:.1f}h to close)",
                             )
-                            db.commit()
+                            synchronized_commit(db)
 
                 except Exception as exc:
                     logger.warning(
@@ -403,7 +403,7 @@ class BetEngine:
 
                             session = bet.session
                             self._close_bet(bet, current_price, session, db, close_reason=reason)
-                            db.commit()
+                            synchronized_commit(db)
                             expired_ids.append(copied_bet_id)
 
                     except Exception as exc:
@@ -1440,7 +1440,7 @@ class BetEngine:
                 session.total_pnl_usdc = round(session.total_pnl_usdc + _post_fill_pnl, 4)
                 db.add(session)
 
-            db.commit()
+            synchronized_commit(db)
             db.refresh(copied_bet)
 
             logger.info(
@@ -2766,7 +2766,7 @@ class BetEngine:
                         bet.status,
                     )
 
-            db.commit()
+            synchronized_commit(db)
 
         except Exception as exc:
             logger.error("check_resolution error: %s", exc)
@@ -2968,7 +2968,7 @@ class BetEngine:
                             db=db,
                             close_reason="Orphan: whale exited, no shares on-chain",
                         )
-                        db.commit()
+                        synchronized_commit(db)
                     else:
                         # We hold shares the whale no longer holds — sell at market
                         logger.info(
@@ -2987,7 +2987,7 @@ class BetEngine:
                             db=db,
                             close_reason="Orphan: whale exited, delayed sell",
                         )
-                        db.commit()
+                        synchronized_commit(db)
 
         except Exception as exc:
             logger.error("check_orphan_positions error: %s", exc)
@@ -3352,7 +3352,7 @@ class BetEngine:
                     to_close, sim_exit_price, session, db, exit_reason
                 )
 
-        db.commit()
+        synchronized_commit(db)
         if not close_ok:
             # Sell failed (FOK cancelled / exception) — signal to caller that
             # _last_seen should NOT be advanced so the exit is retried next poll.
@@ -3424,11 +3424,11 @@ class BetEngine:
             db.add(signal)
 
         # Flush so signal.id is populated before it may be used as a FK below.
-        db.flush()
+        synchronized_flush(db)
 
         # ── Conditional placement ─────────────────────────────────────────
         if not (whale and whale.follow_add_signals):
-            db.commit()
+            synchronized_commit(db)
             return existing_open
 
         if session.current_balance_usdc < 1.0:
@@ -3436,7 +3436,7 @@ class BetEngine:
                 "follow_add_signals: balance $%.2f < $1 — signal recorded, no placement",
                 session.current_balance_usdc,
             )
-            db.commit()
+            synchronized_commit(db)
             return existing_open
 
         if suggested_add_usdc < 1.0:
@@ -3444,7 +3444,7 @@ class BetEngine:
                 "follow_add_signals: suggested_add_usdc $%.4f < $1 minimum — skipping placement",
                 suggested_add_usdc,
             )
-            db.commit()
+            synchronized_commit(db)
             return existing_open
 
         market_info = market_info or {}
@@ -3489,7 +3489,7 @@ class BetEngine:
                 max_bet_pct=settings.MAX_BET_PCT,
             )
             if suggested_add_usdc < 1.0:
-                db.commit()
+                synchronized_commit(db)
                 return existing_open
 
             bet_size_usdc = suggested_add_usdc
@@ -3546,7 +3546,7 @@ class BetEngine:
                     whale_bet.id,
                     exc,
                 )
-                db.commit()
+                synchronized_commit(db)
                 return existing_open
 
             follow_bet = CopiedBet(
@@ -3575,7 +3575,7 @@ class BetEngine:
             db.add(follow_bet)
             session.total_bets_placed += 1
             db.add(session)
-            db.commit()
+            synchronized_commit(db)
 
             logger.info(
                 "follow_add_signals: placed %s follow-bet whale_bet=%d %s @%.4f $%.2f"
@@ -3878,7 +3878,7 @@ class BetEngine:
                 session.total_bets_placed += 1
                 db.add(copied_bet)
                 db.add(session)
-                db.commit()
+                synchronized_commit(db)
                 db.refresh(copied_bet)
 
             placed_tokens_this_iter.add(item.token_id)
@@ -3927,7 +3927,7 @@ class BetEngine:
             opened_at=datetime.utcnow(),
         )
         db.add(copied_bet)
-        db.commit()
+        synchronized_commit(db)
         db.refresh(copied_bet)
         logger.info("Skipped bet for whale_bet %d: %s", whale_bet.id, skip_reason)
         return copied_bet
