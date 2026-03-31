@@ -322,6 +322,53 @@
     </div>
   </section>
 
+  <!-- ================================================================
+       SOFT EXIT ANALYTICS
+       ================================================================ -->
+  <section class="card" id="soft-exit-section" style="display:none">
+    <div class="card-title">
+      <span class="dot"></span>
+      Soft Exit Analytics
+      <span class="text-muted" style="font-size:0.72rem;font-weight:400;margin-left:6px">
+        (EXIT_CONFIRMATION_ENABLED — was deferring the exit worth it?)
+      </span>
+    </div>
+
+    <div id="soft-exit-verdict-widget" style="border-radius:8px;overflow:hidden;border:1px solid var(--border)">
+      <div id="soft-exit-verdict-header" style="padding:10px 16px;font-weight:600;font-size:0.85rem;display:flex;align-items:center;gap:8px"></div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:0;border-top:1px solid var(--border)">
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Soft Exits</div>
+          <div class="signal-stat-value" id="se-stat-total">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Timeout / Drop</div>
+          <div class="signal-stat-value" id="se-stat-triggers">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Beat Whale</div>
+          <div class="signal-stat-value" id="se-stat-better">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Worse than Whale</div>
+          <div class="signal-stat-value" id="se-stat-worse">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Avg Price Delta</div>
+          <div class="signal-stat-value" id="se-stat-delta">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Extra P&amp;L Est.</div>
+          <div class="signal-stat-value" id="se-stat-extra-pnl">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Actual P&amp;L</div>
+          <div class="signal-stat-value" id="se-stat-actual-pnl">—</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- Whale Analysis moved to /whales -->
 
 </div><!-- /app-container -->

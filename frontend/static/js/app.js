@@ -110,6 +110,7 @@ document.addEventListener('DOMContentLoaded', () => {
   fetchActivity();
   fetchLedger();
   fetchSignals();
+  fetchSoftExitStats();
 
   // Polling
   State.pollInterval = setInterval(() => {
@@ -206,6 +207,7 @@ function setMode(mode) {
   fetchModeStats();
   fetchLedger();
   fetchSignals();
+  fetchSoftExitStats();
   // For REAL tab: show live wallet balance immediately (even before a session starts)
   if (mode === 'REAL') fetchWalletBalance();
 }
@@ -817,6 +819,79 @@ function renderSignalsWidget(stats) {
   avgEl.style.color = stats.avg_pnl_per_signal > 0 ? 'var(--success)' : stats.avg_pnl_per_signal < 0 ? 'var(--danger)' : '';
 
   $('sig-stat-open').textContent = stats.open_signals;
+}
+
+// ============================================================
+// Soft Exit Analytics
+// ============================================================
+async function fetchSoftExitStats() {
+  try {
+    const stats = await api('GET', '/api/stats/soft-exit?mode=' + State.mode);
+    renderSoftExitWidget(stats);
+  } catch (err) {
+    console.error('fetchSoftExitStats error:', err);
+  }
+}
+
+function renderSoftExitWidget(stats) {
+  const section = document.getElementById('soft-exit-section');
+  if (!section) return;
+
+  if (!stats || stats.total_soft_exits === 0) {
+    section.style.display = 'none';
+    return;
+  }
+
+  section.style.display = '';
+
+  const verdictCfg = {
+    positive:          { bg: 'rgba(0,200,100,0.12)', color: 'var(--success)', icon: '\u2705', text: "Holding on exit is working \u2014 we're selling higher than the whale" },
+    negative:          { bg: 'rgba(220,50,50,0.10)',  color: 'var(--danger)',  icon: '\u26a0\ufe0f', text: "Deferring exits is costing money \u2014 we're selling lower than the whale" },
+    neutral:           { bg: 'rgba(255,200,0,0.10)',  color: 'var(--warning)', icon: '\u2696\ufe0f', text: 'Mixed impact \u2014 no clear edge from deferring exits' },
+    insufficient_data: { bg: 'rgba(255,255,255,0.04)', color: 'var(--text-muted)', icon: '\u2139\ufe0f', text: 'Not enough resolved soft exits yet to draw a conclusion' },
+  };
+  const cfg = verdictCfg[stats.verdict] || verdictCfg.insufficient_data;
+  const header = document.getElementById('soft-exit-verdict-header');
+  header.style.background = cfg.bg;
+  header.style.color = cfg.color;
+
+  header.textContent = '';
+  const iconSpan = document.createElement('span');
+  iconSpan.textContent = cfg.icon;
+  const labelSpan = document.createElement('span');
+  labelSpan.textContent = ' Is soft exit worth it? ';
+  const descSpan = document.createElement('span');
+  descSpan.style.fontWeight = '400';
+  descSpan.textContent = cfg.text;
+  header.appendChild(iconSpan);
+  header.appendChild(labelSpan);
+  header.appendChild(descSpan);
+
+  $('se-stat-total').textContent = stats.total_soft_exits;
+  $('se-stat-triggers').textContent = stats.by_trigger.timeout + 'T / ' + stats.by_trigger.price_drop + 'D';
+
+  const betterEl = $('se-stat-better');
+  betterEl.textContent = stats.exit_price_vs_whale.better_count;
+  betterEl.style.color = stats.exit_price_vs_whale.better_count > 0 ? 'var(--success)' : '';
+
+  const worseEl = $('se-stat-worse');
+  worseEl.textContent = stats.exit_price_vs_whale.worse_count;
+  worseEl.style.color = stats.exit_price_vs_whale.worse_count > 0 ? 'var(--danger)' : '';
+
+  const deltaEl = $('se-stat-delta');
+  const delta = stats.exit_price_vs_whale.avg_price_delta;
+  deltaEl.textContent = delta != null ? (delta >= 0 ? '+' : '') + delta.toFixed(4) : '\u2014';
+  deltaEl.style.color = delta > 0 ? 'var(--success)' : delta < 0 ? 'var(--danger)' : '';
+
+  const extraEl = $('se-stat-extra-pnl');
+  const extra = stats.pnl.total_extra_pnl_estimate;
+  extraEl.textContent = extra != null ? formatPnl(extra) : '\u2014';
+  extraEl.style.color = extra > 0 ? 'var(--success)' : extra < 0 ? 'var(--danger)' : '';
+
+  const actualEl = $('se-stat-actual-pnl');
+  const actual = stats.pnl.total_actual_pnl_usdc;
+  actualEl.textContent = actual != null ? formatPnl(actual) : '\u2014';
+  actualEl.style.color = actual > 0 ? 'var(--success)' : actual < 0 ? 'var(--danger)' : '';
 }
 
 function renderSignalsGrouped(signals, tab, page) {

@@ -1374,6 +1374,135 @@ async def get_signals_stats(mode: str = Query("all"), db: DBSession = Depends(ge
     }
 
 
+@app.get("/api/stats/soft-exit")
+async def soft_exit_stats(mode: str = Query("all"), db: DBSession = Depends(get_db)):
+    """
+    Analytics for the soft exit confirmation feature (Stage 3).
+
+    For every closed bet where close_reason starts with "Soft exit", computes:
+    - Count by trigger type (timeout vs price-drop)
+    - How often we exited above vs below the whale's price
+    - Average price delta (our price - whale price)
+    - Estimated extra PnL captured (price_delta * size_shares)
+    - Actual PnL totals for soft-exit bets
+    - Verdict: positive / neutral / negative / insufficient_data
+    """
+    import re
+
+    query = db.query(CopiedBet).filter(
+        CopiedBet.close_reason.like("Soft exit%"),
+        CopiedBet.status.in_(["CLOSED_WIN", "CLOSED_LOSS", "CLOSED_NEUTRAL"]),
+    )
+    query = _apply_mode_filter(query, mode)
+    bets = query.all()
+
+    total = len(bets)
+    timeout_count = 0
+    price_drop_count = 0
+
+    better_count = 0  # we exited at higher price than whale
+    worse_count = 0  # we exited at lower price than whale
+    neutral_count = 0  # prices equal / unparseable
+
+    price_deltas: list[float] = []
+    extra_pnl_estimates: list[float] = []
+    actual_pnl: list[float] = []
+
+    # Patterns to extract prices from close_reason text
+    whale_price_re = re.compile(r"whale sold @ ([\d.]+)")
+    we_price_re = re.compile(r"we sold @ ([\d.]+)")
+
+    per_bet = []
+    for bet in bets:
+        reason = bet.close_reason or ""
+        is_timeout = "timeout" in reason.lower()
+        is_price_drop = "price dropped" in reason.lower()
+
+        if is_timeout:
+            timeout_count += 1
+        elif is_price_drop:
+            price_drop_count += 1
+
+        whale_m = whale_price_re.search(reason)
+        we_m = we_price_re.search(reason)
+
+        whale_price = float(whale_m.group(1)) if whale_m else None
+        our_price = float(we_m.group(1)) if we_m else None
+
+        delta = None
+        extra_pnl = None
+        if whale_price is not None and our_price is not None:
+            delta = our_price - whale_price
+            price_deltas.append(delta)
+            if bet.size_shares:
+                extra_pnl = delta * bet.size_shares
+                extra_pnl_estimates.append(extra_pnl)
+            if delta > 0.0001:
+                better_count += 1
+            elif delta < -0.0001:
+                worse_count += 1
+            else:
+                neutral_count += 1
+        else:
+            neutral_count += 1
+
+        if bet.pnl_usdc is not None:
+            actual_pnl.append(bet.pnl_usdc)
+
+        per_bet.append(
+            {
+                "id": bet.id,
+                "question": bet.question[:80] if bet.question else "",
+                "trigger": "timeout"
+                if is_timeout
+                else ("price_drop" if is_price_drop else "unknown"),
+                "whale_exit_price": round(whale_price, 4) if whale_price is not None else None,
+                "our_exit_price": round(our_price, 4) if our_price is not None else None,
+                "price_delta": round(delta, 4) if delta is not None else None,
+                "extra_pnl_estimate": round(extra_pnl, 4) if extra_pnl is not None else None,
+                "pnl_usdc": round(bet.pnl_usdc, 2) if bet.pnl_usdc is not None else None,
+                "close_reason": reason,
+                "closed_at": bet.closed_at.isoformat() if bet.closed_at else None,
+            }
+        )
+
+    avg_delta = round(sum(price_deltas) / len(price_deltas), 4) if price_deltas else None
+    total_extra_pnl = round(sum(extra_pnl_estimates), 2) if extra_pnl_estimates else None
+    total_actual_pnl = round(sum(actual_pnl), 2) if actual_pnl else None
+    avg_actual_pnl = round(sum(actual_pnl) / len(actual_pnl), 2) if actual_pnl else None
+
+    # Verdict based on whether soft exit is net positive
+    if total == 0 or total_extra_pnl is None:
+        verdict = "insufficient_data"
+    elif total_extra_pnl > 0.50:
+        verdict = "positive"
+    elif total_extra_pnl < -0.50:
+        verdict = "negative"
+    else:
+        verdict = "neutral"
+
+    return {
+        "total_soft_exits": total,
+        "by_trigger": {
+            "timeout": timeout_count,
+            "price_drop": price_drop_count,
+        },
+        "exit_price_vs_whale": {
+            "better_count": better_count,
+            "worse_count": worse_count,
+            "neutral_count": neutral_count,
+            "avg_price_delta": avg_delta,
+        },
+        "pnl": {
+            "total_extra_pnl_estimate": total_extra_pnl,
+            "total_actual_pnl_usdc": total_actual_pnl,
+            "avg_actual_pnl_usdc": avg_actual_pnl,
+        },
+        "verdict": verdict,
+        "bets": per_bet,
+    }
+
+
 @app.get("/api/signals")
 async def get_signals(
     page: int = Query(1, ge=1),
