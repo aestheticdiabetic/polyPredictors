@@ -189,6 +189,7 @@ class BetEngine:
             return False, "No ask orders in book"
 
         max_slippage_price = live_price * (1 + settings.MAX_BOOK_SLIPPAGE_PCT)
+        lowest_ask = float(asks[0].get("price", 0)) if asks else None
         usdc_sum = 0.0
 
         for ask in asks:
@@ -202,11 +203,12 @@ class BetEngine:
                 pass
 
         if usdc_sum < settings.MIN_BOOK_DEPTH_USDC:
-            return (
-                False,
-                f"Thin book: only ${usdc_sum:.2f} depth available "
-                f"(min ${settings.MIN_BOOK_DEPTH_USDC:.2f})",
+            msg = (
+                f"Thin book: only ${usdc_sum:.2f} depth available (min ${settings.MIN_BOOK_DEPTH_USDC:.2f}) "
+                f"— live_price={live_price:.4f}, max_slippage={max_slippage_price:.4f}, "
+                f"lowest_ask={lowest_ask:.4f}"
             )
+            return False, msg
 
         return True, ""
 
