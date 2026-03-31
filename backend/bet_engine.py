@@ -114,6 +114,12 @@ class BetEngine:
         # Stage 3: Pending exits — positions deferred for confirmation (soft exit logic)
         self._pending_exits: dict[int, _PendingExit] = {}
         self._pending_exits_lock = threading.Lock()
+        # Prevents duplicate concurrent _close_bet executions for the same bet.
+        # Without this, multiple scheduler jobs (check_resolution, check_orphan,
+        # harvest) can race to close the same position simultaneously, producing
+        # interleaved retry loops and potential double-sells.
+        self._closing_bet_ids: set[int] = set()
+        self._closing_bet_lock = threading.Lock()
         # Stage 4: Slippage tracking — in-memory rolling window per token (last 20 records)
         from collections import defaultdict, deque
 
@@ -1886,6 +1892,18 @@ class BetEngine:
                 return fill_price, taking_amount_usdc
 
             except Exception as exc:
+                # 404 "No orderbook exists" means the market has resolved/settled.
+                # Retrying is pointless — the orderbook will never come back.
+                # Return immediately so _close_bet_real can do an oracle close.
+                _is_no_orderbook = getattr(exc, "status_code", None) == 404 and (
+                    "no orderbook exists" in str(exc).lower() or "orderbook" in str(exc).lower()
+                )
+                if _is_no_orderbook:
+                    logger.warning(
+                        "Real sell bet %d: no orderbook for token (market resolved) — aborting sell retries",
+                        copied_bet.id,
+                    )
+                    return None, None
                 _log_retry(f"exception: {exc}")
                 if not last:
                     # 400 HTML = nginx/CDN rate limit; back off substantially
@@ -1917,6 +1935,32 @@ class BetEngine:
         if copied_bet.mode in ("SIMULATION", "HEDGE_SIM"):
             return self.simulate_sell(copied_bet, current_price, session, db, close_reason)
 
+        # REAL mode — guard against concurrent close attempts for the same bet.
+        # Multiple scheduler jobs (check_resolution, check_orphan_positions,
+        # harvest) can fire simultaneously; only the first one proceeds.
+        with self._closing_bet_lock:
+            if copied_bet.id in self._closing_bet_ids:
+                logger.warning(
+                    "Real close bet %d: already in progress — skipping duplicate concurrent close",
+                    copied_bet.id,
+                )
+                return 0.0
+            self._closing_bet_ids.add(copied_bet.id)
+        try:
+            return self._close_bet_real(copied_bet, current_price, session, db, close_reason)
+        finally:
+            with self._closing_bet_lock:
+                self._closing_bet_ids.discard(copied_bet.id)
+
+    def _close_bet_real(
+        self,
+        copied_bet: CopiedBet,
+        current_price: float,
+        session: MonitoringSession,
+        db: DBSession,
+        close_reason: str = "",
+    ) -> float:
+        """REAL-mode close logic, called exclusively by _close_bet after lock acquisition."""
         # REAL mode — resolved markets (price ≥ 0.98 or ≤ 0.02) have no CLOB
         # order book; attempting a sell returns "not enough balance/allowance".
         # Close the DB record at the oracle price and let auto-redemption recover
@@ -1957,8 +2001,28 @@ class BetEngine:
                 return 0.0
             sell_result = self._sell_with_retry(copied_bet, current_price)
             if sell_result == (None, None):
-                return 0.0
-            fill_price, taking_amount_usdc = sell_result
+                # Sell failed — check whether market resolved while retrying.
+                # This happens when the CLOB returns 404 "No orderbook exists"
+                # (market settled) and _sell_with_retry aborts immediately.
+                # Look up the resolution cache; if the market is confirmed
+                # resolved, do an oracle close rather than leaving OPEN.
+                cache_entry = self._resolution_cache.get(copied_bet.token_id)
+                oracle_price = cache_entry[0] if cache_entry else None
+                is_resolved = cache_entry[2] if cache_entry else False
+                if is_resolved or (
+                    oracle_price is not None and (oracle_price >= 0.98 or oracle_price <= 0.02)
+                ):
+                    fill_price = oracle_price if oracle_price is not None else current_price
+                    logger.info(
+                        "Real close bet %d: sell returned no-orderbook; market resolved at %.4f — oracle close",
+                        copied_bet.id,
+                        fill_price,
+                    )
+                    # taking_amount_usdc stays None -> fallback to shares * price below
+                else:
+                    return 0.0
+            else:
+                fill_price, taking_amount_usdc = sell_result
 
         # Use actual USDC received (takingAmount from CLOB) when available.
         # Falls back to shares x price for oracle-priced closes (resolved markets
