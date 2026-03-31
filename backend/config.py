@@ -235,6 +235,12 @@ class Settings:
     )
     MAX_HISTORICAL_SLIPPAGE_PCT: float = float(os.getenv("MAX_HISTORICAL_SLIPPAGE_PCT", "0.05"))
 
+    # Stage 5: WebSocket entry detection via Polygon/Alchemy WSS
+    # Uses CLOB_WS_URL if set, otherwise falls back to POLYGON_WS_URL / POLYGON_RPC_URL.
+    # Provides ~200ms entry detection alongside the existing HTTP polling fallback.
+    CLOB_WS_ENABLED: bool = os.getenv("CLOB_WS_ENABLED", "false").lower() == "true"
+    CLOB_WS_URL: str = os.getenv("CLOB_WS_URL", "")
+
     # Stage 6: Adaptive whale sizing based on rolling win rate
     ADAPTIVE_SIZING_ENABLED: bool = os.getenv("ADAPTIVE_SIZING_ENABLED", "false").lower() == "true"
     WHALE_PERF_MIN_MULTIPLIER: float = float(os.getenv("WHALE_PERF_MIN_MULTIPLIER", "0.5"))

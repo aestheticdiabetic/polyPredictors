@@ -98,6 +98,15 @@ class WhaleMonitor:
                 "call start_chain_monitor_task() from lifespan to activate"
             )
 
+        if settings.CLOB_WS_ENABLED:
+            from backend.clob_ws_monitor import ClobWsEntryMonitor
+
+            self._clob_ws_monitor = ClobWsEntryMonitor(self._bet_engine, self)
+            logger.info(
+                "CLOB WS entry monitor initialised (WebSocket) — "
+                "call start_clob_ws_task() from lifespan to activate"
+            )
+
         self._resolution_scheduler.add_job(
             func=self._backfill_missing_market_info,
             trigger=IntervalTrigger(minutes=15),
@@ -292,6 +301,17 @@ class WhaleMonitor:
             return None
         task = monitor.start()
         logger.info("On-chain exit monitor WebSocket task started")
+        return task
+
+    def start_clob_ws_task(self) -> "asyncio.Task | None":
+        """Start the CLOB WS entry monitor as an asyncio Task. Call from lifespan."""
+        if not settings.CLOB_WS_ENABLED:
+            return None
+        monitor = getattr(self, "_clob_ws_monitor", None)
+        if monitor is None:
+            return None
+        task = monitor.start()
+        logger.info("CLOB WS entry monitor WebSocket task started")
         return task
 
     def shutdown(self):

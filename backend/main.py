@@ -107,6 +107,7 @@ async def lifespan(app: FastAPI):
         discord_task = asyncio.create_task(discord_bot.start())
         logger.info("Discord bot task started")
     whale_monitor.start_chain_monitor_task()
+    whale_monitor.start_clob_ws_task()
 
     # Stage 1: Pre-warm CLOB authentication to avoid first-request delay
     if settings.credentials_valid():
