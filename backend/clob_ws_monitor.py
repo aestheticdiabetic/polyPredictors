@@ -704,6 +704,7 @@ class ClobWsEntryMonitor:
                 tx_hash=tx_hash or None,
                 bet_type=bet_type,
             )
+            whale_bet.whale = whale_rec
             db.add(whale_bet)
             try:
                 synchronized_flush(db)
