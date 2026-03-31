@@ -893,6 +893,12 @@ class WhaleChainMonitor:
                 db.rollback()
                 log.debug("WhaleChainMonitor: duplicate entry tx %s — skipping", tx_hash[:16])
                 return
+            except OperationalError as e:
+                db.rollback()
+                if "database is locked" in str(e):
+                    log.warning("WhaleChainMonitor: database locked during flush, retrying later")
+                    return
+                raise
 
             active_sessions = db.query(MonitoringSession).filter_by(is_active=True).all()
             if not active_sessions:
