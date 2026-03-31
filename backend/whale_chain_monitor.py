@@ -30,6 +30,7 @@ from web3.datastructures import AttributeDict
 from backend.bet_engine import asset_id_matches
 from backend.config import settings
 from backend.database import CopiedBet, MonitoringSession, SessionLocal, Whale, WhaleBet
+from backend.db_writer import synchronized_commit, synchronized_flush
 from backend.redemption import CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE, ORDER_FILLED_ABI
 
 log = logging.getLogger(__name__)

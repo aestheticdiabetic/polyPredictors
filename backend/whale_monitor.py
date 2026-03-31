@@ -22,6 +22,7 @@ from backend.database import (
     Whale,
     WhaleBet,
 )
+from backend.db_writer import synchronized_commit, synchronized_flush
 
 logger = logging.getLogger(__name__)
 

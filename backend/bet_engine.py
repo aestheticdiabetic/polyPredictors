@@ -26,6 +26,7 @@ from backend.database import (
     Whale,
     WhaleBet,
 )
+from backend.db_writer import synchronized_commit, synchronized_flush
 from backend.risk_calculator import RiskCalculator
 
 logger = logging.getLogger(__name__)
