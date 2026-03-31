@@ -1805,16 +1805,18 @@ class BetEngine:
                             # Grace period elapsed during retries — leave OPEN for
                             # the next resolution cycle rather than neutral-closing.
                             return None, None
-                        # Bet is old enough that an absent Data API position is
-                        # genuinely empty — neutral close (no actual sell needed).
+                        # Single Data API snapshot can lag well beyond the grace
+                        # period (network congestion, indexer backlog).  Never
+                        # phantom-close inside the sell loop — return (None, None)
+                        # so _close_bet_real can do one final confirmation before
+                        # deciding whether to neutral-close or leave OPEN.
                         logger.warning(
-                            "Real sell bet %d: no on-chain position confirmed after %d "
-                            "attempt(s) (bet age=%.0fs) — closing neutral",
+                            "Real sell bet %d: CLOB no_position, Data API shows 0 "
+                            "(bet age=%.0fs) — deferring to caller for final check",
                             copied_bet.id,
-                            attempt + 1,
                             age_seconds,
                         )
-                        return copied_bet.price_at_entry, None
+                        return None, None
 
                     # Data API shows a non-zero balance.
                     # Only update size_shares downward (corrects a partial fill) or
@@ -2042,6 +2044,40 @@ class BetEngine:
                     )
                     # taking_amount_usdc stays None -> fallback to shares * price below
                 else:
+                    # Sell failed for an unresolved market.  Before leaving OPEN,
+                    # do one final Data API check: if it confirms 0 on-chain shares
+                    # the buy was never actually filled and we can neutral-close
+                    # (USDC never left the wallet).  If shares are present but the
+                    # CLOB can't sell (expired allowance, rate-limit, etc.) leave
+                    # OPEN so the orphan checker retries in the next cycle.
+                    confirmed_shares = self._get_actual_position_size(copied_bet.token_id)
+                    if confirmed_shares is not None and confirmed_shares <= 0:
+                        logger.warning(
+                            "Real close bet %d: sell failed and Data API confirms 0 "
+                            "on-chain shares — closing neutral (buy likely unfilled)",
+                            copied_bet.id,
+                        )
+                        with self._session_stats_lock:
+                            session.current_balance_usdc += copied_bet.size_usdc
+                            session.total_pnl_usdc = round((session.total_pnl_usdc or 0.0), 2)
+                        copied_bet.status = "CLOSED_NEUTRAL"
+                        copied_bet.pnl_usdc = 0.0
+                        copied_bet.resolution_price = copied_bet.price_at_entry
+                        copied_bet.closed_at = datetime.utcnow()
+                        if close_reason:
+                            copied_bet.close_reason = close_reason
+                        db.add(copied_bet)
+                        db.add(session)
+                        logger.info(
+                            "REAL unfilled-buy neutral close: bet %d refunded $%.2f | "
+                            "balance -> $%.2f",
+                            copied_bet.id,
+                            copied_bet.size_usdc,
+                            session.current_balance_usdc,
+                        )
+                        return 0.0
+                    # Shares confirmed present (or Data API unreachable) — leave
+                    # OPEN so the orphan checker retries in the next cycle.
                     return 0.0
             else:
                 fill_price, taking_amount_usdc = sell_result
