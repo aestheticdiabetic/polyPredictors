@@ -1952,6 +1952,20 @@ class BetEngine:
                     copied_bet.id,
                 )
                 return 0.0
+            # Refresh status from DB while holding the lock.  check_resolution and
+            # check_orphan_positions both snapshot OPEN bets at job start — by the
+            # time one job finishes closing a bet and releases the lock, the other
+            # job's stale Python object still shows status="OPEN".  Without this
+            # refresh the second job would proceed and double-close the bet
+            # (double P&L, spurious "orphan: whale exited, delayed sell" logs).
+            db.refresh(copied_bet)
+            if copied_bet.status != "OPEN":
+                logger.debug(
+                    "Real close bet %d: already %s — skipping stale close attempt",
+                    copied_bet.id,
+                    copied_bet.status,
+                )
+                return 0.0
             self._closing_bet_ids.add(copied_bet.id)
         try:
             return self._close_bet_real(copied_bet, current_price, session, db, close_reason)
