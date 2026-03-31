@@ -749,9 +749,24 @@ class WhaleChainMonitor:
         )
 
         market_info: dict = market_result if isinstance(market_result, dict) else {}
-        live_price = price_result if isinstance(price_result, float) else None
         taker_fee_bps = fee_result if isinstance(fee_result, int) else 1000
         order_book = book_result if isinstance(book_result, dict) else None
+
+        # Extract live_price from order book min ask (actual market price) or API estimate (fallback)
+        live_price = None
+        if order_book and isinstance(order_book, dict):
+            asks = order_book.get("asks", [])
+            if asks and isinstance(asks, list) and len(asks) > 0:
+                try:
+                    # Asks are in descending order, so minimum ask is the last element
+                    min_ask_price = float(asks[-1].get("price", 0))
+                    if min_ask_price > 0:
+                        live_price = min_ask_price
+                except (ValueError, TypeError, KeyError, IndexError):
+                    pass
+        # Fallback to API estimate if order book min ask extraction failed
+        if live_price is None:
+            live_price = price_result if isinstance(price_result, float) else None
 
         if order_book:
             asks = order_book.get("asks", [])
