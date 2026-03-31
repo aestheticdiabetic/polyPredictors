@@ -824,9 +824,56 @@ class WhaleChainMonitor:
             if tx_hash.startswith("0x"):
                 tx_hash = tx_hash[2:]
 
+            market_id = trade.get("conditionId", "")
+
+            # Detect if this is an add-to-position by checking for existing open position
+            # in the same market. Query for any OPEN or ADD-TO-POSITION bet before this
+            # timestamp that doesn't have a matching EXIT after it.
+            existing_entries = (
+                db.query(WhaleBet)
+                .filter(
+                    WhaleBet.whale_id == whale_rec.id,
+                    WhaleBet.market_id == market_id,
+                    WhaleBet.bet_type.in_(["OPEN", "ADD-TO-POSITION"]),
+                    WhaleBet.timestamp < ts,
+                )
+                .all()
+            )
+
+            # Check if any existing entry has a matching exit
+            has_open_position = False
+            for entry in existing_entries:
+                exit_exists = (
+                    db.query(WhaleBet)
+                    .filter(
+                        WhaleBet.whale_id == whale_rec.id,
+                        WhaleBet.market_id == market_id,
+                        WhaleBet.bet_type == "EXIT",
+                        WhaleBet.timestamp > entry.timestamp,
+                    )
+                    .first()
+                )
+                if not exit_exists:
+                    has_open_position = True
+                    break
+
+            bet_type = "ADD-TO-POSITION" if has_open_position else "OPEN"
+
+            # Log the position classification
+            log.info(
+                "WhaleChainMonitor: %s whale=%s market=%s...%s outcome=%s price=%.4f usdc=%.2f",
+                bet_type,
+                whale_address[:10],
+                market_id[:10],
+                market_id[-6:],
+                trade.get("outcome", "YES"),
+                trade.get("price", 0.5),
+                trade.get("usdcSize", 0.0),
+            )
+
             whale_bet = WhaleBet(
                 whale_id=whale_rec.id,
-                market_id=trade.get("conditionId", ""),
+                market_id=market_id,
                 token_id=trade.get("asset", ""),
                 question=trade.get("question", ""),
                 side="BUY",
@@ -836,7 +883,7 @@ class WhaleChainMonitor:
                 size_shares=trade.get("shares", 0.0),
                 timestamp=ts,
                 tx_hash=tx_hash or None,
-                bet_type="OPEN",
+                bet_type=bet_type,
             )
             db.add(whale_bet)
             try:

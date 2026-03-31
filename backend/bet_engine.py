@@ -608,7 +608,8 @@ class BetEngine:
             return self._handle_exit(whale_bet, session, db, live_exit_price=live_price)
 
         # ---- CASE 2: Whale is opening / adding to a position ----------
-        # Two sub-cases:
+        # Handles both OPEN and ADD-TO-POSITION bet types (latter detected from prior
+        # position in whale_chain_monitor). Two sub-cases for same/different price:
         #   a) Same price (within _SAME_PRICE_TOLERANCE): whale is adding more capital
         #      to an existing position at the same entry level → AddToPositionSignal.
         #   b) Different price: whale is opening a NEW independent tranche at a different
