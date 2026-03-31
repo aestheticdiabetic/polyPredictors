@@ -108,14 +108,14 @@ async def synchronized_commit_async(
 
 
 def _execute_with_retries(
-    operation: Callable[[], T],
+    func: Callable[[], T],
     operation: str = "db_write",
 ) -> T | None:
     """
     Execute database operation with exponential backoff retry.
 
     Args:
-        operation: Callable that performs the DB operation
+        func: Callable that performs the DB operation
         operation: String name for logging
 
     Returns:
@@ -129,7 +129,7 @@ def _execute_with_retries(
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
             with _db_write_lock:
-                return operation()
+                return func()
         except OperationalError as e:
             if "database is locked" not in str(e):
                 # Not a lock contention error — re-raise immediately
