@@ -18,8 +18,9 @@ NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 # Gnosis Conditional Tokens Framework — the ERC-1155 contract that holds conditional
 # tokens and exposes redeemPositions().  This is a different contract from the
 # Polymarket Exchange (CTF_EXCHANGE above).
+# Both regular AND neg-risk markets on Polygon mainnet use the same CTF contract
+# for redeemPositions (confirmed from py_clob_client config: chain 137 conditional_tokens).
 GNOSIS_CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-NEG_RISK_GNOSIS_CTF = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 ZERO_BYTES32 = b"\x00" * 32
@@ -218,10 +219,9 @@ async def redeem_position(position: dict) -> dict:
         if not condition_id:
             return {"error": "No conditionId in position"}
 
-        # API returns "negativeRisk", not "negRisk".
-        # Use the Gnosis CTF contract for redeemPositions — NOT the Polymarket Exchange.
-        neg_risk = position.get("negativeRisk", False)
-        ctf_addr = NEG_RISK_GNOSIS_CTF if neg_risk else GNOSIS_CTF
+        # Both regular and neg-risk markets use the same Gnosis CTF contract for
+        # redeemPositions on Polygon mainnet (chain 137).
+        ctf_addr = GNOSIS_CTF
 
         # Index set for the specific outcome we hold (not both [1, 2])
         # outcomeIndex 0 → indexSet 1 (0b01)
@@ -312,6 +312,11 @@ async def redeem_position(position: dict) -> dict:
                 "gas_matic": gas_matic,
             }
         else:
+            log.error(
+                "redeemPositions reverted conditionId=%s tx=%s",
+                condition_id[:16],
+                tx_hash.hex()[:16],
+            )
             return {"error": "Transaction reverted", "tx_hash": tx_hash.hex()}
 
     except Exception as e:
@@ -355,7 +360,11 @@ async def check_and_redeem() -> dict:
                 )
             else:
                 failed += 1
-                log.error("Failed to redeem position: %s", result.get("error"))
+                log.error(
+                    "Failed to redeem conditionId=%s: %s",
+                    position.get("conditionId", "?")[:16],
+                    result.get("error"),
+                )
 
         return {
             "redeemed": redeemed,
