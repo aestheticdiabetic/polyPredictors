@@ -150,11 +150,7 @@ class RiskCalculator:
 
         Checks:
         - Market is still open and active (not resolved / closed)
-        - Time-to-close rules:
-            * < 1 minute remaining → always skip (hard floor)
-            * 1 min - min_hours_to_close remaining → skip UNLESS live price is
-              within 2% of the whale's entry price (price still representative)
-            * >= min_hours_to_close remaining → allow through
+        - Market has not already closed (hours_remaining < 0)
 
         Returns:
             (True, "") if safe to proceed
@@ -246,34 +242,6 @@ class RiskCalculator:
                     False,
                     f"Market closed {abs(hours_remaining):.1f}h ago",
                 )
-
-            HARD_MIN_HOURS = 1.0 / 60.0  # 1 minute — never bet this close to close
-            if hours_remaining < HARD_MIN_HOURS:
-                mins = hours_remaining * 60
-                return (
-                    False,
-                    f"Market closes in {mins:.1f}min — too close to close",
-                )
-
-            if hours_remaining < min_hours_to_close:
-                # Allow through if live price is within 2% of the whale's entry price,
-                # meaning the market is still pricing correctly despite the short window.
-                if whale_price is not None and live_price is not None:
-                    drift = abs(live_price - whale_price)
-                    if drift <= 0.02:
-                        pass  # price looks good — allow the bet
-                    else:
-                        mins = hours_remaining * 60
-                        return (
-                            False,
-                            f"Market closes in {mins:.0f}min, price drift {drift:.3f} > 2% — skipping",
-                        )
-                else:
-                    # No price data to validate — apply the original stricter rule
-                    return (
-                        False,
-                        f"Market closes in {hours_remaining:.1f}h (min {min_hours_to_close}h required, no price data)",
-                    )
         except (ValueError, TypeError) as exc:
             logger.warning("Could not parse endDate '%s': %s", end_date_str, exc)
             return False, f"Could not parse market end date: {end_date_str!r}"
