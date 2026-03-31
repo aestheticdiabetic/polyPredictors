@@ -198,7 +198,22 @@ async def get_redeemable_positions(wallet_address: str) -> list[dict]:
             resp.raise_for_status()
             positions = resp.json()
 
-        return [p for p in positions if p.get("redeemable") and float(p.get("size", 0)) > 0]
+        redeemable = [p for p in positions if p.get("redeemable") and float(p.get("size", 0)) > 0]
+        # Log positions with value that aren't being picked up
+        for p in positions:
+            value = float(p.get("currentValue") or p.get("value") or 0)
+            size = float(p.get("size", 0))
+            if value > 0.01 or size > 0:
+                log.info(
+                    "Position: conditionId=%s outcome=%s size=%.4f currentValue=$%.4f redeemable=%s",
+                    str(p.get("conditionId", "?"))[:20],
+                    p.get("outcome", "?"),
+                    size,
+                    value,
+                    p.get("redeemable"),
+                )
+        log.info("Total positions from API: %d, redeemable: %d", len(positions), len(redeemable))
+        return redeemable
     except Exception as e:
         log.error("Failed to fetch redeemable positions: %s", e)
         return []
@@ -356,6 +371,7 @@ async def check_and_redeem() -> dict:
                     {
                         "condition_id": position.get("conditionId", ""),
                         "gas_matic": gas_matic,
+                        "value": result.get("value", 0.0),
                     }
                 )
             else:

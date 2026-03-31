@@ -111,6 +111,7 @@ document.addEventListener('DOMContentLoaded', () => {
   fetchLedger();
   fetchSignals();
   fetchSoftExitStats();
+  fetchHarvestStats();
 
   // Polling
   State.pollInterval = setInterval(() => {
@@ -208,6 +209,7 @@ function setMode(mode) {
   fetchLedger();
   fetchSignals();
   fetchSoftExitStats();
+  fetchHarvestStats();
   // For REAL tab: show live wallet balance immediately (even before a session starts)
   if (mode === 'REAL') fetchWalletBalance();
 }
@@ -892,6 +894,83 @@ function renderSoftExitWidget(stats) {
   const actual = stats.pnl.total_actual_pnl_usdc;
   actualEl.textContent = actual != null ? formatPnl(actual) : '\u2014';
   actualEl.style.color = actual > 0 ? 'var(--success)' : actual < 0 ? 'var(--danger)' : '';
+}
+
+// Harvest Exit Analytics
+// ============================================================
+async function fetchHarvestStats() {
+  try {
+    const stats = await api('GET', '/api/stats/harvest?mode=' + State.mode);
+    renderHarvestWidget(stats);
+  } catch (err) {
+    console.error('fetchHarvestStats error:', err);
+  }
+}
+
+function renderHarvestWidget(stats) {
+  const section = document.getElementById('harvest-section');
+  if (!section) return;
+
+  if (!stats || stats.total_harvest_exits === 0) {
+    section.style.display = 'none';
+    return;
+  }
+
+  section.style.display = '';
+
+  const verdictCfg = {
+    positive:          { bg: 'rgba(0,200,100,0.12)', color: 'var(--success)', icon: '✅', text: "Harvest exits are profitable — taking profit early is working" },
+    negative:          { bg: 'rgba(220,50,50,0.10)',  color: 'var(--danger)',  icon: '⚠️', text: "Harvest exits are losing money — consider turning off" },
+    neutral:           { bg: 'rgba(255,200,0,0.10)',  color: 'var(--warning)', icon: '⚖️', text: 'Mixed results — no clear edge from harvesting early' },
+    insufficient_data: { bg: 'rgba(255,255,255,0.04)', color: 'var(--text-muted)', icon: 'ℹ️', text: 'Not enough resolved harvest exits yet to draw a conclusion' },
+  };
+  const cfg = verdictCfg[stats.verdict] || verdictCfg.insufficient_data;
+  const header = document.getElementById('harvest-verdict-header');
+  header.style.background = cfg.bg;
+  header.style.color = cfg.color;
+
+  header.textContent = '';
+  const iconSpan = document.createElement('span');
+  iconSpan.textContent = cfg.icon;
+  const labelSpan = document.createElement('span');
+  labelSpan.textContent = ' Is harvest exit worth it? ';
+  const descSpan = document.createElement('span');
+  descSpan.style.fontWeight = '400';
+  descSpan.textContent = cfg.text;
+  header.appendChild(iconSpan);
+  header.appendChild(labelSpan);
+  header.appendChild(descSpan);
+
+  $('hv-stat-total').textContent = stats.total_harvest_exits;
+  $('hv-stat-types').textContent = stats.by_type.threshold + 'T / ' + stats.by_type.near_close + 'NC';
+
+  const winsEl = $('hv-stat-wins');
+  winsEl.textContent = stats.outcomes.win_count;
+  winsEl.style.color = stats.outcomes.win_count > 0 ? 'var(--success)' : '';
+
+  const lossesEl = $('hv-stat-losses');
+  lossesEl.textContent = stats.outcomes.loss_count;
+  lossesEl.style.color = stats.outcomes.loss_count > 0 ? 'var(--danger)' : '';
+
+  const winRateEl = $('hv-stat-winrate');
+  const wr = stats.outcomes.win_rate_pct;
+  winRateEl.textContent = wr != null ? wr.toFixed(1) + '%' : '—';
+  winRateEl.style.color = wr >= 60 ? 'var(--success)' : wr < 40 ? 'var(--danger)' : '';
+
+  const gainEl = $('hv-stat-price-gain');
+  const gain = stats.price_stats.avg_price_gain;
+  gainEl.textContent = gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(4) : '—';
+  gainEl.style.color = gain > 0 ? 'var(--success)' : gain < 0 ? 'var(--danger)' : '';
+
+  const totalPnlEl = $('hv-stat-total-pnl');
+  const totalPnl = stats.pnl.total_actual_pnl_usdc;
+  totalPnlEl.textContent = totalPnl != null ? formatPnl(totalPnl) : '—';
+  totalPnlEl.style.color = totalPnl > 0 ? 'var(--success)' : totalPnl < 0 ? 'var(--danger)' : '';
+
+  const avgPnlEl = $('hv-stat-avg-pnl');
+  const avgPnl = stats.pnl.avg_actual_pnl_usdc;
+  avgPnlEl.textContent = avgPnl != null ? formatPnl(avgPnl) : '—';
+  avgPnlEl.style.color = avgPnl > 0 ? 'var(--success)' : avgPnl < 0 ? 'var(--danger)' : '';
 }
 
 function renderSignalsGrouped(signals, tab, page) {

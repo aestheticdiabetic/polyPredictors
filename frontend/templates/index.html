@@ -369,6 +369,57 @@
     </div>
   </section>
 
+  <!-- ================================================================
+       HARVEST EXIT ANALYTICS
+       ================================================================ -->
+  <section class="card" id="harvest-section" style="display:none">
+    <div class="card-title">
+      <span class="dot"></span>
+      Harvest Exit Analytics
+      <span class="text-muted" style="font-size:0.72rem;font-weight:400;margin-left:6px">
+        (HARVEST_ENABLED — is taking profit early worth it?)
+      </span>
+    </div>
+
+    <div id="harvest-verdict-widget" style="border-radius:8px;overflow:hidden;border:1px solid var(--border)">
+      <div id="harvest-verdict-header" style="padding:10px 16px;font-weight:600;font-size:0.85rem;display:flex;align-items:center;gap:8px"></div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:0;border-top:1px solid var(--border)">
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Harvests</div>
+          <div class="signal-stat-value" id="hv-stat-total">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Threshold / Near-Close</div>
+          <div class="signal-stat-value" id="hv-stat-types">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Wins</div>
+          <div class="signal-stat-value" id="hv-stat-wins">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Losses</div>
+          <div class="signal-stat-value" id="hv-stat-losses">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Win Rate</div>
+          <div class="signal-stat-value" id="hv-stat-winrate">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Avg Price Gain</div>
+          <div class="signal-stat-value" id="hv-stat-price-gain">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Total P&amp;L</div>
+          <div class="signal-stat-value" id="hv-stat-total-pnl">—</div>
+        </div>
+        <div class="signal-stat-cell">
+          <div class="signal-stat-label">Avg P&amp;L</div>
+          <div class="signal-stat-value" id="hv-stat-avg-pnl">—</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- Whale Analysis moved to /whales -->
 
 </div><!-- /app-container -->

@@ -19,15 +19,21 @@ Sections
 Run with:  python tests/test_mode_isolation.py
 """
 
-import sys
 import os
-import types
+import sys
 from datetime import datetime
+from unittest.mock import MagicMock
 
 # ---------------------------------------------------------------------------
 # Path setup — allow imports from backend/
 # ---------------------------------------------------------------------------
 ROOT = os.path.join(os.path.dirname(__file__), "..")
+
+# Stub out discord before backend.discord_bot is imported (discord package not installed)
+_discord_stub = MagicMock()
+sys.modules.setdefault("discord", _discord_stub)
+sys.modules.setdefault("discord.ext", _discord_stub.ext)
+sys.modules.setdefault("discord.ext.commands", _discord_stub.ext.commands)
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "backend"))
 
@@ -35,10 +41,9 @@ sys.path.insert(0, os.path.join(ROOT, "backend"))
 # In-memory DB — must be done BEFORE importing main.py / database.py so
 # that the engine points at :memory: and not the real SQLite file.
 # ---------------------------------------------------------------------------
-import sqlalchemy
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy.orm import sessionmaker  # noqa: E402
+from sqlalchemy.pool import StaticPool  # noqa: E402
 
 # StaticPool keeps a single connection alive for all sessions — required so
 # that tables created on the engine are visible to subsequent sessions.
@@ -49,17 +54,22 @@ _test_engine = create_engine(
 )
 
 # Patch database module before anything else imports it
-import importlib
-import backend.database as _db_mod
+import backend.database as _db_mod  # noqa: E402
 
 _db_mod.engine = _test_engine
 _db_mod.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_test_engine)
 
 # Now create tables on the in-memory engine
-from backend.database import (
-    Base, CopiedBet, MonitoringSession, Whale, WhaleBet,
-    AddToPositionSignal, get_db,
+from backend.database import (  # noqa: E402
+    AddToPositionSignal,
+    Base,
+    CopiedBet,
+    MonitoringSession,
+    Whale,
+    WhaleBet,
+    get_db,
 )
+
 Base.metadata.create_all(bind=_test_engine)
 
 # ---------------------------------------------------------------------------
@@ -67,7 +77,7 @@ Base.metadata.create_all(bind=_test_engine)
 # ---------------------------------------------------------------------------
 # Stub out heavy external dependencies before importing main.py
 # so the tests don't need a real Polymarket connection.
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
 
 _mock_poly = MagicMock()
 _mock_poly.get_wallet_balance = AsyncMock(return_value=500.0)
@@ -83,20 +93,25 @@ _mock_monitor.refresh_risk_profiles = MagicMock()
 _mock_monitor.reset_last_seen = MagicMock()
 
 # Patch at module level so main.py uses the mocks
-with patch("backend.main.poly_client", _mock_poly), \
-     patch("backend.main.whale_monitor", _mock_monitor), \
-     patch("backend.main.init_db", lambda: None):
+with (
+    patch("backend.main.poly_client", _mock_poly),
+    patch("backend.main.whale_monitor", _mock_monitor),
+    patch("backend.main.init_db", lambda: None),
+):
     import backend.main as _main_mod
+
     # Re-point the app's DB dependency to use the test session factory
     _main_mod.app.dependency_overrides[get_db] = lambda: _db_mod.SessionLocal()
 
-from fastapi.testclient import TestClient
+from fastapi.testclient import TestClient  # noqa: E402
+
 client = TestClient(_main_mod.app)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _new_db():
     return _db_mod.SessionLocal()
@@ -113,8 +128,9 @@ def _make_whale(db, address="0xwhale1", alias="TestWhale") -> Whale:
     return w
 
 
-def _make_whale_bet(db, whale: Whale, market_id="mkt1", token_id="tok_yes",
-                    outcome="YES", side="BUY") -> WhaleBet:
+def _make_whale_bet(
+    db, whale: Whale, market_id="mkt1", token_id="tok_yes", outcome="YES", side="BUY"
+) -> WhaleBet:
     wb = WhaleBet(
         whale_id=whale.id,
         market_id=market_id,
@@ -134,9 +150,16 @@ def _make_whale_bet(db, whale: Whale, market_id="mkt1", token_id="tok_yes",
     return wb
 
 
-def _make_bet(db, mode: str, status: str = "OPEN", pnl: float = None,
-              market_id: str = "mkt1", token_id: str = "tok_yes",
-              outcome: str = "YES", whale_address: str = "0xwhale1") -> CopiedBet:
+def _make_bet(
+    db,
+    mode: str,
+    status: str = "OPEN",
+    pnl: float | None = None,
+    market_id: str = "mkt1",
+    token_id: str = "tok_yes",
+    outcome: str = "YES",
+    whale_address: str = "0xwhale1",
+) -> CopiedBet:
     db_w = _make_whale(db, whale_address)
     wb = _make_whale_bet(db, db_w, market_id=market_id, token_id=token_id, outcome=outcome)
     b = CopiedBet(
@@ -164,8 +187,9 @@ def _make_bet(db, mode: str, status: str = "OPEN", pnl: float = None,
     return b
 
 
-def _make_session(db, mode: str, is_active: bool = False,
-                  balance: float = 200.0) -> MonitoringSession:
+def _make_session(
+    db, mode: str, is_active: bool = False, balance: float = 200.0
+) -> MonitoringSession:
     s = MonitoringSession(
         mode=mode,
         is_active=is_active,
@@ -210,6 +234,7 @@ def _clear_db():
 # ---------------------------------------------------------------------------
 # 1. _apply_mode_filter helper
 # ---------------------------------------------------------------------------
+
 
 def test_apply_mode_filter_simulation():
     """mode=SIMULATION filters to only SIMULATION rows."""
@@ -278,6 +303,7 @@ def test_apply_mode_filter_all_returns_everything():
 # 2. /api/ledger — mode isolation
 # ---------------------------------------------------------------------------
 
+
 def test_ledger_hedge_sim_bets_not_in_simulation_view():
     """HEDGE_SIM bets must not appear when requesting mode=SIMULATION."""
     db = _new_db()
@@ -325,6 +351,7 @@ def test_ledger_status_filter_works_within_mode():
 # ---------------------------------------------------------------------------
 # 3. /api/ledger/stats — isolation + session balance
 # ---------------------------------------------------------------------------
+
 
 def test_stats_standard_excludes_hedge_sim_pnl():
     """P&L in mode=standard must not include HEDGE_SIM bets."""
@@ -380,6 +407,7 @@ def test_stats_balance_uses_standard_session_when_hedge_sim_active():
     r = client.get("/api/ledger/stats?mode=standard")
     data = r.json()
     from backend.config import settings
+
     assert data["session_balance"] == settings.SIM_STARTING_BALANCE, (
         f"Standard stats used HEDGE_SIM balance! Got {data['session_balance']}"
     )
@@ -412,6 +440,7 @@ def test_stats_balance_uses_simulation_session_when_active():
 # ---------------------------------------------------------------------------
 # 4. /api/activity — isolation
 # ---------------------------------------------------------------------------
+
 
 def test_activity_standard_excludes_hedge_sim():
     """Activity feed with mode=standard must not show HEDGE_SIM bets."""
@@ -459,6 +488,7 @@ def test_activity_all_returns_all_modes():
 # 5. /api/signals + /api/signals/stats — isolation via JOIN
 # ---------------------------------------------------------------------------
 
+
 def test_signals_standard_excludes_hedge_sim():
     """Signals linked to HEDGE_SIM CopiedBets must not appear in mode=standard."""
     db = _new_db()
@@ -502,15 +532,13 @@ def test_signals_stats_standard_excludes_hedge_sim():
     sim_bet = _make_bet(db, "SIMULATION")
     hedge_bet = _make_bet(db, "HEDGE_SIM")
     _make_signal(db, sim_bet)
-    _make_signal(db, sim_bet)   # 2 sim signals
-    _make_signal(db, hedge_bet) # 1 hedge signal — must be excluded
+    _make_signal(db, sim_bet)  # 2 sim signals
+    _make_signal(db, hedge_bet)  # 1 hedge signal — must be excluded
     db.close()
 
     r = client.get("/api/signals/stats?mode=standard")
     assert r.status_code == 200
-    assert r.json()["total_signals"] == 2, (
-        f"Expected 2, got {r.json()['total_signals']}"
-    )
+    assert r.json()["total_signals"] == 2, f"Expected 2, got {r.json()['total_signals']}"
 
 
 def test_signals_stats_hedge_sim():
@@ -519,7 +547,7 @@ def test_signals_stats_hedge_sim():
     _clear_db()
     sim_bet = _make_bet(db, "SIMULATION")
     hedge_bet = _make_bet(db, "HEDGE_SIM")
-    _make_signal(db, sim_bet)   # must be excluded
+    _make_signal(db, sim_bet)  # must be excluded
     _make_signal(db, hedge_bet)
     _make_signal(db, hedge_bet)
     db.close()
@@ -531,6 +559,7 @@ def test_signals_stats_hedge_sim():
 # ---------------------------------------------------------------------------
 # 6. /api/stats/by-whale + /api/stats/by-whale-category — isolation
 # ---------------------------------------------------------------------------
+
 
 def test_by_whale_standard_excludes_hedge_sim():
     """Per-whale stats for mode=standard must not include HEDGE_SIM bets."""
@@ -545,9 +574,7 @@ def test_by_whale_standard_excludes_hedge_sim():
     whales = r.json()["whales"]
     # Only 1 whale with total_pnl=20, not 1019
     assert len(whales) == 1
-    assert whales[0]["total_pnl_usdc"] == 20.0, (
-        f"Expected 20.0, got {whales[0]['total_pnl_usdc']}"
-    )
+    assert whales[0]["total_pnl_usdc"] == 20.0, f"Expected 20.0, got {whales[0]['total_pnl_usdc']}"
 
 
 def test_by_whale_hedge_sim_excludes_standard():
@@ -585,11 +612,12 @@ def test_by_whale_category_standard_excludes_hedge_sim():
 # 7. /api/sessions/latest — mode-scoped lookup
 # ---------------------------------------------------------------------------
 
+
 def test_sessions_latest_standard_skips_hedge_sim():
     """mode=standard must return most recent SIM/REAL session, not HEDGE_SIM."""
     db = _new_db()
     _clear_db()
-    sim_s = _make_session(db, "SIMULATION", is_active=False, balance=190.0)
+    _make_session(db, "SIMULATION", is_active=False, balance=190.0)
     _make_session(db, "HEDGE_SIM", is_active=False, balance=155.0)  # created last
     db.close()
 
@@ -605,7 +633,7 @@ def test_sessions_latest_hedge_sim_skips_simulation():
     db = _new_db()
     _clear_db()
     _make_session(db, "SIMULATION", is_active=False)
-    hedge_s = _make_session(db, "HEDGE_SIM", is_active=False, balance=160.0)
+    _make_session(db, "HEDGE_SIM", is_active=False, balance=160.0)
     db.close()
 
     r = client.get("/api/sessions/latest?mode=HEDGE_SIM")
@@ -642,6 +670,7 @@ def test_sessions_latest_returns_none_when_no_matching_session():
 # 8. Hedge guard (bet_engine)
 # ---------------------------------------------------------------------------
 
+
 def _build_engine_fixtures(db, mode: str):
     """
     Create a Whale, WhaleBet (YES), an existing OPEN CopiedBet (YES),
@@ -665,9 +694,16 @@ def _build_engine_fixtures(db, mode: str):
 
     # First WhaleBet — YES side already copied
     wb_yes = WhaleBet(
-        whale_id=whale.id, market_id="mkt_hedge", token_id="tok_yes",
-        question="Will Y happen?", side="BUY", outcome="YES",
-        price=0.55, size_usdc=100.0, size_shares=181.0, timestamp=datetime.utcnow(),
+        whale_id=whale.id,
+        market_id="mkt_hedge",
+        token_id="tok_yes",
+        question="Will Y happen?",
+        side="BUY",
+        outcome="YES",
+        price=0.55,
+        size_usdc=100.0,
+        size_shares=181.0,
+        timestamp=datetime.utcnow(),
         bet_type="OPEN",
     )
     db.add(wb_yes)
@@ -675,12 +711,22 @@ def _build_engine_fixtures(db, mode: str):
     db.refresh(wb_yes)
 
     existing_yes = CopiedBet(
-        whale_bet_id=wb_yes.id, whale_address=whale.address,
-        mode=mode, market_id="mkt_hedge", token_id="tok_yes",
-        question="Will Y happen?", side="BUY", outcome="YES",
-        price_at_entry=0.55, size_usdc=10.0, size_shares=18.0,
-        risk_factor=0.1, whale_bet_usdc=100.0, whale_avg_bet_usdc=100.0,
-        status="OPEN", opened_at=datetime.utcnow(),
+        whale_bet_id=wb_yes.id,
+        whale_address=whale.address,
+        mode=mode,
+        market_id="mkt_hedge",
+        token_id="tok_yes",
+        question="Will Y happen?",
+        side="BUY",
+        outcome="YES",
+        price_at_entry=0.55,
+        size_usdc=10.0,
+        size_shares=18.0,
+        risk_factor=0.1,
+        whale_bet_usdc=100.0,
+        whale_avg_bet_usdc=100.0,
+        status="OPEN",
+        opened_at=datetime.utcnow(),
     )
     db.add(existing_yes)
     db.commit()
@@ -688,9 +734,16 @@ def _build_engine_fixtures(db, mode: str):
 
     # Second WhaleBet — NO side (the hedge signal)
     wb_no = WhaleBet(
-        whale_id=whale.id, market_id="mkt_hedge", token_id="tok_no",
-        question="Will Y happen?", side="BUY", outcome="NO",
-        price=0.45, size_usdc=80.0, size_shares=177.0, timestamp=datetime.utcnow(),
+        whale_id=whale.id,
+        market_id="mkt_hedge",
+        token_id="tok_no",
+        question="Will Y happen?",
+        side="BUY",
+        outcome="NO",
+        price=0.45,
+        size_usdc=80.0,
+        size_shares=177.0,
+        timestamp=datetime.utcnow(),
         bet_type="OPEN",
     )
     db.add(wb_no)
@@ -747,7 +800,7 @@ def test_hedge_guard_does_not_fire_for_different_whale():
     db = _new_db()
     _clear_db()
     # Build fixtures under "HEDGE_SIM" mode normally — YES held by 0xhedgetest
-    session, existing_yes, wb_no = _build_engine_fixtures(db, "HEDGE_SIM")
+    session, _, wb_no = _build_engine_fixtures(db, "HEDGE_SIM")
 
     # Make the NEW bet belong to a DIFFERENT whale
     other_whale = Whale(address="0xother", alias="Other", avg_bet_size_usdc=100.0)
@@ -795,6 +848,7 @@ def test_hedge_guard_does_not_fire_for_closed_opposite():
 # 9. Standard dashboard JS contract — verify via API
 # ---------------------------------------------------------------------------
 
+
 def test_standard_mode_contract_no_hedge_sim_in_any_endpoint():
     """
     Simulate what app.js calls on page load: activity, ledger, stats, signals.
@@ -825,7 +879,9 @@ def test_standard_mode_contract_no_hedge_sim_in_any_endpoint():
 
     # /api/signals
     sigs = client.get("/api/signals?mode=standard").json()
-    assert sigs["pagination"]["total"] == 1, f"Signals leaked HEDGE_SIM: total={sigs['pagination']['total']}"
+    assert sigs["pagination"]["total"] == 1, (
+        f"Signals leaked HEDGE_SIM: total={sigs['pagination']['total']}"
+    )
 
     # /api/signals/stats
     sig_stats = client.get("/api/signals/stats?mode=standard").json()
@@ -878,9 +934,11 @@ def test_hedge_sim_contract_no_standard_in_any_endpoint():
 # 10. HEDGE_SIM uses simulate_buy / simulate_sell — never place_real_buy/sell
 # ---------------------------------------------------------------------------
 
+
 def _make_market_info():
     """Minimal market_info dict that passes all guards in process_new_whale_bet."""
     from datetime import timedelta
+
     return {
         "active": True,
         "closed": False,
@@ -896,15 +954,18 @@ def test_hedge_sim_buy_uses_simulate_not_real():
     Regression: before the fix, mode != "SIMULATION" fell through to place_real_buy,
     causing 'No module named eip712_structs' errors in HEDGE_SIM mode.
     """
+    from unittest.mock import patch
+
     from backend.bet_engine import BetEngine
-    from unittest.mock import MagicMock, patch
 
     db = _new_db()
     _clear_db()
 
     session = MonitoringSession(
-        mode="HEDGE_SIM", is_active=True,
-        starting_balance_usdc=200.0, current_balance_usdc=200.0,
+        mode="HEDGE_SIM",
+        is_active=True,
+        starting_balance_usdc=200.0,
+        current_balance_usdc=200.0,
     )
     db.add(session)
     db.commit()
@@ -916,10 +977,17 @@ def test_hedge_sim_buy_uses_simulate_not_real():
     db.refresh(whale)
 
     wb = WhaleBet(
-        whale_id=whale.id, market_id="mkt_buy", token_id="tok_buy",
-        question="Will buy happen?", side="BUY", outcome="YES",
-        price=0.5, size_usdc=100.0, size_shares=200.0,
-        timestamp=datetime.utcnow(), bet_type="OPEN",
+        whale_id=whale.id,
+        market_id="mkt_buy",
+        token_id="tok_buy",
+        question="Will buy happen?",
+        side="BUY",
+        outcome="YES",
+        price=0.5,
+        size_usdc=100.0,
+        size_shares=200.0,
+        timestamp=datetime.utcnow(),
+        bet_type="OPEN",
     )
     db.add(wb)
     db.commit()
@@ -928,11 +996,15 @@ def test_hedge_sim_buy_uses_simulate_not_real():
     engine = BetEngine(polymarket_client=None)
 
     # Patch place_real_buy to detect if it gets called (it should NOT be)
-    with patch.object(engine, "place_real_buy", side_effect=AssertionError(
-        "place_real_buy was called in HEDGE_SIM mode — regression!"
-    )):
+    with patch.object(
+        engine,
+        "place_real_buy",
+        side_effect=AssertionError("place_real_buy was called in HEDGE_SIM mode — regression!"),
+    ):
         result = engine.process_new_whale_bet(
-            wb, session, db,
+            wb,
+            session,
+            db,
             market_info=_make_market_info(),
             live_price=0.5,
         )
@@ -945,9 +1017,7 @@ def test_hedge_sim_buy_uses_simulate_not_real():
     assert result.mode == "HEDGE_SIM"
     # Balance should have been deducted by simulate_buy
     db.refresh(session)
-    assert session.current_balance_usdc < 200.0, (
-        "Balance unchanged — simulate_buy was not called"
-    )
+    assert session.current_balance_usdc < 200.0, "Balance unchanged — simulate_buy was not called"
     db.close()
 
 
@@ -957,15 +1027,18 @@ def test_hedge_sim_exit_uses_simulate_sell_not_real():
     Regression: _handle_exit only checked mode == 'SIMULATION'; HEDGE_SIM fell
     through to place_real_sell.
     """
-    from backend.bet_engine import BetEngine
     from unittest.mock import patch
+
+    from backend.bet_engine import BetEngine
 
     db = _new_db()
     _clear_db()
 
     session = MonitoringSession(
-        mode="HEDGE_SIM", is_active=True,
-        starting_balance_usdc=200.0, current_balance_usdc=190.0,
+        mode="HEDGE_SIM",
+        is_active=True,
+        starting_balance_usdc=200.0,
+        current_balance_usdc=190.0,
     )
     db.add(session)
     db.commit()
@@ -978,22 +1051,39 @@ def test_hedge_sim_exit_uses_simulate_sell_not_real():
 
     # Simulate an already-open position we copied
     wb_open = WhaleBet(
-        whale_id=whale.id, market_id="mkt_exit", token_id="tok_exit",
-        question="Exit test?", side="BUY", outcome="YES",
-        price=0.5, size_usdc=100.0, size_shares=200.0,
-        timestamp=datetime.utcnow(), bet_type="OPEN",
+        whale_id=whale.id,
+        market_id="mkt_exit",
+        token_id="tok_exit",
+        question="Exit test?",
+        side="BUY",
+        outcome="YES",
+        price=0.5,
+        size_usdc=100.0,
+        size_shares=200.0,
+        timestamp=datetime.utcnow(),
+        bet_type="OPEN",
     )
     db.add(wb_open)
     db.commit()
     db.refresh(wb_open)
 
     open_pos = CopiedBet(
-        whale_bet_id=wb_open.id, whale_address=whale.address,
-        mode="HEDGE_SIM", market_id="mkt_exit", token_id="tok_exit",
-        question="Exit test?", side="BUY", outcome="YES",
-        price_at_entry=0.5, size_usdc=10.0, size_shares=20.0,
-        risk_factor=0.1, whale_bet_usdc=100.0, whale_avg_bet_usdc=100.0,
-        status="OPEN", opened_at=datetime.utcnow(),
+        whale_bet_id=wb_open.id,
+        whale_address=whale.address,
+        mode="HEDGE_SIM",
+        market_id="mkt_exit",
+        token_id="tok_exit",
+        question="Exit test?",
+        side="BUY",
+        outcome="YES",
+        price_at_entry=0.5,
+        size_usdc=10.0,
+        size_shares=20.0,
+        risk_factor=0.1,
+        whale_bet_usdc=100.0,
+        whale_avg_bet_usdc=100.0,
+        status="OPEN",
+        opened_at=datetime.utcnow(),
     )
     db.add(open_pos)
     db.commit()
@@ -1001,10 +1091,17 @@ def test_hedge_sim_exit_uses_simulate_sell_not_real():
 
     # Whale now exits (SELL)
     wb_exit = WhaleBet(
-        whale_id=whale.id, market_id="mkt_exit", token_id="tok_exit",
-        question="Exit test?", side="SELL", outcome="YES",
-        price=0.75, size_usdc=150.0, size_shares=200.0,
-        timestamp=datetime.utcnow(), bet_type="EXIT",
+        whale_id=whale.id,
+        market_id="mkt_exit",
+        token_id="tok_exit",
+        question="Exit test?",
+        side="SELL",
+        outcome="YES",
+        price=0.75,
+        size_usdc=150.0,
+        size_shares=200.0,
+        timestamp=datetime.utcnow(),
+        bet_type="EXIT",
     )
     db.add(wb_exit)
     db.commit()
@@ -1012,10 +1109,12 @@ def test_hedge_sim_exit_uses_simulate_sell_not_real():
 
     engine = BetEngine(polymarket_client=None)
 
-    with patch.object(engine, "place_real_sell", side_effect=AssertionError(
-        "place_real_sell was called in HEDGE_SIM mode — regression!"
-    )):
-        result = engine.process_new_whale_bet(wb_exit, session, db)
+    with patch.object(
+        engine,
+        "place_real_sell",
+        side_effect=AssertionError("place_real_sell was called in HEDGE_SIM mode — regression!"),
+    ):
+        engine.process_new_whale_bet(wb_exit, session, db)
 
     # Position must have been closed via simulate_sell
     db.refresh(open_pos)
@@ -1033,8 +1132,10 @@ def test_hedge_sim_open_bet_recorded_with_correct_mode():
     _clear_db()
 
     session = MonitoringSession(
-        mode="HEDGE_SIM", is_active=True,
-        starting_balance_usdc=200.0, current_balance_usdc=200.0,
+        mode="HEDGE_SIM",
+        is_active=True,
+        starting_balance_usdc=200.0,
+        current_balance_usdc=200.0,
     )
     db.add(session)
     db.commit()
@@ -1046,10 +1147,17 @@ def test_hedge_sim_open_bet_recorded_with_correct_mode():
     db.refresh(whale)
 
     wb = WhaleBet(
-        whale_id=whale.id, market_id="mkt_mode", token_id="tok_mode",
-        question="Mode recorded?", side="BUY", outcome="YES",
-        price=0.6, size_usdc=100.0, size_shares=166.0,
-        timestamp=datetime.utcnow(), bet_type="OPEN",
+        whale_id=whale.id,
+        market_id="mkt_mode",
+        token_id="tok_mode",
+        question="Mode recorded?",
+        side="BUY",
+        outcome="YES",
+        price=0.6,
+        size_usdc=100.0,
+        size_shares=166.0,
+        timestamp=datetime.utcnow(),
+        bet_type="OPEN",
     )
     db.add(wb)
     db.commit()
@@ -1057,7 +1165,9 @@ def test_hedge_sim_open_bet_recorded_with_correct_mode():
 
     engine = BetEngine(polymarket_client=None)
     result = engine.process_new_whale_bet(
-        wb, session, db,
+        wb,
+        session,
+        db,
         market_info=_make_market_info(),
         live_price=0.6,
     )
@@ -1074,17 +1184,20 @@ def test_background_exit_hedge_sim_uses_simulate_sell():
     whale_monitor._handle_exit_trades must call simulate_sell for HEDGE_SIM positions.
     Regression: the background exit poller only checked mode == 'SIMULATION'.
     """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
     from backend.bet_engine import BetEngine
     from backend.whale_monitor import WhaleMonitor
-    from unittest.mock import patch, AsyncMock, MagicMock
-    import asyncio
 
     db = _new_db()
     _clear_db()
 
     session = MonitoringSession(
-        mode="HEDGE_SIM", is_active=True,
-        starting_balance_usdc=200.0, current_balance_usdc=190.0,
+        mode="HEDGE_SIM",
+        is_active=True,
+        starting_balance_usdc=200.0,
+        current_balance_usdc=190.0,
     )
     db.add(session)
     db.commit()
@@ -1097,10 +1210,17 @@ def test_background_exit_hedge_sim_uses_simulate_sell():
 
     # Existing open HEDGE_SIM position
     wb_open = WhaleBet(
-        whale_id=whale.id, market_id="mkt_bg", token_id="tok_bg",
-        question="BG exit test?", side="BUY", outcome="YES",
-        price=0.5, size_usdc=100.0, size_shares=200.0,
-        timestamp=datetime.utcnow(), bet_type="OPEN",
+        whale_id=whale.id,
+        market_id="mkt_bg",
+        token_id="tok_bg",
+        question="BG exit test?",
+        side="BUY",
+        outcome="YES",
+        price=0.5,
+        size_usdc=100.0,
+        size_shares=200.0,
+        timestamp=datetime.utcnow(),
+        bet_type="OPEN",
         tx_hash="txopen_bg",
     )
     db.add(wb_open)
@@ -1108,12 +1228,22 @@ def test_background_exit_hedge_sim_uses_simulate_sell():
     db.refresh(wb_open)
 
     open_pos = CopiedBet(
-        whale_bet_id=wb_open.id, whale_address=whale.address,
-        mode="HEDGE_SIM", market_id="mkt_bg", token_id="tok_bg",
-        question="BG exit test?", side="BUY", outcome="YES",
-        price_at_entry=0.5, size_usdc=10.0, size_shares=20.0,
-        risk_factor=0.1, whale_bet_usdc=100.0, whale_avg_bet_usdc=100.0,
-        status="OPEN", opened_at=datetime.utcnow(),
+        whale_bet_id=wb_open.id,
+        whale_address=whale.address,
+        mode="HEDGE_SIM",
+        market_id="mkt_bg",
+        token_id="tok_bg",
+        question="BG exit test?",
+        side="BUY",
+        outcome="YES",
+        price_at_entry=0.5,
+        size_usdc=10.0,
+        size_shares=20.0,
+        risk_factor=0.1,
+        whale_bet_usdc=100.0,
+        whale_avg_bet_usdc=100.0,
+        status="OPEN",
+        opened_at=datetime.utcnow(),
     )
     db.add(open_pos)
     db.commit()
@@ -1140,16 +1270,20 @@ def test_background_exit_hedge_sim_uses_simulate_sell():
     monitor = WhaleMonitor(bet_engine=engine, polymarket_client=mock_client)
     monitor._resolution_scheduler.shutdown(wait=False)
 
-    with patch("backend.whale_monitor.SessionLocal", _db_mod.SessionLocal), \
-         patch("backend.bet_engine.SessionLocal", _db_mod.SessionLocal), \
-         patch.object(engine, "place_real_sell", side_effect=AssertionError(
-             "place_real_sell called for HEDGE_SIM background exit — regression!"
-         )):
+    with (
+        patch("backend.whale_monitor.SessionLocal", _db_mod.SessionLocal),
+        patch("backend.bet_engine.SessionLocal", _db_mod.SessionLocal),
+        patch.object(
+            engine,
+            "place_real_sell",
+            side_effect=AssertionError(
+                "place_real_sell called for HEDGE_SIM background exit — regression!"
+            ),
+        ),
+    ):
         loop = asyncio.new_event_loop()
         try:
-            loop.run_until_complete(
-                monitor._handle_exit_trades("0xbgexit", [sell_trade])
-            )
+            loop.run_until_complete(monitor._handle_exit_trades("0xbgexit", [sell_trade]))
         finally:
             loop.close()
 
@@ -1183,12 +1317,13 @@ if __name__ == "__main__":
             failed += 1
         except Exception as e:
             import traceback
+
             print(f"  ERROR {name}")
             print(f"        {type(e).__name__}: {e}")
             traceback.print_exc()
             failed += 1
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  {passed}/{passed + failed} passed", end="")
     if failed:
         print(f"  *** {failed} FAILURES ***")

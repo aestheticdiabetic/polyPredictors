@@ -1036,9 +1036,69 @@ class WhaleMonitor:
                     total_gas_matic,
                     total_gas_usdc,
                 )
-                if total_gas_usdc > 0:
+                if redeemed > 0:
                     db = SessionLocal()
                     try:
+                        session = (
+                            db.query(MonitoringSession)
+                            .filter_by(mode="REAL", is_active=True)
+                            .order_by(MonitoringSession.id.desc())
+                            .first()
+                        )
+                        # Close any OPEN bets for redeemed markets
+                        for pos_info in result.get("redeemed_positions", []):
+                            condition_id = pos_info.get("condition_id", "")
+                            redemption_value = pos_info.get("value", 0.0)
+                            if not condition_id:
+                                continue
+                            open_bets = (
+                                db.query(CopiedBet)
+                                .filter(
+                                    CopiedBet.market_id == condition_id,
+                                    CopiedBet.mode == "REAL",
+                                    CopiedBet.status == "OPEN",
+                                )
+                                .all()
+                            )
+                            if not open_bets:
+                                continue
+                            # Distribute redemption value proportionally across tranches
+                            total_size = sum(b.size_usdc for b in open_bets) or 1.0
+                            for bet in open_bets:
+                                share = bet.size_usdc / total_size
+                                proceeds = round(redemption_value * share, 4)
+                                pnl = round(proceeds - bet.size_usdc, 4)
+                                if pnl > 0.01:
+                                    bet.status = "CLOSED_WIN"
+                                    if session:
+                                        session.total_wins += 1
+                                elif pnl < -0.01:
+                                    bet.status = "CLOSED_LOSS"
+                                    if session:
+                                        session.total_losses += 1
+                                else:
+                                    bet.status = "CLOSED_NEUTRAL"
+                                bet.pnl_usdc = pnl
+                                bet.closed_at = datetime.utcnow()
+                                bet.close_reason = "redeemed_on_chain"
+                                db.add(bet)
+                                if session:
+                                    session.current_balance_usdc = round(
+                                        (session.current_balance_usdc or 0.0) + proceeds, 4
+                                    )
+                                    session.total_pnl_usdc = round(
+                                        (session.total_pnl_usdc or 0.0) + pnl, 4
+                                    )
+                                logger.info(
+                                    "Closed OPEN bet %d via redemption: market=%s pnl=$%.2f status=%s",
+                                    bet.id,
+                                    condition_id[:16],
+                                    pnl,
+                                    bet.status,
+                                )
+                        if session:
+                            db.add(session)
+
                         # Allocate gas per-bet: distribute each position's gas cost
                         # proportionally across all closed tranches for that market_id.
                         for pos_info in result.get("redeemed_positions", []):
@@ -1068,14 +1128,8 @@ class WhaleMonitor:
                                 tranche.gas_fees_usdc = round(pos_gas_usdc * share, 6)
                                 db.add(tranche)
 
-                        # Accumulate on session totals
-                        session = (
-                            db.query(MonitoringSession)
-                            .filter_by(mode="REAL", is_active=True)
-                            .order_by(MonitoringSession.id.desc())
-                            .first()
-                        )
-                        if session:
+                        # Accumulate gas on session totals
+                        if total_gas_usdc > 0 and session:
                             session.total_gas_fees_usdc = round(
                                 (session.total_gas_fees_usdc or 0.0) + total_gas_usdc, 6
                             )
