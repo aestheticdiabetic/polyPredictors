@@ -753,6 +753,17 @@ class WhaleChainMonitor:
         taker_fee_bps = fee_result if isinstance(fee_result, int) else 1000
         order_book = book_result if isinstance(book_result, dict) else None
 
+        if order_book:
+            asks = order_book.get("asks", [])
+            bids = order_book.get("bids", [])
+            log.debug(
+                "Order book for token %s: asks=%d, bids=%d, book keys=%s",
+                token_id[:16],
+                len(asks) if asks else 0,
+                len(bids) if bids else 0,
+                list(order_book.keys()) if order_book else [],
+            )
+
         condition_id = market_info.get("conditionId") or market_info.get("condition_id") or ""
         question = market_info.get("question") or market_info.get("title") or ""
         tokens = market_info.get("tokens") or []
