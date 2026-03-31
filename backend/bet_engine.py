@@ -228,9 +228,9 @@ class BetEngine:
             except (ValueError, TypeError):
                 pass
 
-        if usdc_sum < settings.MIN_BOOK_DEPTH_USDC:
+        if usdc_sum < bet_size_usdc:
             msg = (
-                f"Thin book: only ${usdc_sum:.2f} depth available (min ${settings.MIN_BOOK_DEPTH_USDC:.2f}) "
+                f"Thin book: only ${usdc_sum:.2f} depth available (need ${bet_size_usdc:.2f}) "
                 f"— reference_price={reference_price:.4f}, max_slippage={max_slippage_price:.4f}, "
                 f"lowest_ask={lowest_ask:.4f}"
             )
