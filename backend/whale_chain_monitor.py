@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 
 import websockets
 from hexbytes import HexBytes
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError, PendingRollbackError
 from web3 import Web3
 from web3.datastructures import AttributeDict
 
