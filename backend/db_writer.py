@@ -47,7 +47,7 @@ def synchronized_flush(db: Session) -> None:
     Raises:
         OperationalError: If retry exhausted after max attempts
     """
-    _execute_with_retries(lambda: db.flush(), operation="flush")
+    _execute_with_retries(lambda: db.flush(), operation="flush", db=db)
 
 
 def synchronized_commit(db: Session) -> None:
@@ -63,7 +63,7 @@ def synchronized_commit(db: Session) -> None:
     Raises:
         OperationalError: If retry exhausted after max attempts
     """
-    _execute_with_retries(lambda: db.commit(), operation="commit")
+    _execute_with_retries(lambda: db.commit(), operation="commit", db=db)
 
 
 def synchronized_add_and_flush(db: Session, obj: object) -> None:
@@ -82,7 +82,7 @@ def synchronized_add_and_flush(db: Session, obj: object) -> None:
         db.add(obj)
         db.flush()
 
-    _execute_with_retries(_add_and_flush, operation="add_and_flush")
+    _execute_with_retries(_add_and_flush, operation="add_and_flush", db=db)
 
 
 async def synchronized_commit_async(
@@ -110,6 +110,7 @@ async def synchronized_commit_async(
 def _execute_with_retries(
     func: Callable[[], T],
     operation: str = "db_write",
+    db: Session | None = None,
 ) -> T | None:
     """
     Execute database operation with exponential backoff retry.
@@ -117,6 +118,7 @@ def _execute_with_retries(
     Args:
         func: Callable that performs the DB operation
         operation: String name for logging
+        db: Optional SQLAlchemy session for rollback on retry
 
     Returns:
         Return value of operation if successful
@@ -148,7 +150,11 @@ def _execute_with_retries(
                 f"Retrying in {backoff_ms}ms..."
             )
 
-            # Exponential backoff with jitter
+            # Reset session state before retry (SQLAlchemy auto-rolls back on lock errors)
+            if db is not None:
+                db.rollback()
+
+            # Exponential backoff
             time.sleep(backoff_ms / 1000.0)
             backoff_ms = min(backoff_ms * 2, _MAX_BACKOFF_MS)
 
