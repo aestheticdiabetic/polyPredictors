@@ -50,6 +50,12 @@ class Settings:
         os.getenv("RESOLUTION_CHECK_INTERVAL_SECONDS", "60")
     )
 
+    # How often (in seconds) the orphan position checker runs.
+    # Separate from RESOLUTION_CHECK_INTERVAL_SECONDS so orphan checks can be
+    # more frequent (catching missed whale exits faster) without over-fetching
+    # resolution data.  Default 15s — catches a failed close within one poll cycle.
+    ORPHAN_CHECK_INTERVAL_SECONDS: int = int(os.getenv("ORPHAN_CHECK_INTERVAL_SECONDS", "15"))
+
     # Ignore whale trades older than this many hours.  Prevents the initial backlog
     # of historical trades (fetched when a whale is first added) from being evaluated
     # against markets that have since closed.
@@ -240,6 +246,13 @@ class Settings:
     # Provides ~200ms entry detection alongside the existing HTTP polling fallback.
     CLOB_WS_ENABLED: bool = os.getenv("CLOB_WS_ENABLED", "false").lower() == "true"
     CLOB_WS_URL: str = os.getenv("CLOB_WS_URL", "")
+
+    # Polymarket RTDS (Real-Time Data Socket) exit monitor.
+    # Subscribes to wss://ws-live-data.polymarket.com for global activity,
+    # filters client-side for tracked whale SELL events, and dispatches closes
+    # at CLOB-match time (~50ms) — before on-chain settlement.
+    # Complements CHAIN_EXIT_ENABLED (chain monitor) and HTTP activity polling.
+    RTDS_ENABLED: bool = os.getenv("RTDS_ENABLED", "false").lower() == "true"
 
     # Stage 6: Adaptive whale sizing based on rolling win rate
     ADAPTIVE_SIZING_ENABLED: bool = os.getenv("ADAPTIVE_SIZING_ENABLED", "false").lower() == "true"

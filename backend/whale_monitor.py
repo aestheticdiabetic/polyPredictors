@@ -70,7 +70,7 @@ class WhaleMonitor:
         )
         self._resolution_scheduler.add_job(
             func=self._check_orphan_positions_wrapper,
-            trigger=IntervalTrigger(seconds=settings.RESOLUTION_CHECK_INTERVAL_SECONDS),
+            trigger=IntervalTrigger(seconds=settings.ORPHAN_CHECK_INTERVAL_SECONDS),
             id="check_orphan_positions_always",
         )
         self._resolution_scheduler.add_job(
@@ -105,6 +105,15 @@ class WhaleMonitor:
             logger.info(
                 "CLOB WS entry monitor initialised (WebSocket) — "
                 "call start_clob_ws_task() from lifespan to activate"
+            )
+
+        if settings.RTDS_ENABLED:
+            from backend.rtds_monitor import RtdsExitMonitor
+
+            self._rtds_monitor = RtdsExitMonitor(self)
+            logger.info(
+                "RTDS exit monitor initialised (wss://ws-live-data.polymarket.com) — "
+                "call start_rtds_task() from lifespan to activate"
             )
 
         self._resolution_scheduler.add_job(
@@ -314,12 +323,24 @@ class WhaleMonitor:
         logger.info("CLOB WS entry monitor WebSocket task started")
         return task
 
+    def start_rtds_task(self):
+        """Start the RTDS exit monitor WebSocket task (if RTDS_ENABLED)."""
+        monitor = getattr(self, "_rtds_monitor", None)
+        if monitor is None:
+            return None
+        task = monitor.start()
+        logger.info("RTDS exit monitor WebSocket task started")
+        return task
+
     def shutdown(self):
         """Full shutdown including the permanent resolution scheduler."""
         self.stop_monitoring()
         monitor = getattr(self, "_chain_monitor", None)
         if monitor is not None:
             monitor.stop()
+        rtds = getattr(self, "_rtds_monitor", None)
+        if rtds is not None:
+            rtds.stop()
         if self._resolution_scheduler.running:
             self._resolution_scheduler.shutdown(wait=False)
             logger.info("Permanent resolution checker stopped")
@@ -730,9 +751,11 @@ class WhaleMonitor:
                     # Persist the whale's exit bet for record keeping
                     whale_bet = await self._save_whale_bet(trade, whale, ts, db)
                     if not whale_bet:
-                        # Duplicate tx_hash — already processed
-                        if new_last_seen is None or ts > new_last_seen:
-                            new_last_seen = ts
+                        # Duplicate tx_hash — EXIT WhaleBet already saved (by chain monitor
+                        # or a prior poll).  open_positions is non-empty here, meaning the
+                        # close attempt from that earlier processing failed (FOK cancelled).
+                        # Do NOT advance last_seen — leave the signal unconsumed so the
+                        # orphan checker retries on the next cycle.
                         continue
 
                     # Find the most recent session matching this position's mode

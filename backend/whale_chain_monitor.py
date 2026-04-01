@@ -956,6 +956,58 @@ class WhaleChainMonitor:
         finally:
             db.close()
 
+    def _record_unmatched_exit(self, trade: dict, whale_address: str) -> None:
+        """Record a WhaleBet EXIT even when no matching CopiedBet was found.
+
+        This allows check_orphan_positions Case 2 ("EXIT recorded after bet opened")
+        to trigger on the next orphan-check cycle and close any lingering position
+        whose token_id lookup failed here (on-chain vs CLOB format mismatch).
+        Silently swallows IntegrityError (already recorded by activity API or a prior call).
+        """
+        whale_lower = whale_address.lower()
+        db = SessionLocal()
+        try:
+            whale_rec = db.query(Whale).filter(Whale.address.ilike(whale_lower)).first()
+            if not whale_rec:
+                return
+
+            ts = datetime.fromtimestamp(trade["timestamp"], tz=UTC)
+            tx_hash = trade.get("transactionHash", "")
+            if tx_hash.startswith("0x"):
+                tx_hash = tx_hash[2:]
+
+            whale_bet = WhaleBet(
+                whale_id=whale_rec.id,
+                market_id="",  # unknown — position lookup failed
+                token_id=trade.get("asset", ""),
+                question="",
+                side="SELL",
+                outcome="YES",
+                price=trade.get("price", 0.0),
+                size_usdc=trade.get("usdcSize", 0.0),
+                size_shares=trade.get("shares", 0.0),
+                timestamp=ts,
+                tx_hash=tx_hash or None,
+                bet_type="EXIT",
+            )
+            db.add(whale_bet)
+            try:
+                synchronized_flush(db)
+                synchronized_commit(db)
+                log.info(
+                    "WhaleChainMonitor: recorded unmatched EXIT token=%s whale=%s "
+                    "(orphan checker will close any lingering position)",
+                    trade.get("asset", "")[:16],
+                    whale_address[:10],
+                )
+            except IntegrityError:
+                db.rollback()  # activity API or prior call already saved this
+        except Exception as exc:
+            db.rollback()
+            log.debug("WhaleChainMonitor: _record_unmatched_exit failed: %s", exc)
+        finally:
+            db.close()
+
     # ------------------------------------------------------------------
     # Exit dispatch
     # Phase 1: sync DB read (load open position) — runs in executor
@@ -991,6 +1043,12 @@ class WhaleChainMonitor:
                 )
 
         if pos_data is None:
+            # No matching open position — we either skipped entry or the token_id
+            # format differs enough that both lookup methods failed.  Still record
+            # the EXIT WhaleBet so check_orphan_positions Case 2 ("exit after open")
+            # can fire and close any lingering copied position on the next cycle.
+            async with self._db_write_lock:
+                await loop.run_in_executor(None, self._record_unmatched_exit, trade, whale_address)
             return
 
         trade["conditionId"], trade["outcome"], trade["question"], pos_mode = pos_data
