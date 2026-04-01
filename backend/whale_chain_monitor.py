@@ -1234,6 +1234,13 @@ class WhaleChainMonitor:
                             "WhaleChainMonitor: duplicate exit tx %s — retrying close",
                             tx_hash[:16],
                         )
+                        # The first saver (e.g. RTDS) may have stored market_id=""
+                        # because the event lacked conditionId.  Backfill it now
+                        # using the value _sync_load_position resolved from our DB,
+                        # so _find_all_open_positions can match the position.
+                        if not existing.market_id and trade.get("conditionId"):
+                            existing.market_id = trade["conditionId"]
+                            db.add(existing)
                         session = (
                             db.query(MonitoringSession)
                             .filter_by(mode=pos_mode)

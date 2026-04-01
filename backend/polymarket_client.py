@@ -755,7 +755,9 @@ class PolymarketClient:
             """Submit at price, retrying on fee-mismatch or invalid-signature errors."""
             current_fee = self._taker_fee_cache.get(token_id, 0)
             try:
-                return _submit(price, current_fee)
+                result = _submit(price, current_fee)
+                result["_fee_bps"] = current_fee
+                return result
             except Exception as exc:
                 exc_str = str(exc)
 
@@ -771,7 +773,9 @@ class PolymarketClient:
                         )
                         self._taker_fee_cache[token_id] = required_fee
                         try:
-                            return _submit(price, required_fee)
+                            result = _submit(price, required_fee)
+                            result["_fee_bps"] = required_fee
+                            return result
                         except Exception as retry_exc:
                             logger.error("place_market_sell error: %s", retry_exc)
                             raise
@@ -784,7 +788,9 @@ class PolymarketClient:
                     )
                     self._reset_clob_client()
                     try:
-                        return _submit(price, current_fee)
+                        result = _submit(price, current_fee)
+                        result["_fee_bps"] = current_fee
+                        return result
                     except Exception as retry_exc:
                         logger.error("place_market_sell error after client reset: %s", retry_exc)
                         raise
@@ -794,7 +800,7 @@ class PolymarketClient:
                         "place_market_sell: no balance/allowance for token %s — marking as no-position",
                         token_id[:16],
                     )
-                    return {"status": "no_position", "size_matched": 0}
+                    return {"status": "no_position", "size_matched": 0, "_fee_bps": 0}
                 logger.error("place_market_sell error: %s", exc)
                 raise
 
@@ -867,6 +873,68 @@ class PolymarketClient:
                 logger.error("place_market_sell: degraded fill error: %s", exc)
 
         return resp
+
+    def get_recent_sell_usdc_sync(
+        self, token_id: str, delay_secs: float = 1.0
+    ) -> tuple[float | None, float | None]:
+        """
+        Query the Data API for the most recent SELL trade of token_id from our account.
+        Used as a fallback when the CLOB sell response lacks takingAmount, so P&L uses
+        the actual net USDC credited by Polymarket rather than shares × bid price.
+
+        Returns (usdc_net, fill_price) or (None, None) if not found.
+        """
+        import time as _time
+
+        import requests as _req
+
+        if not settings.POLY_FUNDER_ADDRESS:
+            return None, None
+
+        if delay_secs > 0:
+            _time.sleep(delay_secs)
+
+        try:
+            proxies = (
+                {"http": settings.PROXY_URL, "https": settings.PROXY_URL}
+                if settings.PROXY_URL
+                else None
+            )
+            resp = _req.get(
+                f"{settings.DATA_API_BASE}/activity",
+                params={
+                    "user": settings.POLY_FUNDER_ADDRESS,
+                    "type": "TRADE",
+                    "limit": 10,
+                    "sortBy": "TIMESTAMP",
+                    "sortDirection": "DESC",
+                },
+                timeout=5,
+                proxies=proxies,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            trades = (
+                data if isinstance(data, list) else data.get("data", data.get("activities", []))
+            )
+
+            for trade in trades:
+                asset = trade.get("asset") or trade.get("tokenId") or ""
+                side = (trade.get("side") or trade.get("type") or "").upper()
+                if asset == token_id and side == "SELL":
+                    usdc_raw = (
+                        trade.get("usdcSize")
+                        or trade.get("amount")
+                        or trade.get("cost")
+                        or trade.get("cashAmount")
+                    )
+                    price_raw = trade.get("price") or trade.get("avgPrice")
+                    if usdc_raw:
+                        return float(usdc_raw), float(price_raw) if price_raw else None
+            return None, None
+        except Exception as exc:
+            logger.warning("get_recent_sell_usdc_sync failed for %s: %s", token_id[:16], exc)
+            return None, None
 
     async def get_wallet_balance(self) -> float | None:
         """Fetch USDC balance for the configured funder address via authenticated CLOB API."""

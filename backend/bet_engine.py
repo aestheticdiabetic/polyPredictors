@@ -1941,6 +1941,21 @@ class BetEngine:
                         fill_price,
                     )
 
+                # Bug 2: CLOB takingAmount for a SELL is gross (pre-fee). Deduct the
+                # taker fee that was embedded in the order so proceeds reflect actual
+                # net USDC credited by Polymarket.
+                fee_bps = order_resp.get("_fee_bps", 0)
+                if taking_amount_usdc is not None and fee_bps > 0:
+                    net_taking = round(taking_amount_usdc * (1.0 - fee_bps / 10000), 6)
+                    logger.debug(
+                        "Real sell bet %d: fee deduction %d bps: takingAmount %.6f → %.6f net",
+                        copied_bet.id,
+                        fee_bps,
+                        taking_amount_usdc,
+                        net_taking,
+                    )
+                    taking_amount_usdc = net_taking
+
                 return fill_price, taking_amount_usdc
 
             except Exception as exc:
@@ -2067,6 +2082,7 @@ class BetEngine:
                 )
                 return 0.0
             sell_result = self._sell_with_retry(copied_bet, current_price)
+            _clob_sell_ok = sell_result != (None, None)
             if sell_result == (None, None):
                 # Sell failed — check whether market resolved while retrying.
                 # This happens when the CLOB returns 404 "No orderbook exists"
@@ -2125,7 +2141,28 @@ class BetEngine:
             else:
                 fill_price, taking_amount_usdc = sell_result
 
-        # Use actual USDC received (takingAmount from CLOB) when available.
+        # Bug 1: When the CLOB sell response lacked takingAmount, query the Data API
+        # for the actual net USDC credited by Polymarket. This gives the real fill
+        # price and automatically accounts for any taker fee (proceeds are post-fee).
+        # Only attempted for actual CLOB sells, not oracle/neutral closes.
+        if _clob_sell_ok and taking_amount_usdc is None and settings.POLY_FUNDER_ADDRESS:
+            actual_usdc, actual_price = self._client.get_recent_sell_usdc_sync(
+                copied_bet.token_id, delay_secs=1.0
+            )
+            if actual_usdc is not None:
+                logger.info(
+                    "Real sell bet %d: Data API fill $%.4f @ %.4f "
+                    "(CLOB response lacked takingAmount — was using estimated %.4f)",
+                    copied_bet.id,
+                    actual_usdc,
+                    actual_price or fill_price,
+                    fill_price,
+                )
+                taking_amount_usdc = actual_usdc
+                if actual_price:
+                    fill_price = actual_price
+
+        # Use actual USDC received (takingAmount from CLOB or Data API) when available.
         # Falls back to shares x price for oracle-priced closes (resolved markets
         # where we skip the CLOB sell and rely on on-chain redemption).
         if taking_amount_usdc is not None:
@@ -3451,7 +3488,7 @@ class BetEngine:
             # We never held a position here — this EXIT is orphaned (whale sold a
             # market we either missed or skipped at entry).  Drop silently.
             logger.warning(
-                "_handle_exit: no open positions for whale_bet %d "
+                "_handle_exit: no open positions for whale_bet %s "
                 "(market_id=%r, token_id=%s, mode=%s, whale=%s) — orphaned exit",
                 whale_bet.id,
                 whale_bet.market_id,
@@ -3487,6 +3524,7 @@ class BetEngine:
 
         # Stage 3: Soft exit confirmation — defer close if price still favorable
         if settings.EXIT_CONFIRMATION_ENABLED and live_exit_price is not None:
+            deferred_any = False
             for pos in open_positions:
                 # Only apply soft exit to BUY positions (not to exit orders)
                 buffer_price = pos.price_at_entry * (1 + settings.EXIT_CONFIRMATION_BUFFER)
@@ -3505,7 +3543,9 @@ class BetEngine:
                             entered_at_monotonic=time.monotonic(),
                             session_id=session.id,
                         )
-                    return None  # Don't close yet, wait for confirmation
+                    deferred_any = True
+            if deferred_any:
+                return None  # All qualifying tranches deferred; wait for confirmation
 
         close_ok: bool
         if len(open_positions) == 1:
@@ -4202,20 +4242,44 @@ class BetEngine:
 
         Used by _handle_exit to close every open tranche simultaneously when the
         whale exits a position they may have built up across multiple BUY trades.
+
+        Lookup strategy (most-specific first):
+        1. Exact AND match on both market_id AND token_id — fast, zero ambiguity.
+        2. token_id only — handles RTDS/chain-monitor events where market_id is
+           missing (no conditionId in the event), which is the primary cause of
+           orphan exits when RTDS fires before the HTTP activity poll.
+        3. market_id only — handles token_id format mismatches.
         """
-        q = (
+        base = (
             db.query(CopiedBet)
-            .filter(
-                CopiedBet.market_id == market_id,
-                CopiedBet.token_id == token_id,
-                CopiedBet.status == "OPEN",
-                CopiedBet.mode == session_mode,
-            )
+            .filter(CopiedBet.status == "OPEN", CopiedBet.mode == session_mode)
             .order_by(CopiedBet.opened_at.asc())
         )
         if whale_address is not None:
-            q = q.filter(CopiedBet.whale_address == whale_address)
-        return q.all()
+            base = base.filter(CopiedBet.whale_address == whale_address)
+
+        # Strategy 1: exact AND match (most specific)
+        if market_id and token_id:
+            results = base.filter(
+                CopiedBet.market_id == market_id,
+                CopiedBet.token_id == token_id,
+            ).all()
+            if results:
+                return results
+
+        # Strategy 2: token_id only (RTDS/chain events often lack conditionId)
+        if token_id:
+            results = base.filter(CopiedBet.token_id == token_id).all()
+            if results:
+                return results
+
+        # Strategy 3: market_id only (fallback for token_id format mismatches)
+        if market_id:
+            results = base.filter(CopiedBet.market_id == market_id).all()
+            if results:
+                return results
+
+        return []
 
     def _get_actual_position_size(self, token_id: str) -> float | None:
         """
