@@ -660,32 +660,30 @@ class ClobWsEntryMonitor:
 
             market_id = trade.get("conditionId", "")
 
-            existing_entries = (
-                db.query(WhaleBet)
+            # O(2) open-position check: find most recent EXIT, then check if any entry
+            # exists after it. Replaces O(N+1) loop (fetch all entries, check exit for each).
+            latest_exit = (
+                db.query(WhaleBet.timestamp)
                 .filter(
                     WhaleBet.whale_id == whale_rec.id,
                     WhaleBet.market_id == market_id,
-                    WhaleBet.bet_type.in_(["OPEN", "ADD-TO-POSITION"]),
+                    WhaleBet.bet_type == "EXIT",
                     WhaleBet.timestamp < ts,
                 )
-                .all()
+                .order_by(WhaleBet.timestamp.desc())
+                .first()
             )
+            latest_exit_ts = latest_exit[0] if latest_exit else None
 
-            has_open_position = False
-            for entry in existing_entries:
-                exit_exists = (
-                    db.query(WhaleBet)
-                    .filter(
-                        WhaleBet.whale_id == whale_rec.id,
-                        WhaleBet.market_id == market_id,
-                        WhaleBet.bet_type == "EXIT",
-                        WhaleBet.timestamp > entry.timestamp,
-                    )
-                    .first()
-                )
-                if not exit_exists:
-                    has_open_position = True
-                    break
+            entry_q = db.query(WhaleBet.id).filter(
+                WhaleBet.whale_id == whale_rec.id,
+                WhaleBet.market_id == market_id,
+                WhaleBet.bet_type.in_(["OPEN", "ADD-TO-POSITION"]),
+                WhaleBet.timestamp < ts,
+            )
+            if latest_exit_ts is not None:
+                entry_q = entry_q.filter(WhaleBet.timestamp > latest_exit_ts)
+            has_open_position = entry_q.first() is not None
 
             bet_type = "ADD-TO-POSITION" if has_open_position else "OPEN"
 

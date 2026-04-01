@@ -869,36 +869,32 @@ class WhaleChainMonitor:
 
             market_id = trade.get("conditionId", "")
 
-            # Detect if this is an add-to-position by checking for existing open position
-            # in the same market. Query for any OPEN or ADD-TO-POSITION bet before this
-            # timestamp that doesn't have a matching EXIT after it.
-            existing_entries = (
-                db.query(WhaleBet)
+            # Detect if this is an add-to-position: there is an existing OPEN/ADD-TO-POSITION
+            # entry with no EXIT after it. O(2) query strategy: find the most recent EXIT,
+            # then check if any entry exists after it (open position). Replaces the previous
+            # O(N+1) loop that fetched all entries and checked exits for each one.
+            latest_exit = (
+                db.query(WhaleBet.timestamp)
                 .filter(
                     WhaleBet.whale_id == whale_rec.id,
                     WhaleBet.market_id == market_id,
-                    WhaleBet.bet_type.in_(["OPEN", "ADD-TO-POSITION"]),
+                    WhaleBet.bet_type == "EXIT",
                     WhaleBet.timestamp < ts,
                 )
-                .all()
+                .order_by(WhaleBet.timestamp.desc())
+                .first()
             )
+            latest_exit_ts = latest_exit[0] if latest_exit else None
 
-            # Check if any existing entry has a matching exit
-            has_open_position = False
-            for entry in existing_entries:
-                exit_exists = (
-                    db.query(WhaleBet)
-                    .filter(
-                        WhaleBet.whale_id == whale_rec.id,
-                        WhaleBet.market_id == market_id,
-                        WhaleBet.bet_type == "EXIT",
-                        WhaleBet.timestamp > entry.timestamp,
-                    )
-                    .first()
-                )
-                if not exit_exists:
-                    has_open_position = True
-                    break
+            entry_q = db.query(WhaleBet.id).filter(
+                WhaleBet.whale_id == whale_rec.id,
+                WhaleBet.market_id == market_id,
+                WhaleBet.bet_type.in_(["OPEN", "ADD-TO-POSITION"]),
+                WhaleBet.timestamp < ts,
+            )
+            if latest_exit_ts is not None:
+                entry_q = entry_q.filter(WhaleBet.timestamp > latest_exit_ts)
+            has_open_position = entry_q.first() is not None
 
             bet_type = "ADD-TO-POSITION" if has_open_position else "OPEN"
 

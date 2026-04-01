@@ -137,11 +137,18 @@ class WhaleMonitor:
             id="stop_loss_snapshot",
         )
 
-        # Stage 3: Harvest and soft exit jobs — run on resolution scheduler
+        # Stage 3: Harvest job — expensive market checks, run on full resolution interval
         self._resolution_scheduler.add_job(
-            func=self._harvest_and_soft_exit_wrapper,
+            func=self._harvest_wrapper,
             trigger=IntervalTrigger(seconds=settings.RESOLUTION_CHECK_INTERVAL_SECONDS),
-            id="harvest_and_soft_exit",
+            id="harvest",
+        )
+        # Soft exit confirmation — cheap price check, runs every 10s so deferred exits
+        # close promptly once price drops below buffer instead of waiting up to 60s.
+        self._resolution_scheduler.add_job(
+            func=self._check_pending_exits_wrapper,
+            trigger=IntervalTrigger(seconds=10),
+            id="check_pending_exits",
         )
 
         self._resolution_scheduler.start()
@@ -1029,14 +1036,23 @@ class WhaleMonitor:
         except Exception as exc:
             logger.error("stop_loss_snapshot error: %s", exc)
 
-    def _harvest_and_soft_exit_wrapper(self):
-        """Stage 3: Check for harvest opportunities and pending exit confirmations."""
+    def _harvest_wrapper(self):
+        """Stage 3: Check for harvest opportunities (near-close, multiplier threshold)."""
         db = SessionLocal()
         try:
             self._bet_engine.check_and_harvest_positions(db)
+        except Exception as exc:
+            logger.error("harvest error: %s", exc)
+        finally:
+            db.close()
+
+    def _check_pending_exits_wrapper(self):
+        """Stage 3: Confirm or close deferred soft-exit positions. Runs every 10s."""
+        db = SessionLocal()
+        try:
             self._bet_engine._check_pending_exits(db)
         except Exception as exc:
-            logger.error("harvest_and_soft_exit error: %s", exc)
+            logger.error("check_pending_exits error: %s", exc)
         finally:
             db.close()
 
