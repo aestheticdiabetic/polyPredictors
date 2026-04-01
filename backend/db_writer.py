@@ -150,9 +150,15 @@ def _execute_with_retries(
                 f"Retrying in {backoff_ms}ms..."
             )
 
-            # Reset session state before retry (SQLAlchemy auto-rolls back on lock errors)
+            # Reset session state before retry (SQLAlchemy requires explicit rollback after
+            # a failed commit/flush before any subsequent operations can proceed).
+            # Save pending "new" objects first — db.rollback() expunges objects that were
+            # added but not yet flushed, causing a silent data loss on the retry commit.
             if db is not None:
+                pending_new = list(db.new)
                 db.rollback()
+                for obj in pending_new:
+                    db.add(obj)
 
             # Exponential backoff
             time.sleep(backoff_ms / 1000.0)
