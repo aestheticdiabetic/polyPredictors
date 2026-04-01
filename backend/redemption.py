@@ -339,12 +339,28 @@ async def redeem_position(position: dict) -> dict:
         return {"error": str(e)}
 
 
+MIN_MATIC_FOR_REDEMPTION = 0.05  # ~1 redemption tx at normal gas prices
+
+
 async def check_and_redeem() -> dict:
     """Check for redeemable positions and redeem them. Safe to call periodically."""
     if not settings.credentials_valid():
         return {"skipped": True, "reason": "no_credentials"}
 
     try:
+        from web3 import Web3
+
+        w3 = Web3(Web3.HTTPProvider(settings.POLYGON_RPC_URL))
+        eoa = w3.eth.account.from_key(settings.POLY_PRIVATE_KEY).address
+        balance_matic = w3.eth.get_balance(eoa) / 1e18
+        if balance_matic < MIN_MATIC_FOR_REDEMPTION:
+            log.warning(
+                "EOA gas balance too low for redemption (%.4f MATIC < %.4f required) — skipping",
+                balance_matic,
+                MIN_MATIC_FOR_REDEMPTION,
+            )
+            return {"skipped": True, "reason": "insufficient_gas", "balance_matic": balance_matic}
+
         # Use the Gnosis Safe / funder address — this is where positions are held.
         # Do NOT derive from POLY_PRIVATE_KEY; that gives the signing EOA, not the Safe.
         wallet_address = settings.POLY_FUNDER_ADDRESS
