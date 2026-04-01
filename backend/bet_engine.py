@@ -905,8 +905,8 @@ class BetEngine:
                 # If the market is already closed/resolved, drop silently — no ledger entry.
                 # Policy skips (balance, price drift, etc.) still get a SKIPPED record.
                 if self._is_closed_market_skip(effective_market_info, skip_reason):
-                    logger.debug(
-                        "Dropping whale_bet %d silently — market already closed: %s",
+                    logger.info(
+                        "Dropping whale_bet %d — market already closed/resolved: %s",
                         whale_bet.id,
                         skip_reason,
                     )

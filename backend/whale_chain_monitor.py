@@ -732,6 +732,16 @@ class WhaleChainMonitor:
     # ------------------------------------------------------------------
 
     async def _dispatch_entry(self, trade: dict, whale_address: str):
+        try:
+            await self._dispatch_entry_inner(trade, whale_address)
+        except Exception:
+            log.exception(
+                "WhaleChainMonitor: unhandled exception in _dispatch_entry whale=%s token=%s",
+                whale_address[:10],
+                trade.get("asset", "")[:16],
+            )
+
+    async def _dispatch_entry_inner(self, trade: dict, whale_address: str):
         token_id = trade["asset"]
         client = getattr(self._whale_monitor, "_client", None)
         if not client:
@@ -932,6 +942,9 @@ class WhaleChainMonitor:
             try:
                 active_sessions = db.query(MonitoringSession).filter_by(is_active=True).all()
                 if not active_sessions:
+                    log.warning(
+                        "WhaleChainMonitor: no active sessions — whale bet recorded but not copied"
+                    )
                     synchronized_commit(db)
                     return
 
