@@ -105,13 +105,15 @@ class WhaleChainMonitor:
         # for the rare whale events (multiple events in the same block share a timestamp)
         self._block_ts_cache: dict[int, int] = {}
 
-        # Serialise the DB-write phase across concurrent dispatch tasks.
-        # Multiple _dispatch_entry/_dispatch_exit tasks can be created simultaneously
-        # for trades in the same block. Their Phase-1 HTTP work runs concurrently, but
-        # Phase-2 (run_in_executor → SQLite INSERT) must be serialised because SQLite
-        # only allows one writer at a time. Without this lock the concurrent writes race
-        # and raise OperationalError("database is locked") even with WAL mode enabled.
-        self._db_write_lock: asyncio.Lock = asyncio.Lock()
+        # Serialise entry and exit DB-write phases independently.
+        # Entries and exits operate on different ORM objects (CopiedBet open vs WhaleBet
+        # exit) so they don't need to share a single lock. Using separate locks prevents
+        # a slow exit (FOK retries + Data-API P&L query) from blocking a concurrent entry,
+        # which was causing price-drift skips when the entry's cached live_price aged out
+        # while waiting behind an exit retry loop.
+        # SQLite write serialisation is still handled by db_writer._db_write_lock (threading).
+        self._entry_dispatch_lock: asyncio.Lock = asyncio.Lock()
+        self._exit_dispatch_lock: asyncio.Lock = asyncio.Lock()
 
         log.info(
             "WhaleChainMonitor initialized (WS=%s..., sig=%s...)",
@@ -823,10 +825,11 @@ class WhaleChainMonitor:
             trade["usdcSize"],
         )
 
-        # Phase 2: sync DB + bet_engine in executor — serialised via lock so
+        # Phase 2: sync DB + bet_engine in executor — serialised via entry lock so
         # concurrent same-block dispatches don't race on the SQLite write lock.
+        # Entry lock is separate from exit lock so exits don't block entries.
         loop = asyncio.get_event_loop()
-        async with self._db_write_lock:
+        async with self._entry_dispatch_lock:
             await loop.run_in_executor(
                 None,
                 self._sync_open_position,
@@ -1060,7 +1063,7 @@ class WhaleChainMonitor:
             # format differs enough that both lookup methods failed.  Still record
             # the EXIT WhaleBet so check_orphan_positions Case 2 ("exit after open")
             # can fire and close any lingering copied position on the next cycle.
-            async with self._db_write_lock:
+            async with self._exit_dispatch_lock:
                 await loop.run_in_executor(None, self._record_unmatched_exit, trade, whale_address)
             return
 
@@ -1081,8 +1084,9 @@ class WhaleChainMonitor:
             trade["price"],
         )
 
-        # Phase 3: sync DB write + bet_engine in executor — serialised via lock.
-        async with self._db_write_lock:
+        # Phase 3: sync DB write + bet_engine in executor — serialised via exit lock.
+        # Separate from entry lock so exits don't block concurrent entry dispatches.
+        async with self._exit_dispatch_lock:
             await loop.run_in_executor(
                 None,
                 self._sync_close_position,

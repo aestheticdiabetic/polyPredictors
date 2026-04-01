@@ -2147,7 +2147,7 @@ class BetEngine:
         # Only attempted for actual CLOB sells, not oracle/neutral closes.
         if _clob_sell_ok and taking_amount_usdc is None and settings.POLY_FUNDER_ADDRESS:
             actual_usdc, actual_price = self._client.get_recent_sell_usdc_sync(
-                copied_bet.token_id, delay_secs=1.0
+                copied_bet.token_id, delay_secs=0.0
             )
             if actual_usdc is not None:
                 logger.info(
