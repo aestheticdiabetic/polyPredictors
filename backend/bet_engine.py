@@ -739,6 +739,13 @@ class BetEngine:
         # RLock is used so _handle_add_to_position (which also acquires the lock)
         # does not deadlock when called from within this block.
 
+        # ── Phase 1: all policy checks + balance reservation (under lock) ──────
+        # The lock protects session.current_balance_usdc (shared across all
+        # concurrent entry threads) and the same-price dedup guard (must see
+        # committed rows to prevent flooding).  The CLOB HTTP call runs outside
+        # the lock in Phase 2 so concurrent entries on different markets can
+        # proceed in parallel.  SIMULATION stays fully inside the lock because
+        # simulate_buy is synchronous and completes in microseconds.
         with self._placement_lock:
             # WAL snapshot fix: commit any pending work to end the current read
             # transaction before the guard query.  SQLite WAL mode fixes each
@@ -759,6 +766,8 @@ class BetEngine:
             # Checked here (not before the lock) so that concurrent threads cannot
             # both pass the guard before either has committed its new CopiedBet row,
             # which was causing multi-position flooding on rapid same-price buys.
+            # PENDING rows are included so that a concurrent Phase 1 reservation
+            # (CLOB call still in-flight) is also treated as an existing position.
             _SAME_PRICE_TOLERANCE = 0.03  # 3 cents absolute — same entry level
             if whale_address:
                 existing_for_token = (
@@ -766,7 +775,7 @@ class BetEngine:
                     .filter(
                         CopiedBet.whale_address == whale_address,
                         CopiedBet.token_id == whale_bet.token_id,
-                        CopiedBet.status == "OPEN",
+                        CopiedBet.status.in_(["OPEN", "PENDING"]),
                         CopiedBet.mode == mode,
                     )
                     .all()
@@ -1171,180 +1180,276 @@ class BetEngine:
                 )
                 bet_size_usdc = 1.0
 
-            # Place or simulate
-            entry_price = whale_bet.price
+            # Parse market close date from market_info for ledger display.
+            # Prefer gameStartTime (actual tip-off / kick-off) over endDate (trading
+            # cutoff) when it is available and later, so the countdown reflects the
+            # real event time rather than Polymarket's arbitrary betting deadline.
+            market_close_at = None
+            if market_info:
+                end_str = (
+                    market_info.get("endDate")
+                    or market_info.get("endDateIso")
+                    or market_info.get("end_date_iso")
+                    or market_info.get("end_date")
+                )
+                if end_str:
+                    try:
+                        dt = datetime.fromisoformat(end_str.rstrip("Z"))
+                        if dt.tzinfo is not None:
+                            dt = dt.replace(tzinfo=None)  # store as naive UTC
+                        market_close_at = dt
+                    except (ValueError, TypeError):
+                        pass
+
+                # Override with gameStartTime when available and later than endDate
+                game_start_str = market_info.get("gameStartTime")
+                if game_start_str:
+                    try:
+                        gst = datetime.fromisoformat(str(game_start_str).rstrip("Z"))
+                        if gst.tzinfo is not None:
+                            gst = gst.replace(tzinfo=None)
+                        if market_close_at is None or gst > market_close_at:
+                            market_close_at = gst
+                    except (ValueError, TypeError):
+                        pass
+
+            # Reuse the classification already computed for the category-filter check above.
+            market_category, bet_type_cat = cat_sport, cat_bet_type
+
             _neg_risk = bool(market_info.get("negRisk", False))
-            _post_fill_pnl: float | None = None
-            _post_fill_sell_price: float | None = None
-            try:
-                if mode in ("SIMULATION", "HEDGE_SIM"):
-                    shares, actual_price, actual_cost = self.simulate_buy(
-                        session=session,
-                        market_id=whale_bet.market_id,
-                        token_id=whale_bet.token_id,
-                        question=whale_bet.question,
-                        outcome=whale_bet.outcome,
-                        price=whale_bet.price,
-                        size_usdc=bet_size_usdc,
-                        db=db,
-                        live_price=live_price,
-                    )
-                    entry_price = actual_price
-                    size_shares = shares
-                    bet_size_usdc = actual_cost  # use fee-inclusive cost as DB cost basis
-                    bet_status = "OPEN"
-                    skip_reason_val = None
-                else:
-                    order_resp = self.place_real_buy(
-                        token_id=whale_bet.token_id,
-                        size_usdc=bet_size_usdc,
-                        price=whale_bet.price,
-                        neg_risk=_neg_risk,
-                    )
-                    # Detect FOK/unmatched cancellations — no tokens were actually received
-                    order_status_raw = str(order_resp.get("status", "")).upper()
-                    if order_status_raw in ("UNMATCHED", "CANCELLED", "CANCELED"):
-                        size_shares = 0.0
-                        logger.warning(
-                            "REAL BUY status=%s for token %s — order not filled, recording size_shares=0",
-                            order_status_raw,
-                            whale_bet.token_id[:16],
-                        )
-                    else:
-                        import math as _math
 
-                        # Log the raw response so we can diagnose field names in prod.
-                        logger.info("REAL BUY response: %s", order_resp)
+            # ── SIMULATION: run synchronously inside lock, return immediately ──
+            if mode in ("SIMULATION", "HEDGE_SIM"):
+                entry_price = whale_bet.price
+                _post_fill_pnl: float | None = None
+                _post_fill_sell_price: float | None = None
+                shares, actual_price, actual_cost = self.simulate_buy(
+                    session=session,
+                    market_id=whale_bet.market_id,
+                    token_id=whale_bet.token_id,
+                    question=whale_bet.question,
+                    outcome=whale_bet.outcome,
+                    price=whale_bet.price,
+                    size_usdc=bet_size_usdc,
+                    db=db,
+                    live_price=live_price,
+                )
+                entry_price = actual_price
+                size_shares = shares
+                bet_size_usdc = actual_cost  # use fee-inclusive cost as DB cost basis
+                bet_status = "OPEN"
+                skip_reason_val = None
 
-                        # CLOB BUY response fields (confirmed via py-clob-client source):
-                        #   Submitter is the ORDER MAKER (maker=self.funder in builder).
-                        #   makingAmount = USDC the maker (us) provided (e.g. "0.7548")
-                        #   takingAmount = YES shares the taker provided to us (e.g. "1.02")
-                        # entry_price = makingAmount / takingAmount = USDC / shares
-                        # Legacy fields like price/avgPrice/size_matched are NOT present.
-                        taking_raw = order_resp.get("takingAmount")
-                        making_raw = order_resp.get("makingAmount")
+                copied_bet = CopiedBet(
+                    whale_bet_id=whale_bet.id,
+                    whale_address=whale_bet.whale.address,
+                    session_id=session.id,
+                    mode=mode,
+                    market_id=whale_bet.market_id,
+                    token_id=whale_bet.token_id,
+                    question=whale_bet.question,
+                    side=whale_bet.side,
+                    outcome=whale_bet.outcome,
+                    price_at_entry=entry_price,
+                    size_usdc=bet_size_usdc,
+                    size_shares=size_shares,
+                    risk_factor=risk_factor,
+                    whale_bet_usdc=whale_bet.size_usdc,
+                    whale_avg_bet_usdc=whale_avg,
+                    status=bet_status,
+                    skip_reason=skip_reason_val,
+                    market_category=market_category,
+                    bet_type=bet_type_cat,
+                    opened_at=datetime.utcnow(),
+                    market_close_at=market_close_at,
+                )
+                db.add(copied_bet)
+                session.total_bets_placed += 1
+                synchronized_commit(db)
+                db.refresh(copied_bet)
+                logger.info(
+                    "Placed %s bet: %s %s @ %.3f for $%.2f (rf=%.2f)",
+                    mode,
+                    whale_bet.outcome,
+                    whale_bet.market_id[:16],
+                    entry_price,
+                    bet_size_usdc,
+                    risk_factor,
+                )
+                return copied_bet
 
-                        if taking_raw is not None and making_raw is not None:
-                            try:
-                                taking_f = float(taking_raw)
-                                making_f = float(making_raw)
-                                if making_f > 0 and taking_f > 0:
-                                    size_shares = _math.floor(taking_f * 100) / 100
-                                    actual_cost = round(making_f, 4)
-                                    bet_size_usdc = actual_cost
-                                    entry_price = round(making_f / taking_f, 6)
-                                    logger.info(
-                                        "REAL BUY: makingAmount=%.4f (USDC) takingAmount=%.4f (shares)"
-                                        " → entry_price=%.4f actual_cost=$%.4f",
-                                        making_f,
-                                        taking_f,
-                                        entry_price,
-                                        actual_cost,
-                                    )
-                                    # Post-fill guard: CLOB slippage can push the actual fill
-                                    # above REAL_MAX_ENTRY_PRICE checked pre-order. Sell back
-                                    # immediately to avoid being trapped in a fee-dominant trade.
-                                    if entry_price >= settings.REAL_MAX_ENTRY_PRICE:
-                                        logger.warning(
-                                            "REAL BUY: fill %.4f >= REAL_MAX_ENTRY_PRICE %.4f "
-                                            "— selling back immediately",
-                                            entry_price,
-                                            settings.REAL_MAX_ENTRY_PRICE,
-                                        )
-                                        try:
-                                            _sell_r = self.place_real_sell(
-                                                token_id=whale_bet.token_id,
-                                                size_shares=size_shares,
-                                            )
-                                            _post_fill_sell_price = float(
-                                                _sell_r.get("price")
-                                                or _sell_r.get("avgPrice")
-                                                or _sell_r.get("average_price")
-                                                or entry_price * 0.97
-                                            )
-                                        except Exception as _se:
-                                            logger.error("Post-fill emergency sell failed: %s", _se)
-                                            _post_fill_sell_price = entry_price * 0.97
-                                        _post_fill_pnl = round(
-                                            size_shares * _post_fill_sell_price - actual_cost, 4
-                                        )
-                                else:
-                                    # Zero amounts — fall back to whale price estimate
-                                    entry_price = float(whale_bet.price)
-                                    size_shares = (
-                                        _math.floor(bet_size_usdc / entry_price * 100) / 100
-                                    )
-                                    logger.warning(
-                                        "REAL BUY: takingAmount/makingAmount zero — "
-                                        "falling back to whale price %.4f",
-                                        entry_price,
-                                    )
-                            except (TypeError, ValueError) as _e:
-                                entry_price = float(whale_bet.price)
-                                size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
+            # ── REAL: reserve slot + deduct balance, then release lock ──────────
+            # Create a PENDING row so that concurrent threads see this reservation
+            # in the dedup guard while the CLOB call is in-flight (Phase 2).
+            reserved_bet_size = bet_size_usdc
+            pending_bet = CopiedBet(
+                whale_bet_id=whale_bet.id,
+                whale_address=whale_bet.whale.address,
+                session_id=session.id,
+                mode=mode,
+                market_id=whale_bet.market_id,
+                token_id=whale_bet.token_id,
+                question=whale_bet.question,
+                side=whale_bet.side,
+                outcome=whale_bet.outcome,
+                price_at_entry=whale_bet.price,  # placeholder; updated in Phase 3
+                size_usdc=reserved_bet_size,
+                size_shares=0.0,  # placeholder; updated in Phase 3
+                risk_factor=risk_factor,
+                whale_bet_usdc=whale_bet.size_usdc,
+                whale_avg_bet_usdc=whale_avg,
+                status="PENDING",
+                skip_reason=None,
+                market_category=market_category,
+                bet_type=bet_type_cat,
+                opened_at=datetime.utcnow(),
+                market_close_at=market_close_at,
+            )
+            db.add(pending_bet)
+            session.current_balance_usdc = max(
+                0.0, session.current_balance_usdc - reserved_bet_size
+            )
+            db.add(session)
+            synchronized_commit(db)
+            db.refresh(pending_bet)
+        # ── lock released — CLOB call runs concurrently with other entries ───
+
+        # ── Phase 2: CLOB HTTP call (outside lock) ───────────────────────────
+        entry_price = whale_bet.price
+        size_shares = 0.0
+        _post_fill_pnl: float | None = None
+        _post_fill_sell_price: float | None = None
+        bet_status = "SKIPPED"
+        skip_reason_val: str | None = None
+        try:
+            order_resp = self.place_real_buy(
+                token_id=whale_bet.token_id,
+                size_usdc=reserved_bet_size,
+                price=whale_bet.price,
+                neg_risk=_neg_risk,
+            )
+            # Detect FOK/unmatched cancellations — no tokens were actually received
+            order_status_raw = str(order_resp.get("status", "")).upper()
+            if order_status_raw in ("UNMATCHED", "CANCELLED", "CANCELED"):
+                size_shares = 0.0
+                logger.warning(
+                    "REAL BUY status=%s for token %s — order not filled, recording size_shares=0",
+                    order_status_raw,
+                    whale_bet.token_id[:16],
+                )
+            else:
+                import math as _math
+
+                # Log the raw response so we can diagnose field names in prod.
+                logger.info("REAL BUY response: %s", order_resp)
+
+                # CLOB BUY response fields (confirmed via py-clob-client source):
+                #   Submitter is the ORDER MAKER (maker=self.funder in builder).
+                #   makingAmount = USDC the maker (us) provided (e.g. "0.7548")
+                #   takingAmount = YES shares the taker provided to us (e.g. "1.02")
+                # entry_price = makingAmount / takingAmount = USDC / shares
+                # Legacy fields like price/avgPrice/size_matched are NOT present.
+                taking_raw = order_resp.get("takingAmount")
+                making_raw = order_resp.get("makingAmount")
+
+                if taking_raw is not None and making_raw is not None:
+                    try:
+                        taking_f = float(taking_raw)
+                        making_f = float(making_raw)
+                        if making_f > 0 and taking_f > 0:
+                            size_shares = _math.floor(taking_f * 100) / 100
+                            actual_cost = round(making_f, 4)
+                            bet_size_usdc = actual_cost
+                            entry_price = round(making_f / taking_f, 6)
+                            logger.info(
+                                "REAL BUY: makingAmount=%.4f (USDC) takingAmount=%.4f (shares)"
+                                " → entry_price=%.4f actual_cost=$%.4f",
+                                making_f,
+                                taking_f,
+                                entry_price,
+                                actual_cost,
+                            )
+                            # Post-fill guard: CLOB slippage can push the actual fill
+                            # above REAL_MAX_ENTRY_PRICE checked pre-order. Sell back
+                            # immediately to avoid being trapped in a fee-dominant trade.
+                            if entry_price >= settings.REAL_MAX_ENTRY_PRICE:
                                 logger.warning(
-                                    "REAL BUY: could not parse amounts (%s) — fallback", _e
+                                    "REAL BUY: fill %.4f >= REAL_MAX_ENTRY_PRICE %.4f "
+                                    "— selling back immediately",
+                                    entry_price,
+                                    settings.REAL_MAX_ENTRY_PRICE,
+                                )
+                                try:
+                                    _sell_r = self.place_real_sell(
+                                        token_id=whale_bet.token_id,
+                                        size_shares=size_shares,
+                                    )
+                                    _post_fill_sell_price = float(
+                                        _sell_r.get("price")
+                                        or _sell_r.get("avgPrice")
+                                        or _sell_r.get("average_price")
+                                        or entry_price * 0.97
+                                    )
+                                except Exception as _se:
+                                    logger.error("Post-fill emergency sell failed: %s", _se)
+                                    _post_fill_sell_price = entry_price * 0.97
+                                _post_fill_pnl = round(
+                                    size_shares * _post_fill_sell_price - actual_cost, 4
                                 )
                         else:
-                            # Fields absent — fall back to whale price estimate
+                            # Zero amounts — fall back to whale price estimate
                             entry_price = float(whale_bet.price)
                             size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
                             logger.warning(
-                                "REAL BUY: takingAmount/makingAmount absent in response %s"
-                                " — falling back to whale price %.4f",
-                                order_resp,
+                                "REAL BUY: takingAmount/makingAmount zero — "
+                                "falling back to whale price %.4f",
                                 entry_price,
                             )
-                    # Deduct actual cost from session balance, then refund sell proceeds
-                    # if we immediately sold back due to post-fill overpay.
-                    session.current_balance_usdc = max(
-                        0.0, session.current_balance_usdc - bet_size_usdc
+                    except (TypeError, ValueError) as _e:
+                        entry_price = float(whale_bet.price)
+                        size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
+                        logger.warning("REAL BUY: could not parse amounts (%s) — fallback", _e)
+                else:
+                    # Fields absent — fall back to whale price estimate
+                    entry_price = float(whale_bet.price)
+                    size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
+                    logger.warning(
+                        "REAL BUY: takingAmount/makingAmount absent in response %s"
+                        " — falling back to whale price %.4f",
+                        order_resp,
+                        entry_price,
                     )
-                    if _post_fill_sell_price is not None:
-                        sell_proceeds = round(size_shares * _post_fill_sell_price, 4)
-                        session.current_balance_usdc = min(
-                            session.current_balance_usdc + sell_proceeds,
-                            session.starting_balance_usdc,
-                        )
-                        bet_status = "CLOSED_LOSS"
-                        skip_reason_val = (
-                            f"Post-fill overpay: fill {entry_price:.4f} >= "
-                            f"REAL_MAX_ENTRY_PRICE {settings.REAL_MAX_ENTRY_PRICE:.4f}"
-                        )
-                    else:
-                        bet_status = "OPEN"
-                        skip_reason_val = None
-                    db.add(session)
-            except Exception as exc:
-                logger.error("Failed to place bet for whale_bet %d: %s", whale_bet.id, exc)
-                # Retry once on PolyApiException if price is still within drift parameters.
-                try:
-                    from py_clob_client.exceptions import PolyApiException as _PolyApiExc
+            if _post_fill_sell_price is not None:
+                bet_status = "CLOSED_LOSS"
+                skip_reason_val = (
+                    f"Post-fill overpay: fill {entry_price:.4f} >= "
+                    f"REAL_MAX_ENTRY_PRICE {settings.REAL_MAX_ENTRY_PRICE:.4f}"
+                )
+            else:
+                bet_status = "OPEN"
+                skip_reason_val = None
+        except Exception as exc:
+            logger.error("Failed to place bet for whale_bet %d: %s", whale_bet.id, exc)
+            # Retry once on PolyApiException if price is still within drift parameters.
+            try:
+                from py_clob_client.exceptions import PolyApiException as _PolyApiExc
 
-                    _is_poly_exc = isinstance(exc, _PolyApiExc)
-                except ImportError:
-                    _is_poly_exc = "PolyApiException" in type(exc).__name__
-                if _is_poly_exc and mode not in ("SIMULATION", "HEDGE_SIM"):
-                    # 400 HTML = nginx/CDN rate limit; retrying immediately worsens
-                    # the situation — skip the buy instead of hammering the API.
-                    _is_rate_limited = (
-                        getattr(exc, "status_code", None) == 400 and "<html>" in str(exc).lower()
+                _is_poly_exc = isinstance(exc, _PolyApiExc)
+            except ImportError:
+                _is_poly_exc = "PolyApiException" in type(exc).__name__
+            if _is_poly_exc:
+                # 400 HTML = nginx/CDN rate limit; retrying immediately worsens
+                # the situation — skip the buy instead of hammering the API.
+                _is_rate_limited = (
+                    getattr(exc, "status_code", None) == 400 and "<html>" in str(exc).lower()
+                )
+                if _is_rate_limited:
+                    logger.warning(
+                        "PolyApiException 400 HTML (rate limit) on whale_bet %d — skipping buy",
+                        whale_bet.id,
                     )
-                    if _is_rate_limited:
-                        logger.warning(
-                            "PolyApiException 400 HTML (rate limit) on whale_bet %d — skipping buy",
-                            whale_bet.id,
-                        )
-                        return self._create_skipped_bet(
-                            whale_bet=whale_bet,
-                            session=session,
-                            bet_size_usdc=bet_size_usdc,
-                            risk_factor=risk_factor,
-                            whale_avg=whale_avg,
-                            skip_reason="Rate limited (400 HTML)",
-                            db=db,
-                        )
+                    skip_reason_val = "Rate limited (400 HTML)"
+                else:
                     retry_price_ok, retry_price_reason = risk_calc.check_price_staleness(
                         whale_price=whale_bet.price,
                         live_price=live_price,
@@ -1359,7 +1464,7 @@ class BetEngine:
                         try:
                             order_resp = self.place_real_buy(
                                 token_id=whale_bet.token_id,
-                                size_usdc=bet_size_usdc,
+                                size_usdc=reserved_bet_size,
                                 price=whale_bet.price,
                                 neg_risk=_neg_risk,
                             )
@@ -1399,10 +1504,6 @@ class BetEngine:
                                     )
                                 bet_status = "OPEN"
                                 skip_reason_val = None
-                            session.current_balance_usdc = max(
-                                0.0, session.current_balance_usdc - bet_size_usdc
-                            )
-                            db.add(session)
                             logger.info(
                                 "Retry BUY succeeded for whale_bet %d: entry=%.4f shares=%.4f",
                                 whale_bet.id,
@@ -1415,120 +1516,67 @@ class BetEngine:
                                 whale_bet.id,
                                 retry_exc,
                             )
-                            return self._create_skipped_bet(
-                                whale_bet=whale_bet,
-                                session=session,
-                                bet_size_usdc=bet_size_usdc,
-                                risk_factor=risk_factor,
-                                whale_avg=whale_avg,
-                                skip_reason=f"Order failed (retry): {retry_exc}",
-                                db=db,
-                            )
+                            skip_reason_val = f"Order failed (retry): {retry_exc}"
                     else:
                         logger.info(
                             "PolyApiException on whale_bet %d — price out of drift after failure (%s), skipping",
                             whale_bet.id,
                             retry_price_reason,
                         )
-                        return self._create_skipped_bet(
-                            whale_bet=whale_bet,
-                            session=session,
-                            bet_size_usdc=bet_size_usdc,
-                            risk_factor=risk_factor,
-                            whale_avg=whale_avg,
-                            skip_reason=f"Order failed + price drifted: {exc}",
-                            db=db,
-                        )
-                else:
-                    return self._create_skipped_bet(
-                        whale_bet=whale_bet,
-                        session=session,
-                        bet_size_usdc=bet_size_usdc,
-                        risk_factor=risk_factor,
-                        whale_avg=whale_avg,
-                        skip_reason=f"Order failed: {exc}",
-                        db=db,
+                        skip_reason_val = f"Order failed + price drifted: {exc}"
+            else:
+                skip_reason_val = f"Order failed: {exc}"
+
+        # ── Phase 3: write-back under lock (balance correction + finalize) ───
+        with self._placement_lock:
+            db.refresh(pending_bet)
+            db.refresh(session)
+
+            if bet_status in ("OPEN", "CLOSED_LOSS"):
+                # Apply balance delta: actual cost may differ from reservation
+                delta = reserved_bet_size - bet_size_usdc
+                if abs(delta) > 0.0001:
+                    session.current_balance_usdc = min(
+                        session.current_balance_usdc + delta,
+                        session.starting_balance_usdc,
                     )
 
-            # Parse market close date from market_info for ledger display.
-            # Prefer gameStartTime (actual tip-off / kick-off) over endDate (trading
-            # cutoff) when it is available and later, so the countdown reflects the
-            # real event time rather than Polymarket's arbitrary betting deadline.
-            market_close_at = None
-            if market_info:
-                end_str = (
-                    market_info.get("endDate")
-                    or market_info.get("endDateIso")
-                    or market_info.get("end_date_iso")
-                    or market_info.get("end_date")
+                pending_bet.status = bet_status
+                pending_bet.price_at_entry = entry_price
+                pending_bet.size_shares = size_shares
+                pending_bet.size_usdc = bet_size_usdc
+                pending_bet.skip_reason = skip_reason_val
+
+                session.total_bets_placed += 1
+
+                if _post_fill_pnl is not None:
+                    sell_proceeds = round(size_shares * _post_fill_sell_price, 4)  # type: ignore[arg-type]
+                    session.current_balance_usdc = min(
+                        session.current_balance_usdc + sell_proceeds,
+                        session.starting_balance_usdc,
+                    )
+                    pending_bet.pnl_usdc = _post_fill_pnl
+                    pending_bet.resolution_price = _post_fill_sell_price
+                    pending_bet.closed_at = datetime.utcnow()
+                    pending_bet.close_reason = skip_reason_val
+                    with self._session_stats_lock:
+                        session.total_losses += 1
+                        session.total_pnl_usdc = round(session.total_pnl_usdc + _post_fill_pnl, 4)
+            else:
+                # Order failed — mark as SKIPPED and refund the reserved balance
+                pending_bet.status = "SKIPPED"
+                pending_bet.skip_reason = skip_reason_val or "Order failed"
+                session.current_balance_usdc = min(
+                    session.current_balance_usdc + reserved_bet_size,
+                    session.starting_balance_usdc,
                 )
-                if end_str:
-                    try:
-                        dt = datetime.fromisoformat(end_str.rstrip("Z"))
-                        if dt.tzinfo is not None:
-                            dt = dt.replace(tzinfo=None)  # store as naive UTC
-                        market_close_at = dt
-                    except (ValueError, TypeError):
-                        pass
 
-                # Override with gameStartTime when available and later than endDate
-                game_start_str = market_info.get("gameStartTime")
-                if game_start_str:
-                    try:
-                        gst = datetime.fromisoformat(str(game_start_str).rstrip("Z"))
-                        if gst.tzinfo is not None:
-                            gst = gst.replace(tzinfo=None)
-                        if market_close_at is None or gst > market_close_at:
-                            market_close_at = gst
-                    except (ValueError, TypeError):
-                        pass
-
-            # Reuse the classification already computed for the category-filter check above.
-            market_category, bet_type_cat = cat_sport, cat_bet_type
-
-            # Persist CopiedBet
-            copied_bet = CopiedBet(
-                whale_bet_id=whale_bet.id,
-                whale_address=whale_bet.whale.address,
-                session_id=session.id,
-                mode=mode,
-                market_id=whale_bet.market_id,
-                token_id=whale_bet.token_id,
-                question=whale_bet.question,
-                side=whale_bet.side,
-                outcome=whale_bet.outcome,
-                price_at_entry=entry_price,
-                size_usdc=bet_size_usdc,
-                size_shares=size_shares,
-                risk_factor=risk_factor,
-                whale_bet_usdc=whale_bet.size_usdc,
-                whale_avg_bet_usdc=whale_avg,
-                status=bet_status,
-                skip_reason=skip_reason_val,
-                market_category=market_category,
-                bet_type=bet_type_cat,
-                opened_at=datetime.utcnow(),
-                market_close_at=market_close_at,
-            )
-            db.add(copied_bet)
-
-            # Update session counters
-            session.total_bets_placed += 1
-
-            # If we immediately sold back due to post-fill overpay, record the realised loss.
-            if _post_fill_pnl is not None:
-                copied_bet.pnl_usdc = _post_fill_pnl
-                copied_bet.resolution_price = _post_fill_sell_price
-                copied_bet.closed_at = datetime.utcnow()
-                copied_bet.close_reason = skip_reason_val
-                with self._session_stats_lock:
-                    session.total_losses += 1
-                    session.total_pnl_usdc = round(session.total_pnl_usdc + _post_fill_pnl, 4)
-                db.add(session)
-
+            db.add(pending_bet)
+            db.add(session)
             synchronized_commit(db)
-            db.refresh(copied_bet)
+            db.refresh(pending_bet)
 
+        if bet_status in ("OPEN", "CLOSED_LOSS"):
             logger.info(
                 "Placed %s bet: %s %s @ %.3f for $%.2f (rf=%.2f)",
                 mode,
@@ -1538,7 +1586,14 @@ class BetEngine:
                 bet_size_usdc,
                 risk_factor,
             )
-            return copied_bet
+        else:
+            logger.info(
+                "Skipped %s bet for whale_bet %d: %s",
+                mode,
+                whale_bet.id,
+                skip_reason_val,
+            )
+        return pending_bet
 
     # ------------------------------------------------------------------
     # Simulation helpers
@@ -3955,7 +4010,7 @@ class BetEngine:
                         .filter(
                             CopiedBet.whale_address == whale_addr,
                             CopiedBet.token_id == item.token_id,
-                            CopiedBet.status == "OPEN",
+                            CopiedBet.status.in_(["OPEN", "PENDING"]),
                             CopiedBet.mode == session.mode,
                         )
                         .all()

@@ -129,6 +129,32 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.warning("Failed to seed slippage register: %s", exc)
 
+    # Recover orphaned PENDING bets from a previous crashed run.
+    # A PENDING row means Phase 1 (balance deduction + DB insert) completed but
+    # the process died before Phase 3 (CLOB write-back) could update the status.
+    # Refund the reserved balance and mark these rows SKIPPED so they don't
+    # permanently occupy dedup slots or leave the session balance short.
+    try:
+        db = next(get_db())
+        orphaned = db.query(CopiedBet).filter(CopiedBet.status == "PENDING").all()
+        if orphaned:
+            for bet in orphaned:
+                session_obj = db.get(MonitoringSession, bet.session_id)
+                if session_obj:
+                    session_obj.current_balance_usdc = min(
+                        session_obj.current_balance_usdc + bet.size_usdc,
+                        session_obj.starting_balance_usdc,
+                    )
+                    db.add(session_obj)
+                bet.status = "SKIPPED"
+                bet.skip_reason = "Recovered orphaned PENDING from previous run"
+                db.add(bet)
+            synchronized_commit(db)
+            logger.warning("Recovered %d orphaned PENDING bet(s) from previous run", len(orphaned))
+        db.close()
+    except Exception as exc:
+        logger.warning("Failed to recover orphaned PENDING bets: %s", exc)
+
     yield
     # Graceful shutdown
     if discord_bot is not None:

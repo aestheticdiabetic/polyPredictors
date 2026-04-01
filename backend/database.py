@@ -211,7 +211,7 @@ class CopiedBet(Base):
 
     # Status
     status = Column(String(20), nullable=False, default="PENDING")
-    # PENDING / OPEN / CLOSED_WIN / CLOSED_LOSS / CLOSED_NEUTRAL / SKIPPED
+    # PENDING (reserved, CLOB call in-flight) / OPEN / CLOSED_WIN / CLOSED_LOSS / CLOSED_NEUTRAL / SKIPPED
     skip_reason = Column(Text, nullable=True)
     close_reason = Column(Text, nullable=True)  # why a position was closed early
 
