@@ -356,17 +356,50 @@ class BetEngine:
                             and current_price
                             > bet.price_at_entry * settings.HARVEST_NEAR_CLOSE_MIN_MULTIPLIER
                         ):
+                            # The cached price is a Gamma midpoint (up to 90s stale).
+                            # At near-expiry the CLOB bid-side can collapse far below
+                            # the mid while the cache still looks healthy.  Fetch a
+                            # live CLOB bid and abort if it's at or below our entry —
+                            # there's no point selling at a guaranteed loss.
+                            clob_bid: float | None = None
+                            if self._client:
+                                try:
+                                    price_resp = self._client._get_clob_client().get_price(
+                                        bet.token_id, "BUY"
+                                    )
+                                    if isinstance(price_resp, dict) and price_resp.get("price"):
+                                        clob_bid = float(price_resp["price"])
+                                except Exception as _bid_err:
+                                    logger.warning(
+                                        "Near-close harvest: failed to fetch CLOB bid for bet %d: %s — skipping",
+                                        bet.id,
+                                        _bid_err,
+                                    )
+                                    continue
+
+                            if clob_bid is None or clob_bid <= bet.price_at_entry:
+                                logger.info(
+                                    "Near-close harvest skipped for bet %d: CLOB bid %.4f <= entry %.4f "
+                                    "(Gamma mid was %.4f) — waiting for oracle resolution",
+                                    bet.id,
+                                    clob_bid or 0.0,
+                                    bet.price_at_entry,
+                                    current_price,
+                                )
+                                continue
+
                             logger.info(
-                                "Near-close harvest triggered for bet %d: closes in %.1fh, price %.4f > entry %.4f * %.2f",
+                                "Near-close harvest triggered for bet %d: closes in %.1fh, "
+                                "CLOB bid %.4f > entry %.4f (Gamma mid %.4f)",
                                 bet.id,
                                 hours_to_close,
-                                current_price,
+                                clob_bid,
                                 bet.price_at_entry,
-                                settings.HARVEST_NEAR_CLOSE_MIN_MULTIPLIER,
+                                current_price,
                             )
                             self._close_bet(
                                 bet,
-                                current_price,
+                                clob_bid,
                                 bet.session,
                                 db,
                                 close_reason=f"Near-close harvest ({hours_to_close:.1f}h to close)",
@@ -707,6 +740,16 @@ class BetEngine:
         # does not deadlock when called from within this block.
 
         with self._placement_lock:
+            # WAL snapshot fix: commit any pending work to end the current read
+            # transaction before the guard query.  SQLite WAL mode fixes each
+            # session's read snapshot at its first SQL statement, so a concurrent
+            # CopiedBet committed by another monitor (chain monitor vs activity
+            # poller) after this session began would be invisible in the old
+            # snapshot.  Committing here starts a fresh transaction that sees all
+            # data committed up to this moment, including any concurrent placements.
+            with contextlib.suppress(Exception):
+                synchronized_commit(db)
+
             # Re-read session balance now that we hold the lock —
             # another thread may have committed a deduction since
             # this thread first loaded the session object.

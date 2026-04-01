@@ -193,7 +193,7 @@ async def get_redeemable_positions(wallet_address: str) -> list[dict]:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(
                 f"{DATA_API_URL}/positions",
-                params={"user": wallet_address},
+                params={"user": wallet_address, "sizeThreshold": 0, "limit": 500},
             )
             resp.raise_for_status()
             positions = resp.json()
