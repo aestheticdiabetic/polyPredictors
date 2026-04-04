@@ -11,6 +11,10 @@ log = logging.getLogger(__name__)
 DATA_API_URL = "https://data-api.polymarket.com"
 USDC_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 
+# Minimum position value to justify redemption cost (in USDC)
+# Positions worth less than this are already closed/worthless and waste gas
+MIN_VALUE_TO_REDEEM = 0.01
+
 # Polymarket order-book exchange contracts (used for OrderFilled event monitoring only)
 CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
@@ -198,7 +202,15 @@ async def get_redeemable_positions(wallet_address: str) -> list[dict]:
             resp.raise_for_status()
             positions = resp.json()
 
-        redeemable = [p for p in positions if p.get("redeemable") and float(p.get("size", 0)) > 0]
+        # Only redeem positions that are marked redeemable, have size, and have meaningful value.
+        # Positions with $0.00 or dust value are already closed/worthless and waste gas to redeem.
+        redeemable = [
+            p
+            for p in positions
+            if p.get("redeemable")
+            and float(p.get("size", 0)) > 0
+            and float(p.get("currentValue") or p.get("value") or 0) >= MIN_VALUE_TO_REDEEM
+        ]
         # Log positions with value that aren't being picked up
         for p in positions:
             value = float(p.get("currentValue") or p.get("value") or 0)
