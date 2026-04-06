@@ -825,7 +825,6 @@ class BetEngine:
                 db.query(CopiedBet)
                 .filter(
                     CopiedBet.whale_address == whale_address,
-                    CopiedBet.mode == session.mode,
                     CopiedBet.status != "SKIPPED",
                 )
                 .count()
