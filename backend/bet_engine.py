@@ -1262,8 +1262,9 @@ class BetEngine:
                     opened_at=datetime.utcnow(),
                     market_close_at=market_close_at,
                 )
-                db.add(copied_bet)
-                session.total_bets_placed += 1
+                with db.no_autoflush:
+                    db.add(copied_bet)
+                    session.total_bets_placed += 1
                 synchronized_commit(db)
                 db.refresh(copied_bet)
                 logger.info(
