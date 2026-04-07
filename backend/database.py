@@ -57,11 +57,11 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     # block writers. Increasing this lets the WAL grow larger between checkpoints,
     # reducing pause frequency (trades off disk space for lower lock contention).
     cursor.execute("PRAGMA wal_autocheckpoint=10000")
-    # busy_timeout=30000: wait up to 30s for a lock before raising
-    # OperationalError.  The previous 5s was too short — it caused spurious
-    # "database is locked" failures when a WAL write lock was held across a
-    # threading-lock acquisition (e.g. _placement_lock in bet_engine).
-    cursor.execute("PRAGMA busy_timeout=30000")
+    # busy_timeout=60000: wait up to 60s for a lock before raising
+    # OperationalError.  SQLite WAL serializes writers natively; this timeout
+    # handles any brief contention (e.g. autocheckpoint) without needing an
+    # application-level threading lock (which caused deadlocks).
+    cursor.execute("PRAGMA busy_timeout=60000")
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 

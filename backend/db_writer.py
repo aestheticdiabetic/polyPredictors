@@ -1,19 +1,24 @@
 """
-Centralized database write serialization.
+Centralized database write retry logic.
 
-All database write operations (flush, commit) go through this module to prevent
-SQLite lock contention when multiple background tasks (chain monitor, pollers,
-schedulers) compete for the single SQLite writer.
+SQLite WAL mode serializes concurrent writers natively — a threading.Lock is
+NOT needed and is actively harmful: if a session holds the SQLite WAL write
+lock between a flush and its commit, any other thread that holds the threading
+lock and waits for the SQLite lock will block the first thread from acquiring
+the threading lock to commit.  That produces a deadlock that lasts for the
+entire busy_timeout duration per retry.
 
 Architecture:
-- Global threading.Lock ensures only one thread writes to SQLite at a time
-- Wrapper functions add retry logic with exponential backoff
-- All background tasks (scheduler threads, async executors) coordinate here
+- SQLite WAL mode (set in database.py) allows concurrent readers and
+  serializes writers without application-level locking.
+- PRAGMA busy_timeout (set in database.py) makes SQLite wait and retry
+  internally before raising OperationalError.
+- This module adds an application-level retry layer as a last-resort safety
+  net for cases where SQLite returns SQLITE_BUSY despite the busy handler.
 """
 
 import asyncio
 import logging
-import threading
 import time
 from collections.abc import Callable
 from typing import TypeVar
@@ -25,21 +30,15 @@ log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-# Global lock for all database writes
-_db_write_lock = threading.Lock()
-
 # Configuration
 _MAX_RETRIES = 3
-_INITIAL_BACKOFF_MS = 100
+_INITIAL_BACKOFF_MS = 500
 _MAX_BACKOFF_MS = 5000
 
 
 def synchronized_flush(db: Session) -> None:
     """
     Flush changes to database with retries.
-
-    Acquires global write lock before flushing to prevent concurrent
-    writes from multiple background tasks.
 
     Args:
         db: SQLAlchemy session
@@ -53,9 +52,6 @@ def synchronized_flush(db: Session) -> None:
 def synchronized_commit(db: Session) -> None:
     """
     Commit transaction with retries.
-
-    Acquires global write lock before committing to prevent concurrent
-    writes from multiple background tasks.
 
     Args:
         db: SQLAlchemy session
@@ -92,8 +88,6 @@ async def synchronized_commit_async(
     """
     Async wrapper for commit with retries.
 
-    Suitable for use in async contexts (e.g., run_in_executor).
-
     Args:
         db: SQLAlchemy session
         loop: Event loop (if None, uses get_event_loop)
@@ -115,6 +109,11 @@ def _execute_with_retries(
     """
     Execute database operation with exponential backoff retry.
 
+    No threading lock is held here.  SQLite WAL mode + PRAGMA busy_timeout
+    serializes writers at the SQLite level without application-level locking.
+    Holding a threading lock across a SQLite busy-wait causes deadlocks when
+    two sessions each hold a resource the other needs.
+
     Args:
         func: Callable that performs the DB operation
         operation: String name for logging
@@ -131,15 +130,14 @@ def _execute_with_retries(
     for attempt in range(1, _MAX_RETRIES + 1):
         # Snapshot pending-new objects BEFORE the commit/flush call.
         # SQLAlchemy's autoflush moves objects from db.new → db.identity_map
-        # during db.commit(), so if we capture db.new only after a failure we
-        # miss objects that were auto-flushed.  After rollback those objects
-        # become detached and are never re-added, causing "not persistent"
-        # errors on the next db.refresh() call.
+        # during db.commit(), so capturing db.new only after a failure misses
+        # objects that were auto-flushed.  After rollback those objects become
+        # detached and are never re-added, causing "not persistent" errors on
+        # the next db.refresh() call.
         pending_new = list(db.new) if db is not None else []
 
         try:
-            with _db_write_lock:
-                return func()
+            return func()
         except OperationalError as e:
             if "database is locked" not in str(e):
                 # Not a lock contention error — re-raise immediately
@@ -158,10 +156,10 @@ def _execute_with_retries(
                 f"Retrying in {backoff_ms}ms..."
             )
 
-            # Reset session state before retry (SQLAlchemy requires explicit rollback after
-            # a failed commit/flush before any subsequent operations can proceed).
-            # Re-add the pending_new objects captured before autoflush so they
-            # are included in the next commit attempt.
+            # Reset session state before retry (SQLAlchemy requires explicit rollback
+            # after a failed commit/flush before any subsequent operations can proceed).
+            # Re-add the pending_new objects captured before autoflush so they are
+            # included in the next commit attempt.
             if db is not None:
                 db.rollback()
                 for obj in pending_new:
@@ -172,29 +170,3 @@ def _execute_with_retries(
             backoff_ms = min(backoff_ms * 2, _MAX_BACKOFF_MS)
 
     return None
-
-
-def with_write_lock(func: Callable[..., T]) -> Callable[..., T]:
-    """
-    Decorator that wraps a function to serialize database writes.
-
-    Usage:
-        @with_write_lock
-        def my_db_operation(db: Session):
-            db.add(obj)
-            db.commit()
-
-    Args:
-        func: Function that performs DB writes
-
-    Returns:
-        Wrapped function that acquires global write lock
-    """
-
-    def wrapper(*args, **kwargs) -> T:
-        with _db_write_lock:
-            return func(*args, **kwargs)
-
-    wrapper.__name__ = func.__name__
-    wrapper.__doc__ = func.__doc__
-    return wrapper
