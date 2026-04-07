@@ -658,6 +658,107 @@ class PolymarketClient:
         rebuilds it with a fresh nonce.  Called after 'invalid signature' errors."""
         self._clob_client = None
 
+    def place_limit_buy_fak(
+        self,
+        token_id: str,
+        size_usdc: float,
+        max_price: float,
+        neg_risk: bool = False,
+        fee_bps: int | None = None,
+    ) -> dict:
+        """
+        Place a limit BUY order as FAK (Fill-and-Kill) at max_price per share.
+
+        Calculates shares = floor(size_usdc / max_price, 2dp), then posts a limit
+        order at max_price with OrderType.FAK.  If no asks are at or below max_price
+        the order is killed immediately with status CANCELLED — the caller receives
+        no fill and pays no fees or gas.  This prevents sweeping a book that has
+        moved far above the whale's entry price.
+
+        max_price must be pre-rounded to the market's tick size by the caller, or
+        this method will floor it to the nearest valid tick automatically.
+
+        Returns the CLOB order response dict (same shape as place_market_buy).
+        """
+        import math as _math
+        import re
+
+        from py_clob_client.client import OrderType
+        from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
+
+        client = self._get_clob_client()
+
+        tick_size = float(client.get_tick_size(token_id))
+        tick_dp = len(str(tick_size).rstrip("0").split(".")[-1]) if "." in str(tick_size) else 0
+
+        # Floor max_price to the nearest valid tick (never overpay vs our cap)
+        floored_price = _math.floor(max_price / tick_size) * tick_size
+        floored_price = round(floored_price, tick_dp)
+        floored_price = max(floored_price, tick_size)  # at least one tick
+
+        # shares = USDC / price, floored to 2dp (CLOB minimum size granularity)
+        shares = _math.floor(size_usdc / floored_price * 100) / 100
+        if shares <= 0:
+            raise ValueError(
+                f"place_limit_buy_fak: computed 0 shares for size_usdc={size_usdc} max_price={max_price}"
+            )
+
+        current_fee = fee_bps if fee_bps is not None else self._taker_fee_cache.get(token_id, 1000)
+
+        def _submit(price: float, bps: int) -> dict:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=shares,
+                side="BUY",
+                fee_rate_bps=bps,
+            )
+            signed_order = client.create_order(
+                order_args, PartialCreateOrderOptions(neg_risk=neg_risk)
+            )
+            self._clob_limiter.acquire()
+            resp = client.post_order(signed_order, OrderType.FAK)
+            return resp if isinstance(resp, dict) else {"status": "ok", "response": str(resp)}
+
+        try:
+            return _submit(floored_price, current_fee)
+        except Exception as exc:
+            exc_str = str(exc)
+
+            # Fee mismatch — parse required fee and retry
+            match = re.search(r"taker fee[:\s]+(\d+)", exc_str, re.IGNORECASE)
+            if match:
+                required_fee = int(match.group(1))
+                if required_fee != current_fee:
+                    logger.warning(
+                        "place_limit_buy_fak: fee mismatch for %s — retrying with fee_rate_bps=%d",
+                        token_id[:16],
+                        required_fee,
+                    )
+                    self._taker_fee_cache[token_id] = required_fee
+                    try:
+                        return _submit(floored_price, required_fee)
+                    except Exception as retry_exc:
+                        logger.error("place_limit_buy_fak retry error: %s", retry_exc)
+                        raise
+
+            # Invalid signature — nonce drift; rebuild client and retry
+            if "invalid signature" in exc_str.lower():
+                logger.warning(
+                    "place_limit_buy_fak: invalid signature for %s — resetting CLOB client and retrying",
+                    token_id[:16],
+                )
+                self._reset_clob_client()
+                client = self._get_clob_client()
+                try:
+                    return _submit(floored_price, current_fee)
+                except Exception as retry_exc:
+                    logger.error("place_limit_buy_fak error after client reset: %s", retry_exc)
+                    raise
+
+            logger.error("place_limit_buy_fak error: %s", exc)
+            raise
+
     def place_market_buy(self, token_id: str, amount_usdc: float, neg_risk: bool = False) -> dict:
         """
         Place a real market buy order via py-clob-client.

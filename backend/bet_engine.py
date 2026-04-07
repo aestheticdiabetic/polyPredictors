@@ -1362,15 +1362,22 @@ class BetEngine:
                 size_usdc=reserved_bet_size,
                 price=whale_bet.price,
                 neg_risk=_neg_risk,
+                taker_fee_bps=taker_fee_bps,
             )
-            # Detect FOK/unmatched cancellations — no tokens were actually received
+            # Detect FAK cancellations — the limit price was below the best ask
+            # (market moved past MAX_UPWARD_DRIFT above whale entry), so no fill.
+            # Balance is refunded in Phase 3. No fees paid, no position opened.
             order_status_raw = str(order_resp.get("status", "")).upper()
             if order_status_raw in ("UNMATCHED", "CANCELLED", "CANCELED"):
                 size_shares = 0.0
+                skip_reason_val = (
+                    f"Limit FAK cancelled — market above whale entry "
+                    f"{whale_bet.price:.4f} + MAX_UPWARD_DRIFT {settings.MAX_UPWARD_DRIFT_PCT:.4f}"
+                )
                 logger.warning(
-                    "REAL BUY status=%s for token %s — order not filled, recording size_shares=0",
-                    order_status_raw,
+                    "REAL BUY FAK cancelled for token %s — market moved above limit %.4f, skipping",
                     whale_bet.token_id[:16],
+                    whale_bet.price + settings.MAX_UPWARD_DRIFT_PCT,
                 )
             else:
                 import math as _math
@@ -1407,6 +1414,9 @@ class BetEngine:
                             # Post-fill guard: CLOB slippage can push the actual fill
                             # above REAL_MAX_ENTRY_PRICE checked pre-order. Sell back
                             # immediately to avoid being trapped in a fee-dominant trade.
+                            # Note: drift overpay is now prevented upstream via the limit
+                            # FAK order (place_real_buy), so this guard covers only the
+                            # REAL_MAX_ENTRY_PRICE case.
                             if entry_price >= settings.REAL_MAX_ENTRY_PRICE:
                                 logger.warning(
                                     "REAL BUY: fill %.4f >= REAL_MAX_ENTRY_PRICE %.4f "
@@ -1559,6 +1569,7 @@ class BetEngine:
                                 size_usdc=reserved_bet_size,
                                 price=whale_bet.price,
                                 neg_risk=_neg_risk,
+                                taker_fee_bps=taker_fee_bps,
                             )
                             # Retry succeeded — re-enter the success path inline
                             import math as _math
@@ -1566,7 +1577,11 @@ class BetEngine:
                             order_status_raw = str(order_resp.get("status", "")).upper()
                             if order_status_raw in ("UNMATCHED", "CANCELLED", "CANCELED"):
                                 size_shares = 0.0
-                                bet_status = "OPEN"
+                                skip_reason_val = (
+                                    f"Retry limit FAK cancelled — market above whale entry "
+                                    f"{whale_bet.price:.4f} + MAX_UPWARD_DRIFT {settings.MAX_UPWARD_DRIFT_PCT:.4f}"
+                                )
+                                bet_status = "SKIPPED"
                                 skip_reason_val = None
                             else:
                                 taking_raw = order_resp.get("takingAmount")
@@ -1832,17 +1847,40 @@ class BetEngine:
     # ------------------------------------------------------------------
 
     def place_real_buy(
-        self, token_id: str, size_usdc: float, price: float, neg_risk: bool = False
+        self,
+        token_id: str,
+        size_usdc: float,
+        price: float,
+        neg_risk: bool = False,
+        max_price: float | None = None,
+        taker_fee_bps: int | None = None,
     ) -> dict:
-        """Place a real market buy via py-clob-client."""
+        """Place a real limit FAK buy via py-clob-client.
+
+        Uses a limit Fill-and-Kill order at max_price (defaults to price +
+        MAX_UPWARD_DRIFT_PCT) instead of a market order.  If the book has no
+        asks at or below max_price the order is killed immediately with status
+        CANCELLED — no fill, no fees wasted.  This prevents sweeping a book
+        that has moved far above the whale's entry price since detection.
+        """
+        effective_max = (
+            max_price if max_price is not None else price + settings.MAX_UPWARD_DRIFT_PCT
+        )
         logger.info(
-            "REAL BUY: token=%s size=$%.2f price=%.4f neg_risk=%s",
+            "REAL BUY (limit FAK): token=%s size=$%.2f whale_price=%.4f max_price=%.4f neg_risk=%s",
             token_id[:16],
             size_usdc,
             price,
+            effective_max,
             neg_risk,
         )
-        return self._client.place_market_buy(token_id, size_usdc, neg_risk=neg_risk)
+        return self._client.place_limit_buy_fak(
+            token_id,
+            size_usdc,
+            max_price=effective_max,
+            neg_risk=neg_risk,
+            fee_bps=taker_fee_bps,
+        )
 
     def place_real_sell(
         self, token_id: str, size_shares: float, whale_price: float | None = None
