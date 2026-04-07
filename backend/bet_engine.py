@@ -191,7 +191,7 @@ class BetEngine:
         live_price: float | None,
         bet_size_usdc: float,
         whale_price: float | None = None,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, float]:
         """
         Verify sufficient liquidity in the order book to fill our bet.
         Sums ask-side USDC up to price (reference_price * (1 + MAX_BOOK_SLIPPAGE_PCT)).
@@ -200,14 +200,17 @@ class BetEngine:
         uses whale_price as reference — the whale just proved that price is achievable.
         Otherwise uses live_price.
 
-        Returns (True, "") if depth OK; (False, reason) if too thin.
+        Returns (depth_ok, reason, available_usdc):
+          - depth_ok: True if sufficient depth, False if thin
+          - reason: empty string on success, description on failure
+          - available_usdc: USDC available within slippage params (used to clamp bet size)
         """
         if not order_book or not live_price:
-            return True, ""
+            return True, "", bet_size_usdc
 
         asks = order_book.get("asks", [])
         if not asks:
-            return False, "No ask orders in book"
+            return False, "No ask orders in book", 0.0
 
         # Find lowest ask first to determine which reference price to use
         lowest_ask = None
@@ -246,9 +249,9 @@ class BetEngine:
                 f"— reference_price={reference_price:.4f}, max_slippage={max_slippage_price:.4f}, "
                 f"lowest_ask={lowest_ask:.4f}"
             )
-            return False, msg
+            return False, msg, usdc_sum
 
-        return True, ""
+        return True, "", usdc_sum
 
     def _check_wash_trade(
         self, whale_address: str, token_id: str, db: DBSession
@@ -671,7 +674,9 @@ class BetEngine:
                         whale_bet.outcome = (tok.get("outcome") or "Yes").upper()
                         break
             if whale_bet.market_id or whale_bet.question:
-                try:
+                import contextlib
+
+                with contextlib.suppress(Exception):
                     db.add(whale_bet)
                     # Do NOT flush here — flushing acquires the SQLite WAL write
                     # lock, which would be held across the _placement_lock
@@ -679,8 +684,6 @@ class BetEngine:
                     # would then get SQLITE_BUSY for the full busy_timeout period.
                     # The add is sufficient; the data is committed later by
                     # synchronized_commit inside _placement_lock.
-                except Exception:
-                    pass
 
         # ---- CASE 1: Whale is exiting a position ----------------------
         if whale_bet.bet_type == "EXIT":
@@ -1124,24 +1127,36 @@ class BetEngine:
                         db=db,
                     )
 
-            # Stage 2: Order book depth check — ensure sufficient liquidity
+            # Stage 2: Order book depth check — ensure sufficient liquidity.
+            # If the book is thin, clamp to whatever is available (within slippage
+            # params) rather than skipping, as long as it meets the $1 minimum.
             if settings.ORDER_BOOK_CHECK_ENABLED:
-                depth_ok, depth_reason = self._check_order_book_depth(
+                depth_ok, depth_reason, available_usdc = self._check_order_book_depth(
                     order_book=order_book,
                     live_price=live_price,
                     bet_size_usdc=bet_size_usdc,
                     whale_price=whale_bet.price,
                 )
                 if not depth_ok:
-                    return self._create_skipped_bet(
-                        whale_bet=whale_bet,
-                        session=session,
-                        bet_size_usdc=bet_size_usdc,
-                        risk_factor=risk_factor,
-                        whale_avg=whale_avg,
-                        skip_reason=depth_reason,
-                        db=db,
+                    if available_usdc < 1.0:
+                        # Truly no fillable depth — skip entirely
+                        return self._create_skipped_bet(
+                            whale_bet=whale_bet,
+                            session=session,
+                            bet_size_usdc=bet_size_usdc,
+                            risk_factor=risk_factor,
+                            whale_avg=whale_avg,
+                            skip_reason=depth_reason,
+                            db=db,
+                        )
+                    # Partial depth available — clamp to what the book can fill
+                    logger.info(
+                        "Thin book for whale_bet %d: clamping bet from $%.2f to $%.2f available depth",
+                        whale_bet.id,
+                        bet_size_usdc,
+                        available_usdc,
                     )
+                    bet_size_usdc = available_usdc
 
             # Stage 2: Wash trade detection — skip if whale recently exited this token
             if settings.WASH_TRADE_DETECTION_ENABLED:
