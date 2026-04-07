@@ -411,58 +411,87 @@ class PolymarketClient:
             return None
 
     async def get_order_book(self, token_id: str) -> dict | None:
-        """Fetch the full order book for a token. Retries up to 2 times on transient failures."""
+        """Fetch the full order book for a token. Retries up to 2 times on transient failures.
+
+        Uses a fresh one-off HTTP client on event-loop-binding errors (APScheduler creates a
+        new event loop per tick; the shared self._http connection pool holds asyncio.Event
+        objects bound to the original loop, which causes failures on uncached requests).
+        """
         url = f"{settings.CLOB_HOST}/book"
         params = {"token_id": token_id}
         last_exc: Exception | None = None
-        for attempt in range(3):
-            try:
-                resp = await self._http.get(url, params=params)
-                resp.raise_for_status()
-                data = resp.json()
-                if not isinstance(data, dict):
+        _fresh_client: httpx.AsyncClient | None = None
+        try:
+            for attempt in range(3):
+                try:
+                    http = _fresh_client if _fresh_client is not None else self._http
+                    resp = await http.get(url, params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if not isinstance(data, dict):
+                        logger.warning(
+                            "get_order_book unexpected response type %s for token %s: %r",
+                            type(data).__name__,
+                            token_id[:20],
+                            data,
+                        )
+                        return None
+                    return data
+                except httpx.HTTPStatusError as exc:
+                    status = exc.response.status_code
+                    body = exc.response.text[:300]
+                    if status in (404, 422):
+                        # Market not found / unprocessable — no point retrying
+                        logger.warning(
+                            "get_order_book HTTP %d for token %s: %s",
+                            status,
+                            token_id[:20],
+                            body,
+                        )
+                        return None
                     logger.warning(
-                        "get_order_book unexpected response type %s for token %s: %r",
-                        type(data).__name__,
-                        token_id[:20],
-                        data,
-                    )
-                    return None
-                return data
-            except httpx.HTTPStatusError as exc:
-                status = exc.response.status_code
-                body = exc.response.text[:300]
-                if status in (404, 422):
-                    # Market not found / unprocessable — no point retrying
-                    logger.warning(
-                        "get_order_book HTTP %d for token %s: %s",
+                        "get_order_book HTTP %d for token %s (attempt %d/3): %s",
                         status,
                         token_id[:20],
+                        attempt + 1,
                         body,
                     )
-                    return None
-                logger.warning(
-                    "get_order_book HTTP %d for token %s (attempt %d/3): %s",
-                    status,
-                    token_id[:20],
-                    attempt + 1,
-                    body,
-                )
-                last_exc = exc
-            except Exception as exc:
-                logger.warning(
-                    "get_order_book error for token %s (attempt %d/3): %s",
-                    token_id[:20],
-                    attempt + 1,
-                    exc,
-                )
-                last_exc = exc
-            if attempt < 2:
-                await asyncio.sleep(0.5 * (attempt + 1))
-        logger.warning(
-            "get_order_book failed after 3 attempts for token %s: %s", token_id[:20], last_exc
-        )
-        return None
+                    last_exc = exc
+                except Exception as exc:
+                    if "bound to a different event loop" in str(exc) and _fresh_client is None:
+                        # APScheduler runs each job tick in a new event loop; the shared
+                        # self._http connection pool is bound to the old loop. Create a
+                        # one-off client for this request so the pool is not involved.
+                        logger.debug(
+                            "get_order_book: event loop mismatch for token %s — using fresh client",
+                            token_id[:20],
+                        )
+                        _fresh_client = httpx.AsyncClient(
+                            timeout=_TIMEOUT,
+                            follow_redirects=True,
+                            proxy=settings.PROXY_URL or None,
+                        )
+                        # Retry immediately without counting this as an attempt
+                        continue
+                    logger.warning(
+                        "get_order_book error for token %s (attempt %d/3): %s",
+                        token_id[:20],
+                        attempt + 1,
+                        exc,
+                    )
+                    last_exc = exc
+                if attempt < 2:
+                    await asyncio.sleep(0.3)
+            logger.warning(
+                "get_order_book failed after 3 attempts for token %s: %s",
+                token_id[:20],
+                last_exc,
+            )
+            return None
+        finally:
+            if _fresh_client is not None:
+                with contextlib.suppress(Exception):
+                    await _fresh_client.aclose()
 
     async def get_best_price(
         self, token_id: str, force_refresh: bool = False, side: str = "BUY"
