@@ -491,6 +491,22 @@ def _migrate():
 
         # UNIQUE index on tx_hash — prevents duplicate inserts from concurrent scanners.
         # Partial index (WHERE tx_hash IS NOT NULL) avoids conflicts on rows without a hash.
+        # First remove any duplicate tx_hash rows (keep lowest id), then create the index.
+        try:
+            conn.execute(
+                sa.text(
+                    "DELETE FROM whale_bets WHERE id NOT IN ("
+                    "  SELECT MIN(id) FROM whale_bets"
+                    "  WHERE tx_hash IS NOT NULL"
+                    "  GROUP BY tx_hash"
+                    ")"
+                    " AND tx_hash IS NOT NULL"
+                )
+            )
+            conn.commit()
+        except Exception as exc:
+            print(f"whale_bets dedup migration failed: {exc}")
+
         try:
             conn.execute(
                 sa.text(
@@ -499,8 +515,8 @@ def _migrate():
                 )
             )
             conn.commit()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"ix_whale_bets_tx_hash creation failed: {exc}")
 
         # Compound indices on copied_bets — eliminate full-table scans in the hot
         # placement path (process_new_whale_bet queries by whale+token+status and
