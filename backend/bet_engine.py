@@ -1128,9 +1128,23 @@ class BetEngine:
                     )
 
             # Stage 2: Order book depth check — ensure sufficient liquidity.
-            # If the book is thin, clamp to whatever is available (within slippage
-            # params) rather than skipping, as long as it meets the $1 minimum.
-            if settings.ORDER_BOOK_CHECK_ENABLED:
+            # REAL mode always runs this check regardless of ORDER_BOOK_CHECK_ENABLED:
+            # a market sweep through a thin book can fill at prices far above the whale
+            # entry even when live_price (lowest ask) passes the drift filter.
+            # If no order book data is available for REAL mode, skip rather than risk
+            # sweeping into unknown depth (order_book=None bypasses _check_order_book_depth).
+            _do_book_check = settings.ORDER_BOOK_CHECK_ENABLED or mode == "REAL"
+            if _do_book_check:
+                if not order_book and mode == "REAL":
+                    return self._create_skipped_bet(
+                        whale_bet=whale_bet,
+                        session=session,
+                        bet_size_usdc=bet_size_usdc,
+                        risk_factor=risk_factor,
+                        whale_avg=whale_avg,
+                        skip_reason="No order book data — REAL mode requires liquidity verification before entry",
+                        db=db,
+                    )
                 depth_ok, depth_reason, available_usdc = self._check_order_book_depth(
                     order_book=order_book,
                     live_price=live_price,
@@ -1339,6 +1353,7 @@ class BetEngine:
         size_shares = 0.0
         _post_fill_pnl: float | None = None
         _post_fill_sell_price: float | None = None
+        _post_fill_close_reason: str | None = None
         bet_status = "SKIPPED"
         skip_reason_val: str | None = None
         try:
@@ -1417,31 +1432,88 @@ class BetEngine:
                                     size_shares * _post_fill_sell_price - actual_cost, 4
                                 )
                         else:
-                            # Zero amounts — fall back to whale price estimate
+                            # Zero amounts — order accepted but fill details are
+                            # unreliable. Attempt emergency sell to close the unknown
+                            # position rather than recording phantom shares.
                             entry_price = float(whale_bet.price)
                             size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
-                            logger.warning(
-                                "REAL BUY: takingAmount/makingAmount zero — "
-                                "falling back to whale price %.4f",
-                                entry_price,
+                            logger.critical(
+                                "REAL BUY: takingAmount/makingAmount zero for token %s "
+                                "— fill unconfirmed, attempting emergency sell of ~%.2f est. shares",
+                                whale_bet.token_id[:16],
+                                size_shares,
+                            )
+                            try:
+                                _sell_r = self.place_real_sell(
+                                    token_id=whale_bet.token_id, size_shares=size_shares
+                                )
+                                _post_fill_sell_price = float(
+                                    _sell_r.get("price") or _sell_r.get("avgPrice") or entry_price
+                                )
+                            except Exception as _se:
+                                logger.error("Emergency sell failed: %s", _se)
+                                _post_fill_sell_price = entry_price
+                            _post_fill_pnl = round(
+                                size_shares * _post_fill_sell_price - bet_size_usdc, 4
+                            )
+                            _post_fill_close_reason = (
+                                "CLOB fill unconfirmed (zero amounts) — emergency sell attempted"
                             )
                     except (TypeError, ValueError) as _e:
                         entry_price = float(whale_bet.price)
                         size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
-                        logger.warning("REAL BUY: could not parse amounts (%s) — fallback", _e)
+                        logger.critical(
+                            "REAL BUY: could not parse takingAmount/makingAmount (%s) for token %s "
+                            "— fill unconfirmed, attempting emergency sell of ~%.2f est. shares",
+                            _e,
+                            whale_bet.token_id[:16],
+                            size_shares,
+                        )
+                        try:
+                            _sell_r = self.place_real_sell(
+                                token_id=whale_bet.token_id, size_shares=size_shares
+                            )
+                            _post_fill_sell_price = float(
+                                _sell_r.get("price") or _sell_r.get("avgPrice") or entry_price
+                            )
+                        except Exception as _se:
+                            logger.error("Emergency sell failed: %s", _se)
+                            _post_fill_sell_price = entry_price
+                        _post_fill_pnl = round(
+                            size_shares * _post_fill_sell_price - bet_size_usdc, 4
+                        )
+                        _post_fill_close_reason = (
+                            f"CLOB fill unconfirmed (parse error: {_e}) — emergency sell attempted"
+                        )
                 else:
-                    # Fields absent — fall back to whale price estimate
+                    # Fields absent — order accepted but we have no fill data.
+                    # Attempt emergency sell rather than recording phantom shares.
                     entry_price = float(whale_bet.price)
                     size_shares = _math.floor(bet_size_usdc / entry_price * 100) / 100
-                    logger.warning(
-                        "REAL BUY: takingAmount/makingAmount absent in response %s"
-                        " — falling back to whale price %.4f",
+                    logger.critical(
+                        "REAL BUY: takingAmount/makingAmount absent for token %s (response: %s) "
+                        "— fill unconfirmed, attempting emergency sell of ~%.2f est. shares",
+                        whale_bet.token_id[:16],
                         order_resp,
-                        entry_price,
+                        size_shares,
+                    )
+                    try:
+                        _sell_r = self.place_real_sell(
+                            token_id=whale_bet.token_id, size_shares=size_shares
+                        )
+                        _post_fill_sell_price = float(
+                            _sell_r.get("price") or _sell_r.get("avgPrice") or entry_price
+                        )
+                    except Exception as _se:
+                        logger.error("Emergency sell failed: %s", _se)
+                        _post_fill_sell_price = entry_price
+                    _post_fill_pnl = round(size_shares * _post_fill_sell_price - bet_size_usdc, 4)
+                    _post_fill_close_reason = (
+                        "CLOB fill unconfirmed (absent fields) — emergency sell attempted"
                     )
             if _post_fill_sell_price is not None:
                 bet_status = "CLOSED_LOSS"
-                skip_reason_val = (
+                skip_reason_val = _post_fill_close_reason or (
                     f"Post-fill overpay: fill {entry_price:.4f} >= "
                     f"REAL_MAX_ENTRY_PRICE {settings.REAL_MAX_ENTRY_PRICE:.4f}"
                 )
