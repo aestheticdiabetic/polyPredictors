@@ -673,7 +673,12 @@ class BetEngine:
             if whale_bet.market_id or whale_bet.question:
                 try:
                     db.add(whale_bet)
-                    db.flush()
+                    # Do NOT flush here — flushing acquires the SQLite WAL write
+                    # lock, which would be held across the _placement_lock
+                    # acquisition below.  Any concurrent synchronized_commit
+                    # would then get SQLITE_BUSY for the full busy_timeout period.
+                    # The add is sufficient; the data is committed later by
+                    # synchronized_commit inside _placement_lock.
                 except Exception:
                     pass
 
