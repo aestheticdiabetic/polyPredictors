@@ -390,6 +390,7 @@ class WhaleMonitor:
         check_whale_activity finds an up-to-date price immediately on the
         next poll tick rather than waiting for a live HTTP fetch.
         """
+        await self._client.reset_http_client()
         db = SessionLocal()
         try:
             rows = db.query(CopiedBet.token_id).filter_by(status="OPEN").distinct().all()
@@ -455,6 +456,11 @@ class WhaleMonitor:
         Phase 2 — sequential processing: process each result one at a time
                    so session balance updates never race each other.
         """
+        # Reset the shared httpx client so its internal transports/locks bind to
+        # the current per-thread event loop.  poll_whales runs on a scheduler
+        # thread that may differ from where the client was initialised, causing
+        # "bound to a different event loop" errors.
+        await self._client.reset_http_client()
         fetch_results = await asyncio.gather(
             *[self._client.get_user_activity(addr, limit=100) for addr in addresses],
             return_exceptions=True,
@@ -971,8 +977,13 @@ class WhaleMonitor:
         or stuck sell that under-reports available USDC doesn't block new bets
         for an extended period (e.g. partial fills, gas costs, manual trades).
         """
+
+        async def _fetch_balance():
+            await self._client.reset_http_client()
+            return await self._client.get_wallet_balance()
+
         try:
-            balance = _run_async(self._client.get_wallet_balance())
+            balance = _run_async(_fetch_balance())
         except Exception as exc:
             logger.error("_sync_real_balance: wallet fetch error: %s", exc)
             return
