@@ -238,10 +238,22 @@ class RiskCalculator:
             hours_remaining = (end_dt - now).total_seconds() / 3600.0
 
             if hours_remaining < 0:
-                return (
-                    False,
-                    f"Market closed {abs(hours_remaining):.1f}h ago",
-                )
+                # If the CLOB returned a live price the market is demonstrably
+                # still accepting orders — trust the CLOB over the Gamma endDate,
+                # which is a scheduled deadline that can lag for live sports games.
+                if live_price is not None:
+                    logger.warning(
+                        "Market endDate passed %.1fh ago but CLOB live_price=%.4f — "
+                        "market still active, allowing through (id=%s)",
+                        abs(hours_remaining),
+                        live_price,
+                        market_info.get("id", "unknown"),
+                    )
+                else:
+                    return (
+                        False,
+                        f"Market closed {abs(hours_remaining):.1f}h ago",
+                    )
         except (ValueError, TypeError) as exc:
             logger.warning("Could not parse endDate '%s': %s", end_date_str, exc)
             return False, f"Could not parse market end date: {end_date_str!r}"

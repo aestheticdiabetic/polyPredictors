@@ -2104,6 +2104,7 @@ class BetEngine:
         # exit an open market at 0.95-0.97, and we must still place the CLOB sell.
         fill_price = current_price
         taking_amount_usdc: float | None = None  # actual USDC received (from takingAmount)
+        _clob_sell_ok = False
         if current_price >= 0.98 or current_price <= 0.02:
             logger.info(
                 "REAL close bet %d at oracle price %.4f (resolved — skipping CLOB sell, redemption will settle)",
