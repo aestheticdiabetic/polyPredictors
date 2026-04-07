@@ -727,6 +727,12 @@ class ClobWsEntryMonitor:
                     return
                 raise
 
+            # Commit the whale_bet immediately so the write lock is released before
+            # process_new_whale_bet runs.  That function can take several seconds
+            # (market-info queries, CLOB calls, placement logic) and holding the
+            # SQLite WAL write lock across all of that blocks every other writer.
+            synchronized_commit(db)
+
             try:
                 active_sessions = db.query(MonitoringSession).filter_by(is_active=True).all()
                 if not active_sessions:

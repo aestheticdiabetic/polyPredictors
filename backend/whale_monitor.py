@@ -22,7 +22,7 @@ from backend.database import (
     Whale,
     WhaleBet,
 )
-from backend.db_writer import synchronized_commit, synchronized_flush
+from backend.db_writer import synchronized_commit
 
 logger = logging.getLogger(__name__)
 
@@ -913,7 +913,10 @@ class WhaleMonitor:
         )
         db.add(whale_bet)
         try:
-            synchronized_flush(db)  # Get ID without committing
+            # Commit (not just flush) so the SQLite WAL write lock is released
+            # before the caller makes HTTP calls (live_exit_price fetch, _handle_exit).
+            # The whale_bet ID is populated after commit just as it is after flush.
+            synchronized_commit(db)
         except IntegrityError:
             db.rollback()
             logger.debug("Duplicate tx_hash %s — skipping", tx_hash)
