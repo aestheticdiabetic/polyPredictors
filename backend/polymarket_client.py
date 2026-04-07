@@ -3,6 +3,7 @@ Polymarket API client - wraps Data API, Gamma API, and CLOB API.
 All methods are async using httpx.
 """
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -410,16 +411,58 @@ class PolymarketClient:
             return None
 
     async def get_order_book(self, token_id: str) -> dict | None:
-        """Fetch the full order book for a token."""
+        """Fetch the full order book for a token. Retries up to 2 times on transient failures."""
         url = f"{settings.CLOB_HOST}/book"
         params = {"token_id": token_id}
-        try:
-            resp = await self._http.get(url, params=params)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as exc:
-            logger.debug("get_order_book error for %s: %s", token_id, exc)
-            return None
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = await self._http.get(url, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                if not isinstance(data, dict):
+                    logger.warning(
+                        "get_order_book unexpected response type %s for token %s: %r",
+                        type(data).__name__,
+                        token_id[:20],
+                        data,
+                    )
+                    return None
+                return data
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                body = exc.response.text[:300]
+                if status in (404, 422):
+                    # Market not found / unprocessable — no point retrying
+                    logger.warning(
+                        "get_order_book HTTP %d for token %s: %s",
+                        status,
+                        token_id[:20],
+                        body,
+                    )
+                    return None
+                logger.warning(
+                    "get_order_book HTTP %d for token %s (attempt %d/3): %s",
+                    status,
+                    token_id[:20],
+                    attempt + 1,
+                    body,
+                )
+                last_exc = exc
+            except Exception as exc:
+                logger.warning(
+                    "get_order_book error for token %s (attempt %d/3): %s",
+                    token_id[:20],
+                    attempt + 1,
+                    exc,
+                )
+                last_exc = exc
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+        logger.warning(
+            "get_order_book failed after 3 attempts for token %s: %s", token_id[:20], last_exc
+        )
+        return None
 
     async def get_best_price(
         self, token_id: str, force_refresh: bool = False, side: str = "BUY"
@@ -880,7 +923,7 @@ class PolymarketClient:
         """
         Query the Data API for the most recent SELL trade of token_id from our account.
         Used as a fallback when the CLOB sell response lacks takingAmount, so P&L uses
-        the actual net USDC credited by Polymarket rather than shares × bid price.
+        the actual net USDC credited by Polymarket rather than shares x bid price.
 
         Returns (usdc_net, fill_price) or (None, None) if not found.
         """
