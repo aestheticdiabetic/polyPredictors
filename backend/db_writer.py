@@ -129,6 +129,14 @@ def _execute_with_retries(
     backoff_ms = _INITIAL_BACKOFF_MS
 
     for attempt in range(1, _MAX_RETRIES + 1):
+        # Snapshot pending-new objects BEFORE the commit/flush call.
+        # SQLAlchemy's autoflush moves objects from db.new → db.identity_map
+        # during db.commit(), so if we capture db.new only after a failure we
+        # miss objects that were auto-flushed.  After rollback those objects
+        # become detached and are never re-added, causing "not persistent"
+        # errors on the next db.refresh() call.
+        pending_new = list(db.new) if db is not None else []
+
         try:
             with _db_write_lock:
                 return func()
@@ -152,10 +160,9 @@ def _execute_with_retries(
 
             # Reset session state before retry (SQLAlchemy requires explicit rollback after
             # a failed commit/flush before any subsequent operations can proceed).
-            # Save pending "new" objects first — db.rollback() expunges objects that were
-            # added but not yet flushed, causing a silent data loss on the retry commit.
+            # Re-add the pending_new objects captured before autoflush so they
+            # are included in the next commit attempt.
             if db is not None:
-                pending_new = list(db.new)
                 db.rollback()
                 for obj in pending_new:
                     db.add(obj)
