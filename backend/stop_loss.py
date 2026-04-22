@@ -53,6 +53,12 @@ class StopLossMonitor:
             for session in active_sessions:
                 try:
                     balance, open_val = await self._get_balance_and_open(session, db)
+                    if balance is None:
+                        logger.warning(
+                            "Portfolio snapshot skipped: session=%d wallet balance fetch failed",
+                            session.id,
+                        )
+                        continue
                     snap = PortfolioSnapshot(
                         session_id=session.id,
                         timestamp=datetime.now(UTC).replace(tzinfo=None),
@@ -83,6 +89,16 @@ class StopLossMonitor:
 
     async def _check_session(self, session: MonitoringSession, db) -> None:
         balance, open_val = await self._get_balance_and_open(session, db)
+        if balance is None:
+            # Wallet balance fetch failed (RPC/HTTP error, rate limit, etc.).
+            # Skip this cycle — a transient failure must NOT be interpreted as a
+            # zero balance, or the stop-loss will see a fake 100% loss and
+            # auto-stop an otherwise healthy session.
+            logger.warning(
+                "Stop-loss check skipped: session=%d wallet balance fetch failed",
+                session.id,
+            )
+            return
         current_portfolio = balance + open_val
         baseline = self._get_baseline(session, db)
 
@@ -152,10 +168,17 @@ class StopLossMonitor:
     # Portfolio computation
     # ------------------------------------------------------------------
 
-    async def _get_balance_and_open(self, session: MonitoringSession, db) -> tuple[float, float]:
-        """Return (available_balance, open_positions_cost_basis)."""
+    async def _get_balance_and_open(
+        self, session: MonitoringSession, db
+    ) -> tuple[float | None, float]:
+        """Return (available_balance, open_positions_cost_basis).
+
+        `balance` is None when the wallet balance fetch fails (REAL mode only).
+        Callers MUST treat None as "unknown" and skip the cycle — never coerce
+        to 0.0, or the stop-loss will see a fake 100% loss on a transient error.
+        """
         if session.mode == "REAL":
-            balance = await self._client.get_wallet_balance() or 0.0
+            balance = await self._client.get_wallet_balance()
         else:
             balance = session.current_balance_usdc or 0.0
 
